@@ -1301,6 +1301,8 @@ impl agentplane::model::ModelProvider for CountingModel {
             structured: None,
             continuation: None,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         })
     }
 }

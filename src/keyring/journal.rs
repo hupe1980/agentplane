@@ -129,6 +129,24 @@ impl JournalStore for SealedJournal {
     async fn watch(&self, run: RunId) -> Option<crate::journal::AppendWatch> {
         self.inner.watch(run).await
     }
+
+    async fn watch_all(&self) -> Option<crate::journal::AppendWatch> {
+        self.inner.watch_all().await
+    }
+
+    /// The feed opened as `read` opens: a sealed payload is read back clear
+    /// where the key ring still holds its key.
+    async fn feed(
+        &self,
+        after: Option<&crate::journal::FeedCursor>,
+        limit: usize,
+    ) -> Result<crate::journal::FeedPage, StoreError> {
+        let page = self.inner.feed(after, limit).await?;
+        Ok(crate::journal::FeedPage {
+            records: self.open_all(page.records).await?,
+            next: page.next,
+        })
+    }
     fn seals(&self) -> bool {
         true
     }

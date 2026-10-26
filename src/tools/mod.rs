@@ -971,6 +971,8 @@ pub struct ToolCall {
     /// [`Effect::attach`](crate::core::Effect::attach), because it contains the
     /// effect key and an effect does not know its own.
     provenance: Option<crate::core::Provenance>,
+    /// The model's id for the call this execution answers.
+    answering: Option<String>,
 }
 
 impl ToolCall {
@@ -1048,9 +1050,37 @@ impl ToolCall {
             arguments,
             client,
             provenance: None,
+            answering: None,
         })
     }
+
+    /// Mark this execution as the answer to a model's call, so its span
+    /// carries the provider's call id (`gen_ai.tool.call.id`).
+    ///
+    /// Telemetry only: the id is in neither the effect key nor the journal's
+    /// descriptor. An id over 256 bytes is not recorded.
+    ///
+    /// # Errors
+    ///
+    /// [`ToolError::Unreachable`] when the call named another tool: a span
+    /// joining this execution to it would say the model asked for what ran.
+    pub fn answering(mut self, call: &crate::model::ToolCall) -> Result<Self, ToolError> {
+        if call.name != self.id.wire_name() {
+            return Err(ToolError::Unreachable {
+                detail: format!(
+                    "the model's call '{}' named '{}', not this tool",
+                    call.id, call.name
+                ),
+                tool: self.id,
+            });
+        }
+        self.answering = (call.id.len() <= MAX_CALL_ID).then(|| call.id.clone());
+        Ok(self)
+    }
 }
+
+/// The longest provider call id a span records.
+const MAX_CALL_ID: usize = 256;
 
 #[async_trait]
 impl Effect for ToolCall {
@@ -1063,6 +1093,7 @@ impl Effect for ToolCall {
         Some(crate::core::GenAiRequest {
             provider: None,
             name: self.id.reference(),
+            call_id: self.answering.clone(),
         })
     }
 

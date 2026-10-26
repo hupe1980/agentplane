@@ -1310,7 +1310,119 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     the_id_walk_does_not_move_under_writes(fresh, &mut r).await;
     only_a_concluded_run_is_sealed(fresh, &mut r).await;
     a_follower_wakes_once_the_append_is_readable(fresh, &mut r).await;
+    the_feed_serves_every_record_once(fresh, &mut r).await;
+    a_feed_follower_wakes_on_any_run(fresh, &mut r).await;
     r
+}
+
+/// **The feed serves every record of every run once, in commit order.**
+///
+/// Two runs interleave their appends; read in pages of two, the feed returns
+/// all six records, none twice, each run in its own order and the runs in the
+/// order their appends committed. A page past the end is empty and hands back
+/// the cursor it was given.
+async fn the_feed_serves_every_record_once(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let (a, b) = (RunId::generate(), RunId::generate());
+    let (Ok(la), Ok(lb)) = (
+        store.acquire(a, "conformance", LEASE).await,
+        store.acquire(b, "conformance", LEASE).await,
+    ) else {
+        r.record("feed", "acquire() failed on a fresh run");
+        return;
+    };
+    let mut committed = Vec::new();
+    for (run, epoch, n) in [
+        (a, la.epoch, 2),
+        (b, lb.epoch, 1),
+        (a, la.epoch, 1),
+        (b, lb.epoch, 2),
+    ] {
+        match store
+            .append(epoch, (0..n).map(|_| admitted(run)).collect())
+            .await
+        {
+            Ok(records) => committed.extend(records.iter().map(|rec| (rec.body.run, rec.seq()))),
+            Err(e) => {
+                r.record("feed", format!("append failed: {e}"));
+                return;
+            }
+        }
+    }
+    let mut served = Vec::new();
+    let mut cursor = None;
+    for _ in 0..10 {
+        let page = match store.feed(cursor.as_ref(), 2).await {
+            Ok(page) => page,
+            Err(e) => {
+                r.record("feed", format!("feed() failed: {e}"));
+                return;
+            }
+        };
+        if page.records.is_empty() {
+            if page.next != cursor {
+                r.record(
+                    "feed",
+                    "an empty page did not hand back the cursor it was given",
+                );
+            }
+            break;
+        }
+        for record in &page.records {
+            // Read as `read` reads it: a decorator that opens payloads on one
+            // path and not the other serves two answers to one record.
+            let Ok(read) = store.read(record.body.run, record.seq()).await else {
+                r.record("feed", "read() failed on a record the feed served");
+                return;
+            };
+            if read.first().map(|first| &first.body.kind) != Some(&record.body.kind) {
+                r.record(
+                    "feed",
+                    format!("the feed served record {} unlike read() does", record.seq()),
+                );
+            }
+        }
+        served.extend(page.records.iter().map(|rec| (rec.body.run, rec.seq())));
+        cursor = page.next;
+    }
+    if served != committed {
+        r.record(
+            "feed",
+            format!(
+                "the feed served {served:?}; the appends committed {committed:?} — a record \
+                 skipped, repeated or out of commit order"
+            ),
+        );
+    }
+}
+
+/// **A feed follower wakes when any run appends.**
+async fn a_feed_follower_wakes_on_any_run(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let Some(mut follower) = store.watch_all().await else {
+        return;
+    };
+    let run = RunId::generate();
+    let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+        r.record("feed", "acquire() failed on a fresh run");
+        return;
+    };
+    let waiting = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(10), follower.changed()).await
+    });
+    if let Err(e) = store.append(lease.epoch, vec![admitted(run)]).await {
+        r.record("feed", format!("append failed: {e}"));
+        return;
+    }
+    match waiting.await {
+        Ok(Ok(Some(_))) => {}
+        other => r.record(
+            "feed",
+            format!("no wake-up for an append to an unfollowed run: {other:?}"),
+        ),
+    }
 }
 
 /// **A follower wakes once the append is readable.**

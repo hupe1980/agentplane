@@ -74,7 +74,7 @@ impl Skill for ProposesRefund {
 
         let decision = cx.task(&spec).await?;
         Ok(Outcome::done(Tainted::trusted(json!({
-            "approved": decision.approved,
+            "approved": decision.approved(),
             "by": decision.decided.to_string(),
         }))))
     }

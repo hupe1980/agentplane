@@ -860,7 +860,7 @@ impl Presentation {
                             detail,
                         })
                     }
-                    Err(refused) => Err(EffectError::Refused(refused.to_string())),
+                    Err(refused) => Err(EffectError::refused(refused.to_string())),
                 }
             }
         }

@@ -131,7 +131,9 @@ fn ask<'a>(
         schema: None,
         tools: &[],
         exchanges: &[],
+        told: &[],
         continuation: None,
+        compaction: None,
         stream,
     }
 }
@@ -541,6 +543,8 @@ impl ModelProvider for Volunteers {
             structured: None,
             continuation: None,
             reasoning: Some("unasked".to_owned()),
+            commentary: None,
+            compacted: None,
         })
     }
 }

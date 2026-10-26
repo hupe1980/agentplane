@@ -1,7 +1,7 @@
 //! Batch state on redb.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 
 use crate::batch::{BatchCensus, BatchStore, ItemOutcome, ItemRecord};
 use crate::core::{BatchId, RunId, Spend, StoreError};

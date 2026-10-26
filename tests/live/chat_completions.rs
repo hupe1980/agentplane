@@ -111,7 +111,9 @@ fn ask<'a>(
         schema,
         tools,
         exchanges: &[],
+        told: &[],
         continuation: None,
+        compaction: None,
         stream: None,
     }
 }

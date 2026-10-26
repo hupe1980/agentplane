@@ -282,6 +282,7 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             // A digest, and replay routes on it as it does on the disposition.
             unreproducible: _,
             elapsed_ms: _,
+            code: _,
         } => vec![SealedField::Text(error)],
         // Reasoning recorded beside the effects it explains — model output
         // over the caller's data, and nothing routes on it.

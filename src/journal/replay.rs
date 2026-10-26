@@ -476,6 +476,7 @@ impl StepCursor {
                 permanent,
                 unreproducible,
                 elapsed_ms: _,
+                code: _,
             } => {
                 self.settle(
                     key,
@@ -1418,6 +1419,7 @@ mod tests {
                     permanent: false,
                     unreproducible: None,
                     elapsed_ms: None,
+                    code: None,
                 },
             ),
         ]);

@@ -91,7 +91,7 @@ impl Skill for Patch {
             json!({ "tool": "tool://fs/write", "arguments": call.peek() }),
         );
         let task = TaskSpec::new("patch-review", shown, "review").role("maintainer");
-        if !cx.task(&task).await?.approved {
+        if !cx.task(&task).await?.approved() {
             return Ok(Outcome::done(Tainted::trusted(json!({ "written": false }))));
         }
 

@@ -332,6 +332,18 @@ impl JournalStore for Faulty {
     async fn watch(&self, run: RunId) -> Option<crate::journal::AppendWatch> {
         self.inner.watch(run).await
     }
+
+    async fn watch_all(&self) -> Option<crate::journal::AppendWatch> {
+        self.inner.watch_all().await
+    }
+
+    async fn feed(
+        &self,
+        after: Option<&crate::journal::FeedCursor>,
+        limit: usize,
+    ) -> Result<crate::journal::FeedPage, StoreError> {
+        self.inner.feed(after, limit).await
+    }
     fn seals(&self) -> bool {
         self.inner.seals()
     }
@@ -634,6 +646,18 @@ mod tests {
         }
         async fn watch(&self, _run: RunId) -> Option<crate::journal::AppendWatch> {
             None
+        }
+
+        async fn watch_all(&self) -> Option<crate::journal::AppendWatch> {
+            None
+        }
+
+        async fn feed(
+            &self,
+            _: Option<&crate::journal::FeedCursor>,
+            _: usize,
+        ) -> Result<crate::journal::FeedPage, StoreError> {
+            unreachable!("the test reads capabilities only")
         }
         fn atomic(&self) -> Option<&dyn crate::journal::AtomicJournal> {
             Some(self)

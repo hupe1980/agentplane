@@ -33,7 +33,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             schema: None,
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await?;

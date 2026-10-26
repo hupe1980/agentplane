@@ -917,8 +917,8 @@ pub struct Label {""",
         "src/runtime/executor.rs",
         "a_spawned_run_is_a_child_of_the_callers_span",
         "a background run starts a trace of its own, so the embedder's task and verdict are not above it",
-        "            .in_current_span(),",
-        "            .instrument(tracing::Span::none()),",
+        "            }\n            .in_current_span(),",
+        "            }\n            .instrument(tracing::Span::none()),",
     ),
     "AGenAiSpanKeepsTheCratesName": (
         "src/runtime/ctx.rs",
@@ -2667,21 +2667,24 @@ pub struct Label {""",
         "a_withheld_proposal_refuses_an_approval_with_its_own_status",
         "an approval refused because the proposal cannot be shown is answered 409, "
         "telling the decider they lost a race nobody ran",
-        """            crate::core::RuntimeError::ProposalWithheld { .. } => {""",
-        """            crate::core::RuntimeError::ProposalWithheld { .. } if false => {""",
+        """            crate::core::RuntimeError::ProposalWithheld { .. }
+            | crate::core::RuntimeError::DecisionRefused { .. } => {""",
+        """            crate::core::RuntimeError::DecisionRefused { .. } => {""",
     ),
     "AMarkerShapedArgumentIsWithheld": (
         "src/runtime/sweeper.rs",
         "an_argument_spelled_like_the_marker_is_approvable",
         "whether a proposal is withheld is read from its shape, so untrusted "
         "input spelling `{\"$sealed\": …}` makes a task nobody can approve",
-        """            && let Some(reason) = current.as_ref().and_then(|task| task.withheld)""",
-        """            && let Some(reason) = current.as_ref().and_then(|task| {
+        """        if deciding && let Some(reason) = current.as_ref().and_then(|task| task.withheld) {""",
+        """        if deciding
+            && let Some(reason) = current.as_ref().and_then(|task| {
                 task.withheld.or_else(|| {
                     crate::journal::payload::is_sealed(&task.justification.proposed_action)
                         .then_some(crate::core::Withheld::Sealed)
                 })
-            })""",
+            })
+        {""",
     ),
     "ASealedRunsTerminalDecisionIsLost": (
         "src/runtime/executor.rs",
@@ -2728,10 +2731,8 @@ pub struct Label {""",
         "a_proposal_this_plane_cannot_open_is_not_approved",
         "a plane that cannot open a sealed proposal records an approval of it "
         "anyway, so a terminal with no key approves arguments nobody was shown",
-        """        if decision.approved
-            && let Some(reason) = current.as_ref().and_then(|task| task.withheld)""",
-        """        if false
-            && let Some(reason) = current.as_ref().and_then(|task| task.withheld)""",
+        """        if deciding && let Some(reason) = current.as_ref().and_then(|task| task.withheld) {""",
+        """        if false && let Some(reason) = current.as_ref().and_then(|task| task.withheld) {""",
     ),
     "ACaseHistoryPageCannotSeePastItself": (
         "src/api/mod.rs",
@@ -3693,8 +3694,8 @@ pub struct Label {""",
         "a continuation with no tool exchanges behind it is sent, so the "
         "effect key records a continuation the wire never carried and the "
         "provider is asked to continue a turn that never happened",
-        """    if continuation.is_some() && exchanges.is_empty() {""",
-        """    if false && continuation.is_some() && exchanges.is_empty() {""",
+        """    if continuation.is_some() && exchanges.is_empty() && told.is_empty() {""",
+        """    if false && continuation.is_some() && exchanges.is_empty() && told.is_empty() {""",
     ),
     "TheStandInEnforcesAnySchema": (
         "src/model/fake.rs",
@@ -3897,7 +3898,7 @@ pub struct Label {""",
         "own docs — is retried under the full policy, reported as a call that "
         "may have landed, and quarantines any group it was deferred in where "
         "the cheap abort was the truthful settlement",
-        """            _ => EffectError::Refused(error.to_string()),""",
+        """            _ => EffectError::refused(error.to_string()),""",
         """            _ => EffectError::Other(error.to_string()),""",
     ),
     "TheJournalCeilingIsJudgedOnReplay": (
@@ -5273,6 +5274,7 @@ pub struct Label {""",
         },""",
         """        408 | 425 => ModelError::Refused {
             model: model.clone(),
+            code: None,
             detail,
         },""",
     ),
@@ -6356,6 +6358,7 @@ pub struct Label {""",
     }""",
         """        return Err(ModelError::Refused {
             model: model.clone(),
+            code: None,
             detail,
         });
     }""",
@@ -12038,13 +12041,13 @@ pub struct Label {""",
             .and_then(|value| value.state.as_array())
             .cloned()
             .unwrap_or_default();
-        if !exchanges.is_empty() {
-            state.push(Self::tool_responses(exchanges));
+        if !exchanges.is_empty() || !told.is_empty() {
+            state.push(Self::user_turn(exchanges, told));
         }""",
         """        let mut state = Vec::new();
         let _ = prior;
-        if !exchanges.is_empty() {
-            state.push(Self::tool_responses(exchanges));
+        if !exchanges.is_empty() || !told.is_empty() {
+            state.push(Self::user_turn(exchanges, told));
         }""",
     ),
     "AnUnstoredResponseLosesItsReasoning": (
@@ -12313,8 +12316,8 @@ pub struct Label {""",
         "commentary-phase narration is concatenated into Completion::text, "
         "polluting the answer and breaking the JSON parse of a schema-bearing "
         "final turn",
-        """            .filter(|item| item.get("phase").and_then(Value::as_str) != Some("commentary"))""",
-        """            .filter(|_| true)""",
+        """        self.message_text(|phase| phase != Some("commentary"))""",
+        """        self.message_text(|_| true)""",
     ),
     "ACancelIsSilentlyARead": (
         "src/peers/a2a.rs",
@@ -13266,8 +13269,8 @@ pub struct WrappedKey {""",
         "a commission's cost is the effect's spend as well as the sub-run's, so "
         "the tenant's period is charged twice for one call and the "
         "commissioning run's ceiling counts it twice",
-        "    fn spend(&self, _output: &Self::Output) -> crate::core::Spend {\n        crate::core::Spend::ZERO\n    }",
-        "    fn spend(&self, output: &Self::Output) -> crate::core::Spend {\n        crate::core::Spend { tokens: output.tokens, minor_units: output.minor_units }\n    }",
+        "    /// sub-run's spend to this run's ceilings.\n    fn spend(&self, _output: &Self::Output) -> crate::core::Spend {\n        crate::core::Spend::ZERO\n    }",
+        "    /// sub-run's spend to this run's ceilings.\n    fn spend(&self, output: &Self::Output) -> crate::core::Spend {\n        crate::core::Spend { tokens: output.tokens, minor_units: output.minor_units }\n    }",
     ),
     "AReservationIgnoresTheStepsInFlight": (
         "src/runtime/executor.rs",
@@ -15483,8 +15486,8 @@ pub struct WrappedKey {""",
         "src/model/mod.rs",
         "an_unasked_summary_reaches_neither_the_journal_nor_the_stream",
         "a provider that volunteers reasoning puts it in the journal of a call that never asked for it",
-        """                    completion.reasoning = None;""",
-        """                    let _ = &completion;""",
+        """            completion.reasoning = None;""",
+        """            let _ = &completion;""",
     ),
     "AnUnaskedSummaryIsStreamed": (
         "src/model/mod.rs",
@@ -15513,6 +15516,380 @@ pub struct WrappedKey {""",
         "a run's model calls are not read back from its journal",
         """            RecordKind::EffectStarted { descriptor, .. } if descriptor.kind == "model.complete" => {""",
         """            RecordKind::EffectStarted { descriptor, .. } if descriptor.kind != "model.complete" => {""",
+    ),
+    "ResponsesDropsTheCommentary": (
+        "src/model/openai.rs",
+        "responses_keeps_the_words_beside_a_call",
+        "what the model said beside its calls on Responses never reaches the completion",
+        """            commentary: parsed.commentary(),""",
+        """            commentary: None,""",
+    ),
+    "ResponsesStreamsCommentaryAsAnswer": (
+        "src/model/openai_stream.rs",
+        "responses_streams_the_words_beside_a_call_as_commentary",
+        "a live view shows the model's narration as its answer, disagreeing with the finished completion",
+        """                    super::ModelStreamEvent::CommentaryDelta""",
+        """                    super::ModelStreamEvent::TextDelta""",
+    ),
+    "TheToolSpanForgetsTheCallId": (
+        "src/runtime/ctx.rs",
+        "a_tool_span_carries_the_models_call_id",
+        "a trace cannot join the model's call to the tool execution that answered it",
+        """                    span.record(telemetry::GEN_AI_TOOL_CALL_ID, call.as_str());""",
+        """                    let _ = call;""",
+    ),
+    "TheLoopForgetsTheCallItAnswers": (
+        "src/runtime/declarative.rs",
+        "a_tool_span_carries_the_models_call_id",
+        "the declarative loop executes the model's call without saying which call it answers",
+        """                        .and_then(|call| call.answering(&asked))""",
+        """                        .and_then(Ok)""",
+    ),
+    "AnAnswerClaimsAnotherTool": (
+        "src/tools/mod.rs",
+        "answering_another_tools_call_is_refused",
+        "a span says the model asked for the tool that ran when it asked for another",
+        """        if call.name != self.id.wire_name() {""",
+        """        if false {""",
+    ),
+    "TheProviderCodeIsDropped": (
+        "src/model/mod.rs",
+        "a_failed_run_names_its_effect_and_the_providers_code",
+        "a provider's own name for a refusal is lost between the driver and the record, so a caller reads the sentence to tell an exhausted account from a bad request",
+        """            Self::Refused { code, .. } => code.clone(),""",
+        """            Self::Refused { .. } => None,""",
+    ),
+    "TheFailureRecordForgetsTheCode": (
+        "src/runtime/ctx.rs",
+        "a_failed_run_names_its_effect_and_the_providers_code",
+        "the failure record drops the provider's code, so neither the outcome nor a replay can name it",
+        """                            code: e.code().map(str::to_owned),""",
+        """                            code: None,""",
+    ),
+    "TheFailureForgetsItsEffect": (
+        "src/runtime/executor.rs",
+        "a_failed_run_names_its_effect_and_the_providers_code",
+        "a failed run reaches its caller as a sentence, without the effect it ended on",
+        """    matches!(status, RunStatus::Failed(_))""",
+        """    matches!(status, RunStatus::Succeeded)""",
+    ),
+    "AnAnsweredRetryStandsAsTheFailure": (
+        "src/journal/failure.rs",
+        "a_failure_its_step_got_past_is_not_the_runs",
+        "a failure a retry already answered is named as the one the run ended on",
+        """            RecordKind::EffectDone { .. } | RecordKind::EffectReconciled { .. }""",
+        """            RecordKind::Swept { .. }""",
+    ),
+    "TheAccountReadsAsTheRequest": (
+        "src/journal/failure.rs",
+        "the_account_is_told_apart_from_the_request",
+        "an exhausted account or a rejected key reads as an ordinary refusal of the request",
+        """    ACCOUNT.iter().any(|name| code.contains(name))""",
+        """    ACCOUNT.iter().all(|name| code.contains(name))""",
+    ),
+    "AnthropicDropsThePersonsTurn": (
+        "src/model/anthropic.rs",
+        "anthropic_sends_the_persons_turn_after_the_history",
+        "a person's message never reaches an Anthropic model, so a conversation answers a question nobody asked",
+        """            .chain(told.iter().map(|text| json!({ "type": "text", "text": text })))""",
+        """            .chain(told.iter().filter(|_| false).map(|text| json!({ "type": "text", "text": text })))""",
+    ),
+    "ResponsesDropsThePersonsTurn": (
+        "src/model/openai.rs",
+        "responses_sends_the_persons_turn_after_the_history",
+        "a person's message never reaches a Responses model",
+        """    out.extend(person_turns(told));""",
+        """    let _ = told;""",
+    ),
+    "ChatCompletionsDropsThePersonsTurn": (
+        "src/model/chat_completions.rs",
+        "chat_completions_sends_the_persons_turn_after_the_history",
+        "a person's message never reaches a Chat Completions model",
+        """    out.extend(person_turns(told));""",
+        """    let _ = told;""",
+    ),
+    "GeminiDropsThePersonsTurn": (
+        "src/model/gemini.rs",
+        "gemini_sends_the_persons_turn_after_the_history",
+        "a person's message never reaches a Gemini model",
+        """                .chain(told.iter().map(|text| json!({ "text": text })))""",
+        """                .chain(told.iter().filter(|_| false).map(|text| json!({ "text": text })))""",
+    ),
+    "BedrockDropsThePersonsTurn": (
+        "src/model/bedrock.rs",
+        "a_persons_turn_follows_the_history",
+        "a person's message never reaches a Bedrock model",
+        """            .chain(told.iter().map(|text| json!({ "type": "text", "text": text })))""",
+        """            .chain(told.iter().filter(|_| false).map(|text| json!({ "type": "text", "text": text })))""",
+    ),
+    "ATextAnswerEndsTheConversation": (
+        "src/model/anthropic.rs",
+        "anthropic_sends_the_persons_turn_after_the_history",
+        "a text answer leaves no history, so a person's next message reaches a model that has forgotten the conversation",
+        """    let continuation = (!emulating).then(|| {""",
+        """    let continuation = (!emulating && !tool_calls.is_empty()).then(|| {""",
+    ),
+    "TheHistoryForgetsThePersonsTurn": (
+        "src/model/anthropic.rs",
+        "a_conversation_keeps_every_turn",
+        "a person's earlier messages vanish from the history, so the model answers the latest one without the ones before",
+        """    if !exchanges.is_empty() || !told.is_empty() {""",
+        """    if !exchanges.is_empty() {""",
+    ),
+    "ThePersonsLabelIsNotJoined": (
+        "src/model/mod.rs",
+        "a_persons_turn_joins_the_conversations_label",
+        "an untrusted message joins a conversation without its label, so the sink gate judges the call as if nobody untrusted had spoken",
+        """        self.label = self.label.join(message.label());""",
+        """        let _ = message.label();""",
+    ),
+    "APersonsTurnFollowsAnEndedConversation": (
+        "src/model/mod.rs",
+        "a_persons_turn_after_a_schema_answer_is_refused",
+        "a person's message after a schema answer reaches the model as the start of a new conversation",
+        """        if self.ended && !self.told.is_empty() {""",
+        """        if false {""",
+    ),
+    "ContinuingDropsThePersonsTurn": (
+        "src/model/mod.rs",
+        "a_conversation_is_one_run_across_suspensions",
+        "a call continuing a conversation leaves the person's message behind",
+        """        self.told.clone_from(&transcript.told);""",
+        """        self.told.clear();""",
+    ),
+    "AnthropicNeverAsksToCompact": (
+        "src/model/anthropic.rs",
+        "anthropic_compacts_reports_and_bills_the_pass",
+        "a call asking Anthropic to compact is sent without the edit, so the conversation runs into its window",
+        """            body["context_management"] = json!({ "edits": [edit] });""",
+        """            let _ = edit;""",
+    ),
+    "AnthropicForgetsTheCompactionBeta": (
+        "src/model/anthropic.rs",
+        "anthropic_compacts_reports_and_bills_the_pass",
+        "the compaction edit is sent without the beta that turns it on",
+        """            builder = builder.header("anthropic-beta", COMPACTION_BETA);""",
+        """            let _ = COMPACTION_BETA;""",
+    ),
+    "AnthropicBillsWithoutTheCompaction": (
+        "src/model/anthropic.rs",
+        "anthropic_compacts_reports_and_bills_the_pass",
+        "the compaction pass the provider bills is left out of usage, so a compacted call reads as the cheap one",
+        """        .filter(|pass| pass.kind != "message")""",
+        """        .filter(|_| false)""",
+    ),
+    "AnthropicHidesTheCompaction": (
+        "src/model/anthropic.rs",
+        "anthropic_compacts_reports_and_bills_the_pass",
+        "a reader of the journal cannot tell that the model worked from a summary from here on",
+        """    let compacted = compaction(&continuation);""",
+        """    let compacted: Option<super::Compacted> = None;""",
+    ),
+    "AnthropicTakesATriggerUnderItsFloor": (
+        "src/model/anthropic.rs",
+        "anthropic_refuses_a_trigger_under_its_floor",
+        "a trigger the provider refuses is sent, failing the call at the provider instead of before it",
+        """            if compaction.trigger_tokens < MIN_COMPACTION_TRIGGER {""",
+        """            if false {""",
+    ),
+    "ResponsesNeverAsksToCompact": (
+        "src/model/openai.rs",
+        "responses_compacts_and_reports_it",
+        "a call asking Responses to compact is sent without the threshold",
+        """                "compact_threshold": compaction.trigger_tokens,""",
+        """                "compact_threshold_unread": compaction.trigger_tokens,""",
+    ),
+    "ResponsesHidesTheCompaction": (
+        "src/model/openai.rs",
+        "responses_compacts_and_reports_it",
+        "a Responses compaction is never reported",
+        """            compacted: parsed.compacted(),""",
+        """            compacted: None,""",
+    ),
+    "ResponsesTakesSummaryInstructions": (
+        "src/model/openai.rs",
+        "responses_refuses_summary_instructions",
+        "summary instructions Responses cannot carry are dropped in silence",
+        """        if compaction.is_some_and(|c| c.instructions.is_some()) {""",
+        """        if false {""",
+    ),
+    "AWireThatCannotCompactAccepts": (
+        "src/model/chat_completions.rs",
+        "a_wire_that_cannot_compact_refuses",
+        "a wire with no compaction accepts the setting, so the conversation runs into its window unannounced",
+        """        if compaction.is_some() {""",
+        """        if false {""",
+    ),
+    "CompactionPastTheBoundIsSent": (
+        "src/model/mod.rs",
+        "compaction_past_the_input_bound_is_refused",
+        "a compaction that can never run under the call's input bound is sent anyway",
+        """            && compaction.trigger_tokens >= max""",
+        """            && false""",
+    ),
+    "TheManifestKeepsCompactionPastTheBound": (
+        "src/manifest/mod.rs",
+        "the_manifest_refuses_compaction_past_the_bound",
+        "a declaration promises a long conversation its own input bound refuses before the provider compacts",
+        """            && compaction.trigger_tokens >= max""",
+        """            && false""",
+    ),
+    "ACodedSkillForgetsTheCallItAnswers": (
+        "src/runtime/ctx.rs",
+        "a_coded_skills_tool_span_carries_the_call_it_answers",
+        "a coded skill answering a model's call executes the tool without saying which call it answers",
+        """                Some(asked) => call.and_then(|call| call.answering(asked)),""",
+        """                Some(_) => call,""",
+    ),
+    "AnUnofferedAnswerIsRecorded": (
+        "src/core/task.rs",
+        "an_answer_not_offered_is_refused",
+        "an answer the question never offered is recorded as the person's decision",
+        """            if !ask.free_text && !ask.choices.contains(answer) =>""",
+        """            if false =>""",
+    ),
+    "AnApprovalTaskTakesAnAnswer": (
+        "src/core/task.rs",
+        "an_approval_task_takes_no_answer",
+        "an answer to an approval task is recorded, leaving no verdict on what the task proposed",
+        """        (None, TaskVerdict::Answered(_)) => Err(""",
+        """        (None, TaskVerdict::Answered(_)) if false => Err(""",
+    ),
+    "TheWorklistRecordsAMisfit": (
+        "src/runtime/sweeper.rs",
+        "an_answer_not_offered_is_refused",
+        "a decision that does not decide its task is recorded and the task settled, so the person is never told",
+        """                crate::core::verdict_fits(row.justification.asks.as_ref(), &decision.verdict)""",
+        """                crate::core::verdict_fits(None, &crate::core::TaskVerdict::Rejected)""",
+    ),
+    "AnAnswerForgetsItsTask": (
+        "src/runtime/ctx.rs",
+        "a_question_is_answered_with_an_offered_choice",
+        "an answer reaches the skill without saying which task it answered",
+        """                .insert(crate::core::SourceId::new(format!("task:{}", spec.kind)));""",
+        """                .insert(crate::core::SourceId::new("task".to_owned()));""",
+    ),
+    "InMemoryStoresShareOneDatabase": (
+        "src/store/redb.rs",
+        "two_planes_in_memory_share_nothing",
+        "every in-memory store in a process is one database, so two planes see each other's runs, waits and halts",
+        """    pub fn open_in_memory() -> Result<Self, StoreError> {
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(|e| be(&e))?;
+        Self::init(db)
+    }""",
+        """    pub fn open_in_memory() -> Result<Self, StoreError> {
+        static SHARED: std::sync::OnceLock<RedbStore> = std::sync::OnceLock::new();
+        if let Some(shared) = SHARED.get() {
+            return Ok(shared.clone());
+        }
+        let db = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .map_err(|e| be(&e))?;
+        let store = Self::init(db)?;
+        let _ = SHARED.set(store.clone());
+        Ok(store)
+    }""",
+    ),
+    "AReadOnlyHandleWrites": (
+        "src/store/redb.rs",
+        "a_reader_beside_a_live_writer_sees_its_commits",
+        "a write through a read-only handle is attempted instead of refused as read-only",
+        """        Db::Reader(_) => Err(StoreError::ReadOnly),""",
+        """        Db::Reader(_) => Err(StoreError::Backend("no writer".into())),""",
+    ),
+    "AReadOnlyFollowerIsNeverWoken": (
+        "src/store/redb.rs",
+        "a_reader_beside_a_live_writer_sees_its_commits",
+        "a follower in another process is never woken, so a live view of a running project stands still",
+        """        if self.is_read_only() && self.signals.claim_poll(&tenant, run) {""",
+        """        if false && self.signals.claim_poll(&tenant, run) {""",
+    ),
+    "ASharedWriterHoldsTheFileAlone": (
+        "src/store/redb.rs",
+        "a_reader_beside_a_live_writer_sees_its_commits",
+        "a writer opened to be read beside locks the file alone, so no other process can read the project while it works",
+        """            .set_concurrency_mode(ConcurrencyMode::SingleWriter)
+            .create(path)""",
+        """            .create(path)""",
+    ),
+    "TheFeedSkipsARecord": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "a page resumes one past where it should, so a record at every page boundary is never served",
+        """                .saturating_add(1),""",
+        """                .saturating_add(2),""",
+    ),
+    "TheFeedForgetsAnAppend": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "an append takes no feed position, so a host following the feed never sees it",
+        """                    feed.insert((tenant.as_str(), position), (key.as_str(), seq))""",
+        """                    feed.insert((tenant.as_str(), 0), (key.as_str(), seq))""",
+    ),
+    "TheFeedServesAnInFlightPosition": (
+        "src/store/postgres.rs",
+        "the_feed_holds_behind_a_transaction_still_running",
+        "the feed serves past a transaction still running, so a reader skips that transaction's records forever when it commits",
+        """                    AND tx < pg_snapshot_xmin(pg_current_snapshot())""",
+        """                    AND TRUE""",
+    ),
+    "TheStoreSignalIsNeverRaised": (
+        "src/journal/signal.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "a follower of the whole feed is never woken, so a host polls every run instead",
+        """        self.raise_all(tenant);""",
+        """        let _ = tenant;""",
+    ),
+    "TheSealedFeedStaysSealed": (
+        "src/keyring/journal.rs",
+        "the_sealed_journal_satisfies_the_journal_store_contract",
+        "the feed through a sealing decorator serves sealed payloads that read() opens",
+        """            records: self.open_all(page.records).await?,""",
+        """            records: page.records,""",
+    ),
+    "AStartedCommissionIsAdmittedTwice": (
+        "src/runtime/ctx.rs",
+        "a_resumed_start_reattaches_to_its_sub_run",
+        "a start re-performed after a crash admits a second sub-run beside the first, and two specialists do the work",
+        """            provenance.dispatch.unwrap_or(provenance.effect)""",
+        """            crate::core::RunId::generate()""",
+    ),
+    "TwoParentsShareASubRun": (
+        "src/runtime/ctx.rs",
+        "two_parents_never_share_a_sub_run",
+        "the sub-run's key does not name its parent, so a second run commissioning the same work attaches to the first run's answer",
+        """            "agentplane.commission/{}/{}",
+            provenance.run,""",
+        """            "agentplane.commission/{}/{}",
+            "parent",""",
+    ),
+    "AStartedCommissionWaitsForItsAnswer": (
+        "src/runtime/executor.rs",
+        "started_commissions_run_at_the_same_time",
+        "a start waits for its sub-run to rest, so commissions started together run one after another",
+        """                    .insert(run, (parent, working));""",
+        """                    .insert(run, (parent, working));
+                let _ = Box::pin(self.rested_commission(run)).await;""",
+    ),
+    "AnAwaitedAnswerLosesItsSource": (
+        "src/runtime/ctx.rs",
+        "started_commissions_run_at_the_same_time",
+        "an awaited answer no longer says which agent wrote it, so a source rule cannot tell the specialists apart",
+        """    /// Which agent answered, as the start names it.
+    fn source(&self) -> crate::core::SourceId {
+        crate::core::SourceId::new(format!("agent/{}", self.capability))""",
+        """    /// Which agent answered, as the start names it.
+    fn source(&self) -> crate::core::SourceId {
+        crate::core::SourceId::new("agent".to_owned())""",
+    ),
+    "ConverseGetsTwoUserTurnsInARow": (
+        "src/model/bedrock.rs",
+        "a_first_persons_turn_joins_the_prompts_message",
+        "a person's first turn is sent as a second user message after the prompt, which Converse refuses",
+        """        || !user(&messages[prompt_len])""",
+        """        || true""",
     ),
 }
 

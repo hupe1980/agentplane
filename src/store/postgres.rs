@@ -119,6 +119,13 @@ CREATE TABLE IF NOT EXISTS journal (
     -- case's runs otherwise — a join that also **misses** every record written
     -- by a run the case does not own, which is exactly what a sweep is.
     case_id    TEXT,
+    -- The feed's order. A position alone is not commit order: two
+    -- transactions take positions in one order and commit in the other, and a
+    -- reader past the later one would skip the earlier forever. So the feed
+    -- orders by the writing transaction, then the position within it, and
+    -- serves only transactions older than every one still running.
+    tx         XID8   NOT NULL DEFAULT pg_current_xact_id(),
+    pos        BIGINT GENERATED ALWAYS AS IDENTITY,
     PRIMARY KEY (tenant, run_id, seq),
     -- Both halves of a signature or neither: half of one is a damaged row,
     -- and reading it as unsigned would strip the record's authorship.
@@ -129,6 +136,13 @@ CREATE TABLE IF NOT EXISTS journal (
 CREATE INDEX IF NOT EXISTS journal_by_case
     ON journal (tenant, case_id, run_id, seq)
     WHERE case_id IS NOT NULL;
+
+-- Every run's records in the feed's order, per tenant. A journal created
+-- before the feed gains its columns here; its existing rows take the current
+-- transaction, which is older than any later write.
+ALTER TABLE journal ADD COLUMN IF NOT EXISTS tx XID8 NOT NULL DEFAULT pg_current_xact_id();
+ALTER TABLE journal ADD COLUMN IF NOT EXISTS pos BIGINT GENERATED ALWAYS AS IDENTITY;
+CREATE INDEX IF NOT EXISTS journal_feed ON journal (tenant, tx, pos);
 
 CREATE TABLE IF NOT EXISTS run_activity (
     tenant     TEXT   NOT NULL,
@@ -1267,6 +1281,73 @@ impl JournalStore for PostgresStore {
         let follower = self.signals.subscribe(&self.tenant_name(), run);
         self.listen().await;
         Some(follower)
+    }
+
+    /// Every append's notification raises the tenant too, so this rides the
+    /// same listening connection `watch` opens.
+    async fn watch_all(&self) -> Option<crate::journal::AppendWatch> {
+        let follower = self.signals.subscribe_all(&self.tenant_name());
+        self.listen().await;
+        Some(follower)
+    }
+
+    async fn feed(
+        &self,
+        after: Option<&crate::journal::FeedCursor>,
+        limit: usize,
+    ) -> Result<crate::journal::FeedPage, StoreError> {
+        let (tx, pos) = match after {
+            None => ("0".to_owned(), 0_i64),
+            Some(cursor) => cursor
+                .as_str()
+                .split_once('.')
+                .and_then(|(tx, pos)| {
+                    tx.parse::<u64>().ok()?;
+                    Some((tx.to_owned(), pos.parse::<i64>().ok()?))
+                })
+                .ok_or_else(|| StoreError::Backend(format!("'{cursor}' is not a feed cursor")))?,
+        };
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        // Below the oldest running transaction, a transaction's rows are all
+        // committed or all gone for good, so nothing can later appear behind
+        // a position served from there.
+        let rows = client
+            .query(
+                "SELECT seq, prev_hash, hash, raw, key_id, signature, tx::text, pos FROM journal
+                  WHERE tenant = $1 AND (tx, pos) > ($2::text::xid8, $3)
+                    AND tx < pg_snapshot_xmin(pg_current_snapshot())
+                  ORDER BY tx, pos LIMIT $4",
+                &[
+                    &self.tenant_name(),
+                    &tx,
+                    &pos,
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let mut records = Vec::with_capacity(rows.len());
+        let mut next = after.cloned();
+        for row in rows {
+            let seq: i64 = row.get(0);
+            let prev: Vec<u8> = row.get(1);
+            let hash: Vec<u8> = row.get(2);
+            let raw: Vec<u8> = row.get(3);
+            let key_id: Option<String> = row.get(4);
+            let signature: Option<Vec<u8>> = row.get(5);
+            let tx: String = row.get(6);
+            let pos: i64 = row.get(7);
+            let signature = signature_of(seq.cast_unsigned(), key_id, signature)?;
+            records.push(Record::from_stored_with(
+                self.upcaster.as_ref(),
+                raw,
+                digest_from(&prev)?,
+                digest_from(&hash)?,
+                signature,
+            )?);
+            next = Some(crate::journal::FeedCursor::new(format!("{tx}.{pos}")));
+        }
+        Ok(crate::journal::FeedPage { records, next })
     }
 
     /// The topology an embedded store cannot serve: several plane instances

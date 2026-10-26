@@ -396,14 +396,15 @@ fn messages(prompt: &Value) -> Vec<Value> {
 fn continue_with(
     out: &mut Vec<Value>,
     exchanges: &[super::ToolExchange],
+    told: &[String],
     continuation: Option<&super::ProviderContinuation>,
 ) {
-    if exchanges.is_empty() {
+    if exchanges.is_empty() && told.is_empty() {
         return;
     }
     if let Some(state) = continuation.and_then(|c| c.state.as_array()) {
         out.extend(state.iter().cloned());
-    } else {
+    } else if !exchanges.is_empty() {
         // Compatibility path for manually assembled exchanges: rebuild the
         // assistant turn the wire needs from the calls the caller carries.
         out.push(json!({
@@ -418,16 +419,14 @@ fn continue_with(
             })).collect::<Vec<_>>(),
         }));
     }
-    for e in exchanges {
-        out.push(json!({
-            "role": "tool",
-            "tool_call_id": e.call.id,
-            "content": match &e.output {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            },
-        }));
-    }
+    out.extend(tool_messages(exchanges));
+    out.extend(person_turns(told));
+}
+
+/// What a person said, as user messages after the tool results.
+fn person_turns(told: &[String]) -> impl Iterator<Item = Value> + '_ {
+    told.iter()
+        .map(|text| json!({ "role": "user", "content": text }))
 }
 
 /// One `tool` result message per exchange, for continuation accumulation.
@@ -459,6 +458,7 @@ impl ChatCompletions {
         schema: Option<&Value>,
         tools: &[super::ToolDeclaration],
         exchanges: &[super::ToolExchange],
+        told: &[String],
         continuation: Option<&super::ProviderContinuation>,
     ) -> Result<Value, ModelError> {
         if let Some(state) = continuation
@@ -466,12 +466,13 @@ impl ChatCompletions {
         {
             return Err(ModelError::Refused {
                 model: model.clone(),
+                code: None,
                 detail: "the continuation was not a chat-completions message array".to_owned(),
             });
         }
-        super::refuse_dangling_continuation(continuation, exchanges, model)?;
+        super::refuse_dangling_continuation(continuation, exchanges, told, model)?;
         let mut msgs = messages(prompt);
-        continue_with(&mut msgs, exchanges, continuation);
+        continue_with(&mut msgs, exchanges, told, continuation);
         let mut body = json!({
             "model": model.model,
             "messages": msgs,
@@ -488,6 +489,7 @@ impl ChatCompletions {
                 // this driver itself constructed invalid.
                 return Err(ModelError::Refused {
                     model: model.clone(),
+                    code: None,
                     detail: format!(
                         "model '{}' obtains a declared response schema by forcing a \
                          synthetic tool, which cannot be combined with the {} tool(s) \
@@ -670,7 +672,9 @@ impl ChatCompletions {
         // sends something other than `assistant`, would produce a history entry
         // the next request cannot use, and the message's own position in the
         // conversation is this driver's fact rather than the server's.
-        let continuation = (!calls.is_empty()).then(|| {
+        // Every answer leaves the turn it was, so a person can speak after it
+        // — except the forced tool that shapes a schema answer.
+        let continuation = (!emulating).then(|| {
             let mut message = choice.message.raw.clone();
             match message.as_object_mut() {
                 Some(object) => {
@@ -707,6 +711,8 @@ impl ChatCompletions {
             truncated,
             continuation,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         })
     }
 
@@ -871,12 +877,7 @@ fn stream_error(
             &json!({ "error": error }).to_string(),
         );
     }
-    let named = |key: &str| error.get(key).and_then(Value::as_str).unwrap_or_default();
-    classify_named(
-        model,
-        &format!("{} {}", named("type"), named("code")),
-        detail,
-    )
+    classify_named(model, error, detail)
 }
 
 /// Extend the provider transcript after a successful tool-calling response.
@@ -884,6 +885,7 @@ fn accumulate_continuation(
     completion: &mut Completion,
     prior: Option<&super::ProviderContinuation>,
     exchanges: &[super::ToolExchange],
+    told: &[String],
 ) {
     let Some(current) = completion.continuation.as_mut() else {
         return;
@@ -893,6 +895,7 @@ fn accumulate_continuation(
         .cloned()
         .unwrap_or_default();
     state.extend(tool_messages(exchanges));
+    state.extend(person_turns(told));
     if let Some(items) = current.state.as_array() {
         state.extend(items.iter().cloned());
     }
@@ -930,12 +933,23 @@ impl ModelProvider for ChatCompletions {
             schema,
             tools,
             exchanges,
+            told,
             continuation,
+            compaction,
             stream,
         } = request;
 
         super::refuse_provider_side_media(prompt, model)?;
         super::refuse_in_thread_instructions(prompt, model)?;
+        // No compaction exists on this wire, and a conversation that asked
+        // for one would otherwise run into its window unannounced.
+        if compaction.is_some() {
+            return Err(ModelError::Refused {
+                model: model.clone(),
+                code: None,
+                detail: "the chat-completions wire has no server-side compaction".to_owned(),
+            });
+        }
 
         // No model-family-neutral spelling exists on this wire. Refused
         // rather than dropped: a declared control that silently does nothing
@@ -943,6 +957,7 @@ impl ModelProvider for ChatCompletions {
         if reasoning_effort.is_some() {
             return Err(ModelError::Refused {
                 model: model.clone(),
+                code: None,
                 detail: "the chat-completions wire has no neutral reasoning-effort \
                          mapping; configure the model's own default instead"
                     .to_owned(),
@@ -958,6 +973,7 @@ impl ModelProvider for ChatCompletions {
             schema,
             tools,
             exchanges,
+            told,
             continuation,
         )?;
         let mut http = self
@@ -1002,7 +1018,7 @@ impl ModelProvider for ChatCompletions {
                 label.clone(),
             ));
         }
-        accumulate_continuation(&mut completion, continuation, exchanges);
+        accumulate_continuation(&mut completion, continuation, exchanges, told);
         Ok(completion)
     }
 }

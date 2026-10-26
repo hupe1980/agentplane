@@ -170,7 +170,10 @@ grep -q 'Succeeded' <<<"$out" || { echo "FAIL: the tool loop did not succeed: $o
 # Success alone is not evidence the server was reached: a loop whose model never
 # asks for a tool succeeds too. The server's answer is in the journal only if
 # the call went out and came back.
-"${MCPBIN[@]}" export --store "$tdir/t.redb" 2>/dev/null | grep -q 'printer on fire' || {
+# Captured, not piped: `grep -q` stops at the first match, and under pipefail
+# the export it leaves writing into a closed pipe fails the check.
+exported="$("${MCPBIN[@]}" export --store "$tdir/t.redb" 2>/dev/null)"
+grep -q 'printer on fire' <<<"$exported" || {
     echo "FAIL: the run succeeded and the MCP server's answer is not in its journal"; exit 1; }
 rm -rf "$tdir"
 echo "ok: started the server, derived the catalogue, called the tool, completed the run"

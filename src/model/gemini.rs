@@ -334,6 +334,7 @@ impl Gemini {
             .or_else(|_| std::env::var("GOOGLE_API_KEY"))
             .map_err(|_| ModelError::Refused {
                 model: ModelId::new(PROVIDER, "*"),
+                code: None,
                 detail: "neither GEMINI_API_KEY nor GOOGLE_API_KEY is set".to_owned(),
             })?;
         Self::new(key)
@@ -428,6 +429,7 @@ impl Gemini {
     fn refused(model: &ModelId, detail: impl Into<String>) -> ModelError {
         ModelError::Refused {
             model: model.clone(),
+            code: None,
             detail: detail.into(),
         }
     }
@@ -520,12 +522,13 @@ impl Gemini {
             schema,
             tools,
             exchanges,
+            told,
             continuation,
             ..
         } = request;
 
         let mut contents = Self::contents(prompt);
-        Self::append_tool_turns(&mut contents, exchanges, *continuation, model)?;
+        Self::append_tool_turns(&mut contents, exchanges, told, *continuation, model)?;
 
         let mut generation_config = json!({ "maxOutputTokens": max_output_tokens });
         if let Some(effort) = reasoning_effort {
@@ -611,10 +614,11 @@ impl Gemini {
     fn append_tool_turns(
         contents: &mut Value,
         exchanges: &[super::ToolExchange],
+        told: &[String],
         continuation: Option<&super::ProviderContinuation>,
         model: &ModelId,
     ) -> Result<(), ModelError> {
-        if exchanges.is_empty() {
+        if exchanges.is_empty() && told.is_empty() {
             if continuation.is_some() {
                 // Silently dropping it would journal an effect key that
                 // records a continuation the wire never carried.
@@ -658,6 +662,7 @@ impl Gemini {
             // carries no thought signature, and a thinking model will refuse
             // it. Callers who ran the model through this driver always have
             // one.
+            None if exchanges.is_empty() => {}
             None => array.push(json!({
                 "role": "model",
                 "parts": exchanges
@@ -669,13 +674,14 @@ impl Gemini {
             })),
         }
 
-        array.push(Self::tool_responses(exchanges));
+        array.push(Self::user_turn(exchanges, told));
         Ok(())
     }
 
-    /// The results turn: one user content of `functionResponse` parts, in the
-    /// order the calls were made.
-    fn tool_responses(exchanges: &[super::ToolExchange]) -> Value {
+    /// The turn that follows an answer: one user content of `functionResponse`
+    /// parts, in the order the calls were made, then what a person said as
+    /// text parts.
+    fn user_turn(exchanges: &[super::ToolExchange], told: &[String]) -> Value {
         json!({
             "role": "user",
             "parts": exchanges
@@ -697,6 +703,7 @@ impl Gemini {
                     }
                     json!({ "functionResponse": response })
                 })
+                .chain(told.iter().map(|text| json!({ "text": text })))
                 .collect::<Vec<_>>(),
         })
     }
@@ -709,6 +716,7 @@ impl Gemini {
         completion: &mut Completion,
         prior: Option<&super::ProviderContinuation>,
         exchanges: &[super::ToolExchange],
+        told: &[String],
     ) {
         let Some(current) = completion.continuation.as_mut() else {
             return;
@@ -717,8 +725,8 @@ impl Gemini {
             .and_then(|value| value.state.as_array())
             .cloned()
             .unwrap_or_default();
-        if !exchanges.is_empty() {
-            state.push(Self::tool_responses(exchanges));
+        if !exchanges.is_empty() || !told.is_empty() {
+            state.push(Self::user_turn(exchanges, told));
         }
         if let Some(turns) = current.state.as_array() {
             state.extend(turns.iter().cloned());
@@ -830,11 +838,16 @@ impl Gemini {
         // bare turn: the state must carry *every* prior round, or round
         // three's request forgets round one's signed turn — silently, since
         // the model simply re-asks with amnesia.
-        let continuation = (!calls.is_empty() && content.is_object())
+        //
+        // Every answer leaves it, so a person can speak after it — except the
+        // forced function that shapes a schema answer.
+        let continuation = (!emulating && content.is_object())
             .then(|| super::ProviderContinuation::new(PROVIDER, json!([content.clone()])));
 
         Ok(Completion {
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            commentary: None,
+            compacted: None,
             structured: structured_value,
             tool_calls: calls,
             text,
@@ -1202,6 +1215,10 @@ impl ModelProvider for Gemini {
         let model = request.model;
         super::refuse_provider_side_media(request.prompt, model)?;
         super::refuse_in_thread_instructions(request.prompt, model)?;
+        // No server-side compaction exists on this wire.
+        if request.compaction.is_some() {
+            return Err(Self::refused(model, "Gemini has no server-side compaction"));
+        }
         self.check_egress(model)?;
 
         let body = self.body(model, &request)?;
@@ -1252,7 +1269,12 @@ impl ModelProvider for Gemini {
                 label.clone(),
             ));
         }
-        Self::accumulate_continuation(&mut completion, request.continuation, request.exchanges);
+        Self::accumulate_continuation(
+            &mut completion,
+            request.continuation,
+            request.exchanges,
+            request.told,
+        );
         Ok(completion)
     }
 }

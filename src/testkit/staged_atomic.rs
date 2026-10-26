@@ -141,6 +141,18 @@ impl JournalStore for StagedAtomic {
     async fn watch(&self, run: RunId) -> Option<crate::journal::AppendWatch> {
         self.inner.watch(run).await
     }
+
+    async fn watch_all(&self) -> Option<crate::journal::AppendWatch> {
+        self.inner.watch_all().await
+    }
+
+    async fn feed(
+        &self,
+        after: Option<&crate::journal::FeedCursor>,
+        limit: usize,
+    ) -> Result<crate::journal::FeedPage, StoreError> {
+        self.inner.feed(after, limit).await
+    }
     fn seals(&self) -> bool {
         self.inner.seals()
     }

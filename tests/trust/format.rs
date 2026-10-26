@@ -207,6 +207,7 @@ fn effects() -> Vec<RecordKind> {
             permanent: true,
             unreproducible: Some(format!("blob {}", digest())),
             elapsed_ms: Some(30_000),
+            code: None,
         },
         RecordKind::EffectReconciled {
             disposition: Disposition::Landed,

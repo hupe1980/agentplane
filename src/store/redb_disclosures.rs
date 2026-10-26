@@ -1,7 +1,7 @@
 //! The disclosure register over redb: one table, keyed by tenant and act id.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 
 use crate::core::{CaseId, RunId, StoreError};
 use crate::disclosure::{Disclosure, DisclosureRegister};

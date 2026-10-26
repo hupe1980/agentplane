@@ -141,6 +141,8 @@ fn plans(structured: Value) -> Completion {
         truncated: false,
         continuation: None,
         reasoning: None,
+        commentary: None,
+        compacted: None,
     }
 }
 

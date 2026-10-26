@@ -16,6 +16,107 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.54.0] — 2026-10-26
+
+### Added
+
+- **What the model says beside its calls.** `Completion::commentary` holds an
+  OpenAI Responses model's commentary-phase narration, journaled and labelled
+  with the answer; `ModelStreamEvent::CommentaryDelta` streams it live. Every
+  other wire marks no phase, so its narration stays in `text`. The dev page
+  shows it.
+- **A person's turn in a conversation.** `Transcript::told(&message)` adds a
+  person's message as the next user turn, its label joined. Every driver
+  sends it and keeps a continuation on a text answer, so a conversation can
+  follow one; a turn after a schema-forced answer is refused. One run can hold
+  a whole conversation across suspensions (cookbook: *Hold a conversation in
+  one run*).
+- **Compaction the provider performs.** `ModelCall::with_compaction(Compaction::at(n))`,
+  or `compaction:` on a manifest role, asks Anthropic or OpenAI Responses to
+  compact inside their own continuation; `Completion::compacted` reports it.
+  Other drivers refuse the call. A trigger at or above `max_input_tokens` is
+  refused.
+- **A question a person answers.** `TaskSpec::question(..).choices([..])` and
+  `cx.question(&spec)`, whose answer arrives trusted from `task:<kind>`. An
+  answer outside the choices, an approval of a question or an answer to an
+  approval task is refused before it is recorded (`DecisionRefused`, HTTP 422).
+  `agentplane decide <task> answer --answer …`.
+- **A feed across runs.** `JournalStore::feed(after, limit)` serves every
+  record of every run in the tenant, once, from an opaque `FeedCursor`, and
+  `JournalStore::watch_all` wakes on any append. On `PostgreSQL` the feed
+  orders by writing transaction and serves only below the oldest running one,
+  so a later commit never lands behind a reader's cursor.
+- **Commissions that run while the skill continues.** `StepCtx::start_commission`
+  admits the sub-run and returns a `runtime::Started` at once; `StepCtx::await_commission` collects
+  its answer. Started together, sub-runs work at the same time. The start is
+  the ordinary `agent.commission` effect under every gate a commission
+  passes, and `commission` is now a start followed by its await
+  (`agent.commission.await`, a journaled read).
+- **A journal another process reads.** `RedbStore::open_shared` opens a file
+  that other processes may read while this one writes, and
+  `RedbStore::open_read_only` reads it beside the live writer: every read
+  works, every write is `StoreError::ReadOnly`, nothing is written on open, and
+  a run is followed by polling. A shared writer commits in two phases, about
+  twice `open`'s commit time; `open` keeps the file to itself. Built on redb's
+  `experimental-multiprocess`.
+- **Two planes in one process share nothing:** two runtimes on two stores see
+  none of each other's runs, waits, leases, halts, signals or listings. A tenant partitions one store; it is not this boundary.
+- **A failure a caller can tell apart.** `RunOutcome::failed_effect` names
+  the effect a failed run ended on — kind, disposition, permanence and the
+  provider's code — read from the journal by `journal::failed_effect`, so a
+  replay answers alike. `FailedEffect::refuses_the_account` tells an exhausted
+  quota, billing or a bad key from a bad request, on every shipped driver.
+- **`gen_ai.tool.call.id` on tool spans.** The tool-calling loop records the
+  provider's id for the call each execution answers; a coded skill answering a
+  model's call uses `StepCtx::call_tool_for(&call, tool, arguments)`, which
+  refuses a call that named another tool. Telemetry only: outside the effect
+  key.
+
+### Changed
+
+- **BREAKING: new `Completion` fields** `commentary` and `compacted`. A literal
+  adds `commentary: None, compacted: None`.
+- **BREAKING: `Request` gains `told` and `compaction`**; a provider
+  destructuring it names both. `ModelRole` and `manifest::ModelRef` gain
+  `compaction`; `fake::Ask` gains `told`, `continuation` and `compaction`.
+- **A text answer now carries a continuation** on every driver, so a
+  completion's journaled output is larger by the turn it answered. The fake
+  provider leaves one too, except after a schema answer.
+- **BREAKING: provider codes on refusals.** `ModelError::Refused` gains
+  `code`; `EffectError::Refused` is a struct variant `{ detail, code }`, built
+  with `EffectError::refused(detail)`; `RecordKind::EffectFailed` gains an
+  optional `code`; `RunOutcome` gains `failed_effect`. A pre-freeze record
+  change: an older journal reads with `code` absent.
+- **BREAKING: a commission interrupted by a crash re-attaches** instead of waiting on
+  an operator: its sub-run is admitted under a key derived from the
+  commissioning run and the dispatch, so the re-performed start finds it.
+  The `agent.commission` effect's output is now `{run}`; the answer and
+  spend are on the `agent.commission.await` effect that follows it. A
+  pre-freeze record change: a run that commissioned under an earlier release
+  does not strictly replay.
+- **BREAKING: `JournalStore` gains `feed` and `watch_all`**, with no
+  default: a decorator forwards both. The `PostgreSQL` journal gains `tx`
+  (`xid8`) and `pos` columns and a `journal_feed` index, and redb a `feed`
+  table; both change in place, with no migration — recreate a development
+  database.
+- **BREAKING: a decision is a verdict.** `Decision::approved` (a field) is
+  `Decision::verdict: TaskVerdict` (`approved`, `rejected`, `answered`), read
+  with `Decision::approved()` and `answered()`; `Justification` gains `asks`.
+  The decide body's `approved` is optional beside `answer`, and its answer
+  carries `verdict`. A pre-freeze record change: a journal holding a decision
+  from an earlier release does not read.
+- **BREAKING: `core::GenAiRequest::call_id`.** An effect reporting a GenAI
+  request adds `call_id: None`.
+
+### Fixed
+
+- **Anthropic compaction billed as the cheap call.** With compaction on, the
+  provider's top-level token counts leave out the compaction pass;
+  `usage.iterations` is now summed, on the buffered and streamed paths.
+- **Responses narration streamed as the answer.** A commentary-phase message's
+  deltas arrived as `TextDelta` while `Completion::text` left them out, so a
+  live view and the finished completion disagreed about what the answer was.
+
 ## [0.53.0] — 2026-10-26
 
 ### Added

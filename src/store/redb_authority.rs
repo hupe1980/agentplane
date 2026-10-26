@@ -10,7 +10,7 @@
 //! window is the whole guarantee when a ceiling is nearly spent.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 
 use crate::authority::{
     AuthorityError, AuthorityId, AuthorityState, AuthorityStore, Drawn, Holder, Revocation,

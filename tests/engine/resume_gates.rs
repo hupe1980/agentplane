@@ -847,6 +847,7 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         permanent: false,
                         unreproducible: None,
                         elapsed_ms: None,
+                        code: None,
                     },
                 )
                 .step(StepId(1))

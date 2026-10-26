@@ -307,7 +307,9 @@ async fn openai_accepts_our_tool_declaration_and_asks_for_it() {
             schema: None,
             tools: &tools,
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await

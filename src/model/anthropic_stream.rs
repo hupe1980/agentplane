@@ -61,6 +61,8 @@ pub struct Accumulator {
     tools: std::collections::BTreeMap<u64, ToolBlock>,
     /// Which content block index is the forced structured-output tool.
     tool_index: Option<u64>,
+    /// What compaction passes read and wrote, beside the answer's counts.
+    compaction: (u64, u64),
     usage: Usage,
     /// The model the provider says answered, from `message_start`.
     served_model: Option<String>,
@@ -104,6 +106,9 @@ struct WireUsage {
     /// The writes split by cache tier. Absent on a response that wrote none.
     #[serde(default)]
     cache_creation: Option<super::anthropic::CacheCreation>,
+    /// Each sampling pass, when compaction is on.
+    #[serde(default)]
+    iterations: Option<Vec<super::anthropic::Iteration>>,
 }
 
 impl Accumulator {
@@ -199,7 +204,7 @@ impl Accumulator {
             .collect()
     }
 
-    /// Exact assistant content to round-trip on a tool continuation.
+    /// Exact assistant content to round-trip on the next turn.
     #[must_use]
     pub fn continuation_content(&self) -> Value {
         Value::Array(
@@ -372,6 +377,13 @@ impl Accumulator {
                     self.append_block_string(value, "signature", signature);
                 }
             }
+            // The summary arrives whole, in one delta; the block carries it
+            // back on the next request.
+            Some("compaction_delta") => {
+                if let Some(summary) = delta.get("content").and_then(Value::as_str) {
+                    self.append_block_string(value, "content", summary);
+                }
+            }
             _ => {}
         }
         None
@@ -424,6 +436,9 @@ impl Accumulator {
         if let Some(v) = w.output_tokens {
             self.usage.output_tokens = v;
         }
+        if let Some(passes) = w.iterations {
+            self.compaction = super::anthropic::beside_the_answer(&passes);
+        }
     }
 
     /// The prompt cost, with the cache counters folded back in.
@@ -437,8 +452,8 @@ impl Accumulator {
         // counts beside `input_tokens`, and one spelling of that arithmetic is
         // what keeps the two paths from billing a cached call differently.
         Usage::with_cache_beside_input(
-            self.usage.input_tokens,
-            self.usage.output_tokens,
+            self.usage.input_tokens.saturating_add(self.compaction.0),
+            self.usage.output_tokens.saturating_add(self.compaction.1),
             self.usage.cache_write_tokens,
             self.usage.cache_read_tokens,
         )
@@ -522,6 +537,33 @@ mod tests {
             acc.event(&n, &d);
         }
         assert_eq!(acc.text(), expected);
+    }
+
+    /// A streamed compaction block keeps its summary for the next request,
+    /// and the compaction pass is billed beside the answer's counts.
+    #[test]
+    fn a_streamed_compaction_is_kept_and_billed() {
+        let mut acc = Accumulator::new();
+        acc.event(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"compaction"}}"#,
+        );
+        acc.event(
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"compaction_delta","content":"The user asked about balances."}}"#,
+        );
+        acc.event(
+            "message_delta",
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":10,"output_tokens":5,
+                "iterations":[{"type":"compaction","input_tokens":180000,"output_tokens":2000},
+                              {"type":"message","input_tokens":10,"output_tokens":5}]}}"#,
+        );
+        assert_eq!(
+            acc.continuation_content()[0]["content"],
+            "The user asked about balances."
+        );
+        assert_eq!(acc.billed().input_tokens, 180_010);
+        assert_eq!(acc.billed().output_tokens, 2_005);
     }
 
     #[test]

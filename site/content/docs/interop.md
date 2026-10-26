@@ -1051,9 +1051,38 @@ Details worth stating:
   reasoning stays in the continuation, and a call that did not ask never
   carries a summary, whatever its provider volunteered.
 
+* **What the model says beside its calls is its own field.** Responses marks
+  narration on the way to a tool call as a `commentary`-phase message; it is
+  `Completion::commentary` and streams as `ModelStreamEvent::CommentaryDelta`,
+  and `text` is the answer alone, so a schema answer still parses. Every other
+  wire marks no phase, so the same words are in `text`.
+
+* **A person speaks after any answer.** `Transcript::told` adds a person's
+  message as the user turn after the history — after the tool results, in the
+  same turn — and every driver keeps a continuation on a text answer, so the
+  next call carries the whole conversation. A schema-forced answer leaves
+  none: its forced call has no result to follow, and a person's turn after it
+  is refused before any request.
+
+* **Compaction is the provider's, asked for per call or role.**
+  `ModelCall::with_compaction(Compaction::at(tokens))` — or `compaction:` on a
+  manifest role — asks the provider to summarise the conversation inside its
+  own continuation once input reaches the trigger:
+
+  | Driver | Asked as | Reported |
+  |---|---|---|
+  | Anthropic | beta `compact-2026-01-12`, `context_management.edits: [compact_20260112]`; trigger ≥ 50 000; optional `instructions` | `Completion::compacted` with the `compaction` block's summary; `usage.iterations` billed |
+  | OpenAI Responses | `context_management: [{type: compaction, compact_threshold}]`; no instructions | `Completion::compacted`, no summary: the item is encrypted |
+  | Chat Completions, Gemini, Bedrock | refused before the request | — |
+
+  The instruction is never compacted: it is `system` on Anthropic and
+  `instructions` on Responses. A trigger at or above the role's
+  `max_input_tokens` is refused, since the call would be refused at the bound
+  before the provider compacted.
+
 * **Live deltas are labelled projections, not replay truth.** An optional
-  `ModelStreamObserver` receives answer text, a requested reasoning summary
-  and terminal usage while the provider still produces one canonical
+  `ModelStreamObserver` receives answer text, commentary, a requested reasoning
+  summary and terminal usage while the provider still produces one canonical
   completion. Events inherit untrusted trust and the call's output
   sensitivity; opaque reasoning is never exposed. Observer delivery is advisory
   and strict replay emits no live events. `ModelStreamEvent` is

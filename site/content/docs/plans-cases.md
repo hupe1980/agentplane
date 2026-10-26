@@ -680,6 +680,14 @@ order to **disagree**:
 | `cost` | What acting will cost |
 | `evidence` | The trail behind the proposal |
 | `due_at` | Taken from the case's obligation, so reviewer and case share one deadline |
+| `asks` | On a question, the answers offered and whether free text is accepted — so the reviewed digest covers what the person was asked |
+
+A decision is a verdict: **approved**, **rejected**, or **answered** with text.
+An approval task is approved or rejected; a question
+(`TaskSpec::question`, awaited with `cx.question`) is answered or declined, never
+approved, so the record never shows a permission nobody was asked for. A
+verdict that does not fit its task — an answer outside the offered choices
+included — is refused before anything is recorded.
 
 ### Four eyes
 

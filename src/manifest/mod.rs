@@ -685,6 +685,29 @@ fn refuse_zero_ceilings(models: &Models) -> Result<(), ManifestError> {
     Ok(())
 }
 
+/// A role that compacts at or above its own `max_input_tokens` never
+/// compacts: the call is refused at the bound before the provider would have
+/// summarised, so the declaration promises a long conversation it cannot hold.
+fn refuse_compaction_past_the_bound(models: &Models) -> Result<(), ManifestError> {
+    for (field, m) in [
+        ("spec.models.privileged.compaction", &models.privileged),
+        ("spec.models.quarantined.compaction", &models.quarantined),
+    ] {
+        let Some(m) = m else { continue };
+        if let (Some(compaction), Some(max)) = (&m.compaction, m.max_input_tokens)
+            && compaction.trigger_tokens >= max
+        {
+            return Err(ManifestError::Unenforceable {
+                field,
+                detail: "compaction must trigger below the role's max_input_tokens — a \
+                         call reaching the trigger is refused at the bound first, so \
+                         the provider never compacts",
+            });
+        }
+    }
+    Ok(())
+}
+
 impl OversightDeadline {
     /// A deadline with no parameters, as YAML gives one that names only these.
     ///
@@ -1093,6 +1116,13 @@ pub struct ModelRef {
     /// `chat-completions`, `bedrock` — sends nothing and returns none.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reasoning_summary: bool,
+    /// Ask the provider to compact the conversation once a call's input
+    /// reaches `trigger_tokens`, optionally under summary `instructions`.
+    /// `anthropic` (at least 50 000) and `openai` (no instructions) compact;
+    /// every other driver refuses the call. Must be below `max_input_tokens`
+    /// when both are declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<crate::model::Compaction>,
     /// What this model's tokens cost, in minor units per million tokens.
     ///
     /// Required on every declared role when `budgets.max_minor_units` is set:
@@ -1115,6 +1145,7 @@ impl ModelRef {
             max_input_tokens: None,
             reasoning_effort: None,
             reasoning_summary: false,
+            compaction: None,
             pricing: None,
         }
     }
@@ -1161,6 +1192,7 @@ impl ModelRef {
 fn role(r: &ModelRef) -> crate::model::ModelRole {
     crate::model::ModelRole {
         reasoning_summary: r.reasoning_summary,
+        compaction: r.compaction.clone(),
         model: crate::model::ModelId::new(&r.provider, &r.model),
         max_output_tokens: r.max_tokens,
         max_input_tokens: r.max_input_tokens,
@@ -3011,6 +3043,7 @@ impl Manifest {
         }
 
         refuse_zero_ceilings(models)?;
+        refuse_compaction_past_the_bound(models)?;
 
         if let (Some(privileged), Some(quarantined)) = (&models.privileged, &models.quarantined)
             && privileged.provider == quarantined.provider

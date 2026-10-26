@@ -1358,14 +1358,25 @@ impl Runtime {
         // proposal's shape: clear arguments spelled like an envelope are
         // arguments, and reading the shape let untrusted input make a task
         // nobody could approve.
-        let current = if decision.approved || expected.is_some() {
+        let deciding = !matches!(decision.verdict, crate::core::TaskVerdict::Rejected);
+        let current = if deciding || expected.is_some() {
             tasks.task(id).await.map_err(RuntimeError::from_store)?
         } else {
             None
         };
-        if decision.approved
-            && let Some(reason) = current.as_ref().and_then(|task| task.withheld)
+        // A verdict that does not decide this task — an answer to an approval,
+        // an approval of a question, an answer it did not offer — is refused
+        // before the claim, and nothing is recorded.
+        if let Some(row) = &current
+            && let Err(detail) =
+                crate::core::verdict_fits(row.justification.asks.as_ref(), &decision.verdict)
         {
+            return Err(RuntimeError::DecisionRefused {
+                task: id.to_string(),
+                detail,
+            });
+        }
+        if deciding && let Some(reason) = current.as_ref().and_then(|task| task.withheld) {
             return Err(RuntimeError::ProposalWithheld {
                 task: id.to_string(),
                 reason,

@@ -484,7 +484,15 @@ pub struct LiftHaltRequest {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionRequest {
-    pub approved: bool,
+    /// Approve or reject a task asking for approval; `false` also declines a
+    /// question. Exactly one of `approved` and `answer`.
+    #[serde(default)]
+    pub approved: Option<bool>,
+    /// A question's answer: one of the offered choices, or free text where
+    /// the question accepts it. Exactly one of `approved` and `answer`.
+    #[serde(default)]
+    pub answer: Option<String>,
+    #[serde(default)]
     pub reason: String,
     #[serde(default)]
     #[schemars(extend("x-agentplane-holds" = "Anything the decision adds. On an approved call task, the call's arguments in place of the model's, checked against the tool's schema; on a rejection, recorded advice. Absent or null for nothing."))]
@@ -889,7 +897,7 @@ struct ReconcileAnswer {
 #[schemars(deny_unknown_fields)]
 struct DecideAnswer {
     decided_by: String,
-    approved: bool,
+    verdict: crate::core::TaskVerdict,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -2616,8 +2624,19 @@ async fn decide(
     // followed but the only construction available. `authenticated` is the
     // honest basis on this surface and only on this surface — an
     // `Authenticator` named the caller before the route ran.
+    let verdict = match (body.approved, body.answer) {
+        (Some(true), None) => crate::core::TaskVerdict::Approved,
+        (Some(false), None) => crate::core::TaskVerdict::Rejected,
+        (None, Some(answer)) => crate::core::TaskVerdict::Answered(answer),
+        _ => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "a decision carries exactly one of `approved` and `answer`".to_owned(),
+            ));
+        }
+    };
     let decision = Decision {
-        approved: body.approved,
+        verdict,
         decided: crate::core::Decided::By(
             crate::core::Operator::authenticated(s.caller.actor.clone())
                 .map_err(|e| unusable_caller(&e))?,
@@ -2652,7 +2671,10 @@ async fn decide(
             // same approval here fails the same way. The body names the reason
             // and the two ways on — a plane holding the key ring, or a
             // rejection.
-            crate::core::RuntimeError::ProposalWithheld { .. } => {
+            // A verdict that does not decide this task is the same answer:
+            // the body says which verdicts would, and nothing was recorded.
+            crate::core::RuntimeError::ProposalWithheld { .. }
+            | crate::core::RuntimeError::DecisionRefused { .. } => {
                 ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
             }
             // The named version is not the row's: read it again.
@@ -2664,7 +2686,7 @@ async fn decide(
 
     Ok(Json(DecideAnswer {
         decided_by: s.caller.actor,
-        approved: decision.approved,
+        verdict: decision.verdict,
     }))
 }
 

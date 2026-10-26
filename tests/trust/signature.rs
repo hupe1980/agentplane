@@ -604,6 +604,18 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
         ) -> Option<agentplane::journal::AppendWatch> {
             self.0.watch(run).await
         }
+
+        async fn watch_all(&self) -> Option<agentplane::journal::AppendWatch> {
+            self.0.watch_all().await
+        }
+
+        async fn feed(
+            &self,
+            after: Option<&agentplane::journal::FeedCursor>,
+            limit: usize,
+        ) -> Result<agentplane::journal::FeedPage, agentplane::core::StoreError> {
+            self.0.feed(after, limit).await
+        }
         fn is_shared(&self) -> bool {
             self.0.is_shared()
         }
@@ -1772,6 +1784,18 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
             run: agentplane::core::RunId,
         ) -> Option<agentplane::journal::AppendWatch> {
             self.inner.watch(run).await
+        }
+
+        async fn watch_all(&self) -> Option<agentplane::journal::AppendWatch> {
+            self.inner.watch_all().await
+        }
+
+        async fn feed(
+            &self,
+            after: Option<&agentplane::journal::FeedCursor>,
+            limit: usize,
+        ) -> Result<agentplane::journal::FeedPage, agentplane::core::StoreError> {
+            self.inner.feed(after, limit).await
         }
         fn is_shared(&self) -> bool {
             self.inner.is_shared()

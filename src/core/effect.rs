@@ -642,6 +642,9 @@ pub struct GenAiRequest {
     pub provider: Option<String>,
     /// The model asked for, or the tool named.
     pub name: String,
+    /// The model's id for the call a tool execution answers, when one does.
+    /// Telemetry only: never part of the effect's key or descriptor.
+    pub call_id: Option<String>,
 }
 
 /// What a `GenAI` operation answered, for the span attributes of that name.

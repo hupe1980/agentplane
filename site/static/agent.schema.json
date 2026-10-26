@@ -166,6 +166,29 @@
         }
       ]
     },
+    "Compaction": {
+      "additionalProperties": false,
+      "description": "When a provider should compact a conversation, and how to summarise it.",
+      "properties": {
+        "instructions": {
+          "description": "What the summary must keep, replacing the provider's own summarising instruction. Anthropic only; Responses has no such field and refuses it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trigger_tokens": {
+          "description": "Compact once a call's input reaches this many tokens. Anthropic requires at least 50 000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "trigger_tokens"
+      ],
+      "type": "object"
+    },
     "Condition": {
       "description": "One field of the answer, and one thing that must be true of it.",
       "oneOf": [
@@ -761,6 +784,17 @@
       "additionalProperties": false,
       "description": "One model, named the way a provider names it.",
       "properties": {
+        "compaction": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Compaction"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Ask the provider to compact the conversation once a call's input reaches `trigger_tokens`, optionally under summary `instructions`. `anthropic` (at least 50 000) and `openai` (no instructions) compact; every other driver refuses the call. Must be below `max_input_tokens` when both are declared."
+        },
         "max_input_tokens": {
           "description": "A per-call input ceiling: the most tokens one call may send, cached ones included.",
           "format": "uint32",

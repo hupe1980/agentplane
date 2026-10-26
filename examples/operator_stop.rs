@@ -133,7 +133,7 @@ impl Skill for HoldThenAsk {
             )
             .await?;
         Ok(Outcome::done(Tainted::trusted(
-            json!({ "approved": decision.approved }),
+            json!({ "approved": decision.approved() }),
         )))
     }
 

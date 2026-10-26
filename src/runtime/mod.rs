@@ -24,7 +24,7 @@ mod verdict;
 pub use attention::{Attention, Condition, Remedy, SUBJECTS_LISTED};
 pub use batch::BatchSpec;
 pub use build_error::BuildError;
-pub use ctx::{BuildsEffect, Mode, StepCtx};
+pub use ctx::{BuildsEffect, Mode, Started, StepCtx};
 pub use drain::DrainReport;
 #[cfg(feature = "manifest")]
 pub use executor::Agent;

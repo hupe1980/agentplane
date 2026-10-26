@@ -119,8 +119,8 @@ impl Effect for Scripted {
         match self.script.get(n).copied().unwrap_or(Attempt::Succeed) {
             Attempt::Succeed => Ok(json!({ "attempt": n + 1 })),
             Attempt::RefusedCleanly => Err(EffectError::Rejected("peer said no".into())),
-            Attempt::AnsweredNo => Err(EffectError::Refused(
-                "the model does not exist and never will".into(),
+            Attempt::AnsweredNo => Err(EffectError::refused(
+                "the model does not exist and never will",
             )),
             Attempt::TimedOut => Err(EffectError::Timeout {
                 driver: "test".into(),
@@ -746,6 +746,7 @@ async fn every_attempt_is_admitted_against_the_budget() {
 /// function of the disposition, the recovery mode, and the policy — and carries
 /// on with the attempt the crashed run never started.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn resume_continues_a_retry_the_crashed_run_never_started() {
     use agentplane::core::{EffectKey, PlanIR, StepId};
     use agentplane::journal::Append;
@@ -830,6 +831,7 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                         permanent: false,
                         unreproducible: None,
                         elapsed_ms: None,
+                        code: None,
                     },
                 )
                 .step(StepId(0))

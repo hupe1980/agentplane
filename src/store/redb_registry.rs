@@ -34,7 +34,7 @@
 //! rather than exotic.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 
 use crate::core::{Digest, KeyId, KeySignature, Signer, StoreError, Verifier};
 use crate::manifest::registry::{

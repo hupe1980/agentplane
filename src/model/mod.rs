@@ -313,11 +313,12 @@ pub(crate) fn for_each_subschema(
     }
 }
 
-/// A continuation with no tool exchanges behind it.
+/// A continuation with nothing after it: no tool exchanges and no person's
+/// turn.
 ///
 /// Every wire that carries a continuation carries it as *the turn that already
-/// happened*: the model's own tool-call items, followed by their outputs.
-/// Without exchanges there is no request for it to follow, and honouring it
+/// happened*, followed by what answers it. Without either there is no request
+/// for it to follow, and honouring it
 /// would journal an effect key recording a continuation the wire never carried.
 ///
 /// Shared because it is one rule: a driver-local copy drifts, and a stand-in
@@ -328,11 +329,13 @@ pub(crate) fn for_each_subschema(
 pub(crate) fn refuse_dangling_continuation(
     continuation: Option<&ProviderContinuation>,
     exchanges: &[ToolExchange],
+    told: &[String],
     model: &ModelId,
 ) -> Result<(), ModelError> {
-    if continuation.is_some() && exchanges.is_empty() {
+    if continuation.is_some() && exchanges.is_empty() && told.is_empty() {
         return Err(ModelError::Refused {
             model: model.clone(),
+            code: None,
             detail: "a continuation without tool exchanges has no request to follow — \
                      a continuation is the turn that already happened, and without the \
                      calls it answered there is nothing for it to continue"
@@ -370,6 +373,7 @@ pub(crate) fn refuse_provider_side_media(
     };
     Err(ModelError::Refused {
         model: model.clone(),
+        code: None,
         detail: provider_side_media_refusal(kind),
     })
 }
@@ -421,6 +425,7 @@ pub(crate) fn refuse_in_thread_instructions(
     };
     Err(ModelError::Refused {
         model: model.clone(),
+        code: None,
         detail: format!(
             "the prompt carries a '{role}'-role message inside its turn list, which \
              was refused before dispatch: this seam has one instruction slot — the \
@@ -870,6 +875,82 @@ pub struct Completion {
     /// summarised nothing this turn — a short answer often has no summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// What the model said beside its calls, where the wire marks it apart
+    /// from the answer.
+    ///
+    /// Responses sends a model's narration on its way to a tool call as a
+    /// message in the `commentary` phase, and [`text`](Self::text) leaves it
+    /// out so a schema-bearing answer still parses. Every other wire marks no
+    /// phase, so the same words are in `text` and this is `None`. Part of the
+    /// answer: journaled, replayed and labelled with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commentary: Option<String>,
+    /// The provider compacted the conversation during this call, when the
+    /// call [asked it to](ModelCall::with_compaction).
+    ///
+    /// The compaction itself lives in [`continuation`](Self::continuation),
+    /// which the next call sends back; this says that it happened, so a reader
+    /// of the journal knows the model worked from a summary from here on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted: Option<Compacted>,
+}
+
+/// A provider code held to an identifier, or nothing: at most 128 bytes of
+/// ASCII letters, digits and `_.:-`. Provider text kept in the clear on a
+/// failure record, so nothing else passes.
+#[cfg(any(feature = "providers", feature = "bedrock"))]
+#[must_use]
+pub(crate) fn bounded_code(code: String) -> Option<String> {
+    (!code.is_empty()
+        && code.len() <= 128
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b':' | b'-')))
+    .then_some(code)
+}
+
+/// When a provider should compact a conversation, and how to summarise it.
+///
+/// See [`ModelCall::with_compaction`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Compaction {
+    /// Compact once a call's input reaches this many tokens. Anthropic
+    /// requires at least 50 000.
+    pub trigger_tokens: u32,
+    /// What the summary must keep, replacing the provider's own summarising
+    /// instruction. Anthropic only; Responses has no such field and refuses
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+impl Compaction {
+    /// Compact once input reaches `trigger_tokens`.
+    #[must_use]
+    pub const fn at(trigger_tokens: u32) -> Self {
+        Self {
+            trigger_tokens,
+            instructions: None,
+        }
+    }
+
+    /// Summarise under these instructions instead of the provider's own.
+    #[must_use]
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
+        self
+    }
+}
+
+/// A provider's compaction of a conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Compacted {
+    /// The summary that replaced the earlier turns, where the wire returns it
+    /// readable. Anthropic does; Responses returns an encrypted item, so this
+    /// is `None` there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 /// Opaque, self-contained provider state for one continuation turn.
@@ -893,8 +974,13 @@ pub enum ModelStreamEvent {
     /// attempt's: it belongs to an earlier call, or to an attempt that failed
     /// and is being retried.
     Started,
-    /// Visible answer text only. Reasoning is never exposed here.
+    /// Visible answer text only. Reasoning and commentary are never exposed
+    /// here.
     TextDelta(String),
+    /// What the model says beside its calls, where the wire marks it apart
+    /// from the answer: what [`Completion::commentary`] will hold, as it
+    /// arrives.
+    CommentaryDelta(String),
     /// Reasoning summary text, on a call that asked for one: what
     /// [`Completion::reasoning`] will hold, as it arrives. Never the provider's
     /// opaque reasoning.
@@ -944,8 +1030,16 @@ pub enum ModelError {
 
     /// The provider refused before generating: bad request, unknown model, a
     /// content filter on the *input*. Nothing was metered.
+    ///
+    /// `code` is the provider's own name for the refusal where its body gave
+    /// one — `insufficient_quota`, `authentication_error`, `PERMISSION_DENIED`
+    /// — bounded to a short identifier, and absent otherwise.
     #[error("'{model}' refused the request: {detail}")]
-    Refused { model: ModelId, detail: String },
+    Refused {
+        model: ModelId,
+        detail: String,
+        code: Option<String>,
+    },
 
     /// **This plane** refused to connect: the driver's host is not one the
     /// deployment's [`Egress`](crate::core::Egress) allowlist grants.
@@ -1048,6 +1142,15 @@ pub enum ModelError {
 }
 
 impl ModelError {
+    /// The provider's own name for a refusal, where its body gave one.
+    #[must_use]
+    pub fn code(&self) -> Option<String> {
+        match self {
+            Self::Refused { code, .. } => code.clone(),
+            _ => None,
+        }
+    }
+
     /// What this failure says about whether the call reached the provider.
     #[must_use]
     pub const fn disposition(&self) -> Disposition {
@@ -1121,6 +1224,8 @@ pub struct ModelRole {
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Whether this role's calls ask for a reasoning summary.
     pub reasoning_summary: bool,
+    /// Whether this role's calls ask the provider to compact, and when.
+    pub compaction: Option<Compaction>,
     /// What this role's tokens cost, when the declaration stated it.
     pub pricing: Option<Pricing>,
 }
@@ -1135,6 +1240,7 @@ impl ModelRole {
             max_input_tokens: None,
             reasoning_effort: None,
             reasoning_summary: false,
+            compaction: None,
             pricing: None,
         }
     }
@@ -1146,6 +1252,9 @@ impl ModelRole {
     /// choice is made.
     #[must_use]
     pub fn applied_to(&self, mut call: ModelCall) -> ModelCall {
+        if let Some(compaction) = &self.compaction {
+            call = call.with_compaction(compaction.clone());
+        }
         if let Some(max_output_tokens) = self.max_output_tokens {
             call = call.with_max_output_tokens(max_output_tokens);
         }
@@ -1203,8 +1312,17 @@ pub struct Request<'a> {
     pub tools: &'a [ToolDeclaration],
     /// Tools already run this turn, and what they returned.
     pub exchanges: &'a [ToolExchange],
-    /// Exact provider-native state emitted beside those tool calls.
+    /// A person's messages since the model last answered, sent after the
+    /// continuation and after any tool results, in the user role. See
+    /// [`Transcript::told`].
+    pub told: &'a [String],
+    /// Exact provider-native state the previous answer left, sent back before
+    /// the exchanges and the person's turns.
     pub continuation: Option<&'a ProviderContinuation>,
+    /// Ask the provider to compact the conversation once it reaches a size.
+    /// A driver whose wire cannot is refused rather than ignoring it: a
+    /// conversation that should have been compacted ends at the window.
+    pub compaction: Option<&'a Compaction>,
     /// Live observer. Not provider-visible and therefore not effect identity.
     /// Strict replay never calls it because replay never performs the provider.
     pub stream: Option<(&'a dyn ModelStreamObserver, &'a crate::core::Label)>,
@@ -1560,8 +1678,12 @@ impl ToolExchange {
 #[derive(Debug, Clone)]
 pub struct Transcript {
     exchanges: Vec<ToolExchange>,
+    told: Vec<String>,
     continuation: Option<ProviderContinuation>,
     label: crate::core::Label,
+    /// The model answered without leaving a continuation — a schema-forced
+    /// answer — so the conversation has no history a person's turn can follow.
+    ended: bool,
 }
 
 impl Transcript {
@@ -1570,8 +1692,10 @@ impl Transcript {
     pub fn new(prompt: &crate::core::Tainted<Value>) -> Self {
         Self {
             exchanges: Vec::new(),
+            told: Vec::new(),
             continuation: None,
             label: prompt.label().clone(),
+            ended: false,
         }
     }
 
@@ -1588,8 +1712,22 @@ impl Transcript {
     pub fn asked(&mut self, completion: &crate::core::Tainted<Completion>) -> Vec<ToolCall> {
         self.continuation
             .clone_from(&completion.peek().continuation);
+        self.ended = self.continuation.is_none();
         self.exchanges.clear();
+        self.told.clear();
         completion.peek().tool_calls.clone()
+    }
+
+    /// A person said `message`; the model will read it as the next user turn,
+    /// after the answers to any tools it called.
+    ///
+    /// The message joins the conversation's label as it arrived: a delivered
+    /// event is untrusted, and calling this decides nothing about trust. A
+    /// call continuing a conversation whose last answer left no history — a
+    /// schema-forced answer — is refused before any request.
+    pub fn told(&mut self, message: &crate::core::Tainted<String>) {
+        self.label = self.label.join(message.label());
+        self.told.push(message.peek().clone());
     }
 
     /// A tool answered `call`; the model will read `output`.
@@ -1621,6 +1759,12 @@ impl Transcript {
     pub fn exchanges(&self) -> &[ToolExchange] {
         &self.exchanges
     }
+
+    /// What a person said since the model last answered.
+    #[must_use]
+    pub fn person_turns(&self) -> &[String] {
+        &self.told
+    }
 }
 
 /// One completion.
@@ -1631,7 +1775,12 @@ pub struct ModelCall {
     schema: Option<Value>,
     tools: Vec<ToolDeclaration>,
     exchanges: Vec<ToolExchange>,
+    told: Vec<String>,
     continuation: Option<ProviderContinuation>,
+    /// The transcript this call continues ended without a continuation, so a
+    /// person's turn has no history to follow.
+    ended: bool,
+    compaction: Option<Compaction>,
     /// The label of the transcript this call continues, when it continues one.
     carried: Option<crate::core::Label>,
     stream: Option<Arc<dyn ModelStreamObserver>>,
@@ -1680,7 +1829,10 @@ impl ModelCall {
             schema: None,
             tools: Vec::new(),
             exchanges: Vec::new(),
+            told: Vec::new(),
             continuation: None,
+            ended: false,
+            compaction: None,
             carried: None,
             stream: None,
             max_output_tokens: Self::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -1765,8 +1917,25 @@ impl ModelCall {
     #[must_use]
     pub fn continuing(mut self, transcript: &Transcript) -> Self {
         self.exchanges.clone_from(&transcript.exchanges);
+        self.told.clone_from(&transcript.told);
         self.continuation.clone_from(&transcript.continuation);
+        self.ended = transcript.ended;
         self.carried = Some(transcript.label.clone());
+        self
+    }
+
+    /// Ask the provider to compact the conversation once its input reaches
+    /// `compaction.trigger_tokens`: the earlier turns are replaced by a
+    /// summary inside the provider's continuation, which the next call sends
+    /// back, and [`Completion::compacted`] says it happened.
+    ///
+    /// Anthropic and `OpenAI` Responses compact; every other wire refuses the
+    /// call rather than letting the conversation run into its window. The
+    /// instruction (`/system`) is never compacted. Part of the effect key:
+    /// the provider is asked something else.
+    #[must_use]
+    pub fn with_compaction(mut self, compaction: Compaction) -> Self {
+        self.compaction = Some(compaction);
         self
     }
 
@@ -1784,6 +1953,54 @@ impl ModelCall {
             self.stream = observer;
         }
         self
+    }
+
+    /// The provider-visible settings that join the effect key only when set,
+    /// so a call that sets none keys as it always has.
+    fn key_only_when_set(&self, args: &mut Value) {
+        if self.reasoning_summary {
+            args["reasoning_summary"] = serde_json::json!(true);
+        }
+        // A person's turn is what the model is asked to answer, and the
+        // compaction setting changes what it is sent.
+        if !self.told.is_empty() {
+            args["told"] = serde_json::json!(self.told);
+        }
+        if let Some(compaction) = &self.compaction {
+            args["compaction"] = serde_json::json!(compaction);
+        }
+    }
+
+    /// The completion as this call asked for it: a reasoning summary the
+    /// provider volunteered is dropped, so the journal holds what the effect
+    /// key says was requested.
+    fn only_what_was_asked(&self, mut completion: Completion) -> Completion {
+        if !self.reasoning_summary {
+            completion.reasoning = None;
+        }
+        completion
+    }
+
+    /// Requests this call must not make, refused before any reaches a
+    /// provider.
+    fn refuse_what_cannot_be_sent(&self) -> Result<(), EffectError> {
+        if self.ended && !self.told.is_empty() {
+            return Err(EffectError::refused(
+                "a person's turn follows an answer that left no continuation — a \
+                 schema-forced answer ends the conversation, so the message would \
+                 reach the model without anything it answers",
+            ));
+        }
+        if let (Some(compaction), Some(max)) = (&self.compaction, self.max_input_tokens)
+            && compaction.trigger_tokens >= max
+        {
+            return Err(EffectError::refused(format!(
+                "compaction at {} input tokens can never run under a max_input_tokens of \
+                 {max}: the call is refused at the bound before the provider compacts",
+                compaction.trigger_tokens
+            )));
+        }
+        Ok(())
     }
 
     /// Bound how many tokens this call may generate.
@@ -1997,11 +2214,7 @@ impl Effect for ModelCall {
                 })).collect::<Vec<_>>(),
                 "continuation": self.continuation,
         });
-        // Provider-visible, so in the key — but only when asked, so a call
-        // that does not ask keys as it always has.
-        if self.reasoning_summary {
-            args["reasoning_summary"] = serde_json::json!(true);
-        }
+        self.key_only_when_set(&mut args);
         EffectDescriptor::new("model.complete", args)
     }
 
@@ -2072,6 +2285,7 @@ impl Effect for ModelCall {
             .exchanges
             .iter()
             .map(|exchange| exchange.output.clone())
+            .chain(self.told.iter().map(|told| Value::String(told.clone())))
             .collect();
         Some(crate::core::Tainted::with_label(
             Value::Array(outputs),
@@ -2083,11 +2297,21 @@ impl Effect for ModelCall {
         let Value::Array(outputs) = carried else {
             return false;
         };
-        if outputs.len() != self.exchanges.len() {
+        // The whole shape checked before anything is assigned: a refusal must
+        // leave the call as it was, not half rewritten.
+        if outputs.len() != self.exchanges.len() + self.told.len()
+            || !outputs[self.exchanges.len()..].iter().all(Value::is_string)
+        {
             return false;
         }
-        for (exchange, output) in self.exchanges.iter_mut().zip(outputs) {
-            exchange.output = output;
+        let mut outputs = outputs.into_iter();
+        for exchange in &mut self.exchanges {
+            exchange.output = outputs.next().unwrap_or_default();
+        }
+        for (told, output) in self.told.iter_mut().zip(outputs) {
+            if let Value::String(text) = output {
+                *told = text;
+            }
         }
         true
     }
@@ -2130,6 +2354,7 @@ impl Effect for ModelCall {
 
     fn gen_ai_request(&self) -> Option<crate::core::GenAiRequest> {
         Some(crate::core::GenAiRequest {
+            call_id: None,
             provider: Some(
                 self.provider
                     .gen_ai_provider()
@@ -2173,6 +2398,7 @@ impl Effect for ModelCall {
         // The one instruction slot is `/system`, and it is protected.
         refuse_in_thread_instructions(&prompt, &self.model)
             .map_err(|error| EffectError::Rejected(error.to_string()))?;
+        self.refuse_what_cannot_be_sent()?;
 
         // The same identity the terminal completion is labelled with, from the
         // same derivation — `Effect::source` — so the two spellings cannot
@@ -2210,18 +2436,15 @@ impl Effect for ModelCall {
                 schema: self.schema.as_ref(),
                 tools: &self.tools,
                 exchanges: &self.exchanges,
+                told: &self.told,
                 continuation: self.continuation.as_ref(),
+                compaction: self.compaction.as_ref(),
                 stream: observer
                     .as_ref()
                     .map(|observer| (observer as &dyn ModelStreamObserver, &stream_label)),
             })
             .await
-            .map(|mut completion| {
-                if !self.reasoning_summary {
-                    completion.reasoning = None;
-                }
-                completion
-            });
+            .map(|completion| self.only_what_was_asked(completion));
 
         // The declared schema is a contract on the *answer*, and the runtime
         // relies on it: `structured` is indexed into rather than re-checked.
@@ -2264,7 +2487,10 @@ impl Effect for ModelCall {
                     Disposition::DidNotHappen
                         if matches!(e, ModelError::Refused { .. } | ModelError::Egress { .. }) =>
                     {
-                        EffectError::Refused(detail)
+                        EffectError::Refused {
+                            detail,
+                            code: e.code(),
+                        }
                     }
                     // A throttle is a wait, and the provider is the only party
                     // who knows how long. Carried as `RateLimited` — with the
@@ -2763,6 +2989,8 @@ mod tests {
                 structured: None,
                 continuation: None,
                 reasoning: None,
+                commentary: None,
+                compacted: None,
             })
         }
     }
@@ -2959,6 +3187,8 @@ mod tests {
                 structured: None,
                 continuation: None,
                 reasoning: None,
+                commentary: None,
+                compacted: None,
             })
         }
     }

@@ -362,7 +362,7 @@ impl Declarative {
                         task.justification.evidence.push(evidence);
                     }
                     let decision = cx.task(&task).await?;
-                    if !decision.approved {
+                    if !decision.approved() {
                         // Reported to the model the way every other refused call
                         // is, and without the reviewer's words. A human's free
                         // text steering the next turn is untrusted content in
@@ -443,6 +443,7 @@ impl Declarative {
                             value,
                             egress.as_deref(),
                         )
+                        .and_then(|call| call.answering(&asked))
                         .map_err(|e| {
                             crate::core::StepError::Effect(crate::core::EffectError::Rejected(
                                 e.to_string(),
@@ -516,7 +517,7 @@ impl Declarative {
             let decision = cx
                 .task(&spec.approve_answer(deadline, answer.peek().clone()))
                 .await?;
-            if !decision.approved {
+            if !decision.approved() {
                 // Named and quoted, because "the agent failed" is not something
                 // an operator can act on and "Carol refused, because X" is.
                 return Ok(Outcome::fail(format!(
@@ -2094,7 +2095,7 @@ async fn dispatch_granted(
             task.justification.evidence.push(evidence);
         }
         let decision = cx.task(&task).await?;
-        if !decision.approved {
+        if !decision.approved() {
             return Ok(Err(format!(
                 "{} refused the call to {reference}: {}",
                 decision.decided, decision.reason

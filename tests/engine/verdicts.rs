@@ -193,6 +193,7 @@ async fn a_faithful_replay_of_a_failed_run_is_verified() {
     let provider = FakeProvider::new();
     provider.will_fail(agentplane::model::ModelError::Refused {
         model: agentplane::model::ModelId::new("fake", "sum-1"),
+        code: None,
         detail: "the provider refused".to_owned(),
     });
     let (store, run) = record(SUMMARISER, &provider).await;

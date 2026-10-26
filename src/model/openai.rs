@@ -215,6 +215,7 @@ impl OpenAi {
             .permits(host.as_deref())
             .map_err(|e| ModelError::Refused {
                 model: model.clone(),
+                code: None,
                 detail: e.to_string(),
             })
     }
@@ -251,6 +252,7 @@ impl OpenAi {
         if let Some(problem) = StrictSubset::OpenAi.problem(schema) {
             return Err(ModelError::Refused {
                 model: model.clone(),
+                code: None,
                 detail: format!(
                     "the schema cannot be used with strict constrained decoding: {problem}"
                 ),
@@ -331,7 +333,7 @@ struct ApiResponse {
     model: Option<String>,
     #[serde(default)]
     /// Raw by design: every field, including fields this SDK version does not
-    /// know, must be returned to Responses on a tool continuation.
+    /// know, must be returned to Responses on the next turn.
     output: Vec<Value>,
     #[serde(default)]
     usage: Option<ApiUsage>,
@@ -375,18 +377,35 @@ impl ApiResponse {
             .map_or(0, |d| d.reasoning_tokens)
     }
 
+    /// The answer: every message's text outside the `commentary` phase.
+    ///
+    /// A `phase: "commentary"` message is the model narrating on its way to
+    /// the answer — typically the preamble beside a tool call. Concatenated
+    /// into `text` it pollutes the answer, and on a schema-bearing final turn
+    /// it breaks the JSON parse of an otherwise valid answer. Absent `phase`
+    /// means the final answer. The narration is [`commentary`](Self::commentary).
     fn text(&self) -> String {
+        self.message_text(|phase| phase != Some("commentary"))
+    }
+
+    /// Whether the server compacted the conversation: a `compaction` item in
+    /// the output. Its content is encrypted, so there is no summary to read.
+    fn compacted(&self) -> Option<super::Compacted> {
         self.output
             .iter()
-            // A `phase: "commentary"` message is the model narrating on its
-            // way to the answer — typically the preamble beside a tool call.
-            // Concatenated into `text` it pollutes the answer, and on a
-            // schema-bearing final turn it breaks the JSON parse of an
-            // otherwise valid answer. Absent `phase` means the final answer,
-            // which is what every model before the field emitted. The
-            // commentary itself is not lost: the continuation carries the
-            // output items verbatim, and a live observer streams the deltas.
-            .filter(|item| item.get("phase").and_then(Value::as_str) != Some("commentary"))
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+            .then_some(super::Compacted { summary: None })
+    }
+
+    /// The commentary-phase messages' text, or `None` when there was none.
+    fn commentary(&self) -> Option<String> {
+        Some(self.message_text(|phase| phase == Some("commentary"))).filter(|t| !t.is_empty())
+    }
+
+    fn message_text(&self, phase: impl Fn(Option<&str>) -> bool) -> String {
+        self.output
+            .iter()
+            .filter(|item| phase(item.get("phase").and_then(Value::as_str)))
             .filter_map(|item| item.get("content").and_then(Value::as_array))
             .flatten()
             .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
@@ -523,9 +542,10 @@ fn input(prompt: &Value) -> Value {
 fn continue_with(
     input: Value,
     exchanges: &[super::ToolExchange],
+    told: &[String],
     continuation: Option<&super::ProviderContinuation>,
 ) -> Value {
-    if exchanges.is_empty() {
+    if exchanges.is_empty() && told.is_empty() {
         return input;
     }
     let mut out = match input {
@@ -534,7 +554,7 @@ fn continue_with(
     };
     if let Some(state) = continuation.and_then(|state| state.state.as_array()) {
         out.extend(state.iter().cloned());
-    } else {
+    } else if !exchanges.is_empty() {
         // Compatibility path for manually assembled, non-reasoning exchanges.
         // Built-in completions always carry their exact provider output.
         out.extend(exchanges.iter().map(|e| {
@@ -546,17 +566,15 @@ fn continue_with(
             })
         }));
     }
-    for e in exchanges {
-        out.push(json!({
-            "type": "function_call_output",
-            "call_id": e.call.id,
-            "output": match &e.output {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            },
-        }));
-    }
+    out.extend(function_outputs(exchanges));
+    out.extend(person_turns(told));
     Value::Array(out)
+}
+
+/// What a person said, as user messages after the tool outputs.
+fn person_turns(told: &[String]) -> impl Iterator<Item = Value> + '_ {
+    told.iter()
+        .map(|text| json!({ "role": "user", "content": [{ "type": "input_text", "text": text }] }))
 }
 
 fn function_outputs(exchanges: &[super::ToolExchange]) -> impl Iterator<Item = Value> + '_ {
@@ -577,6 +595,7 @@ fn accumulate_continuation(
     completion: &mut Completion,
     prior: Option<&super::ProviderContinuation>,
     exchanges: &[super::ToolExchange],
+    told: &[String],
 ) {
     let Some(current) = completion.continuation.as_mut() else {
         return;
@@ -586,6 +605,7 @@ fn accumulate_continuation(
         .cloned()
         .unwrap_or_default();
     state.extend(function_outputs(exchanges));
+    state.extend(person_turns(told));
     if let Some(items) = current.state.as_array() {
         state.extend(items.iter().cloned());
     }
@@ -622,6 +642,8 @@ impl OpenAi {
             schema,
             tools,
             exchanges,
+            &[],
+            None,
             None,
         )
     }
@@ -637,13 +659,16 @@ impl OpenAi {
         schema: Option<&Value>,
         tools: &[super::ToolDeclaration],
         exchanges: &[super::ToolExchange],
+        told: &[String],
         continuation: Option<&super::ProviderContinuation>,
+        compaction: Option<&super::Compaction>,
     ) -> Result<Value, ModelError> {
         if let Some(state) = continuation
             && (state.provider != "openai" || !state.state.is_array())
         {
             return Err(ModelError::Refused {
                 model: model.clone(),
+                code: None,
                 detail: "the continuation was not an OpenAI output-item array".to_owned(),
             });
         }
@@ -651,16 +676,24 @@ impl OpenAi {
         if reasons && !exchanges.is_empty() && continuation.is_none() {
             return Err(ModelError::Refused {
                 model: model.clone(),
+                code: None,
                 detail: "reasoning-enabled tool continuation requires the complete opaque \
                          output items from the prior OpenAI response"
                     .to_owned(),
             });
         }
-        super::refuse_dangling_continuation(continuation, exchanges, model)?;
+        super::refuse_dangling_continuation(continuation, exchanges, told, model)?;
+        if compaction.is_some_and(|c| c.instructions.is_some()) {
+            return Err(ModelError::Refused {
+                model: model.clone(),
+                code: None,
+                detail: "OpenAI Responses compaction takes no summary instructions".to_owned(),
+            });
+        }
         let mut body = json!({
             "model": model.model,
             "max_output_tokens": max_output_tokens,
-            "input": continue_with(input(prompt), exchanges, continuation),
+            "input": continue_with(input(prompt), exchanges, told, continuation),
             // Responses are retained by API default. State held by a provider
             // cannot be this runtime's replay truth, and retaining governed
             // prompts is a deployment decision rather than an invisible SDK
@@ -676,6 +709,12 @@ impl OpenAi {
             // retained provider-side.
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
+        if let Some(compaction) = compaction {
+            body["context_management"] = json!([{
+                "type": "compaction",
+                "compact_threshold": compaction.trigger_tokens,
+            }]);
+        }
         if let Some(effort) = reasoning_effort {
             // Responses names `none` through `xhigh`. `max` has no counterpart,
             // and sending it would be a 400 at best and a silently clamped
@@ -684,6 +723,7 @@ impl OpenAi {
             if effort == super::ReasoningEffort::Max {
                 return Err(ModelError::Refused {
                     model: model.clone(),
+                    code: None,
                     detail: "OpenAI Responses has no reasoning effort 'max' — it names none, \
                              minimal, low, medium, high and xhigh"
                         .to_owned(),
@@ -709,6 +749,7 @@ impl OpenAi {
                 // this driver itself constructed invalid.
                 return Err(ModelError::Refused {
                     model: model.clone(),
+                    code: None,
                     detail: format!(
                         "model '{}' has no native structured output here, so a declared \
                          response schema is obtained by forcing a synthetic tool — which \
@@ -879,10 +920,15 @@ impl OpenAi {
             (text, parsed_schema)
         };
 
-        let continuation = (!calls.is_empty())
-            .then(|| super::ProviderContinuation::new("openai", parsed.continuation()));
+        // Every answer leaves the turn it was, so a person can speak after it —
+        // except the forced function that shapes a schema answer, whose call
+        // has no output to follow.
+        let continuation =
+            (!emulating).then(|| super::ProviderContinuation::new("openai", parsed.continuation()));
         Ok(Completion {
             reasoning: parsed.reasoning(),
+            commentary: parsed.commentary(),
+            compacted: parsed.compacted(),
             structured: structured_value,
             tool_calls: calls,
             text,
@@ -1027,7 +1073,7 @@ impl OpenAi {
 /// limit, anything else an outage.
 fn stream_error(model: &ModelId, acc: &openai_stream::Accumulator, error: &Value) -> ModelError {
     let named = |key: &str| error.get(key).and_then(Value::as_str).unwrap_or_default();
-    let (kind, code) = (named("type"), named("code"));
+    let code = named("code");
     let detail = match (code, named("message")) {
         ("", "") => format!("the provider sent an error event: {error}"),
         ("", message) => message.to_owned(),
@@ -1036,7 +1082,7 @@ fn stream_error(model: &ModelId, acc: &openai_stream::Accumulator, error: &Value
     if acc.generated() {
         return severed(model, acc, &detail);
     }
-    super::wire::classify_named(model, &format!("{kind} {code}"), detail)
+    super::wire::classify_named(model, error, detail)
 }
 
 /// A stream that stopped before its terminal event.
@@ -1093,7 +1139,9 @@ impl ModelProvider for OpenAi {
             schema,
             tools,
             exchanges,
+            told,
             continuation,
+            compaction,
             stream,
         } = request;
 
@@ -1116,7 +1164,9 @@ impl ModelProvider for OpenAi {
                 schema,
                 tools,
                 exchanges,
+                told,
                 continuation,
+                compaction,
             )?)
             .send()
             .await
@@ -1149,7 +1199,7 @@ impl ModelProvider for OpenAi {
                 label.clone(),
             ));
         }
-        accumulate_continuation(&mut completion, continuation, exchanges);
+        accumulate_continuation(&mut completion, continuation, exchanges, told);
         Ok(completion)
     }
 }
@@ -1587,8 +1637,7 @@ mod continuation_tests {
     /// "commentary"`; the final answer arrives unmarked or as
     /// `final_answer`. Concatenating both pollutes `Completion::text`, and
     /// on a schema-bearing turn the preamble breaks the JSON parse of an
-    /// otherwise valid answer. The narration is not lost — the continuation
-    /// carries every output item verbatim.
+    /// otherwise valid answer. The narration is its own field.
     #[test]
     fn commentary_phase_text_stays_out_of_the_answer() {
         let parsed: ApiResponse = serde_json::from_value(json!({
@@ -1606,6 +1655,23 @@ mod continuation_tests {
             "{\"balance\":42}",
             "commentary narration joined the final answer"
         );
+        assert_eq!(
+            parsed.commentary().as_deref(),
+            Some("Let me check the ledger. "),
+            "the narration beside the call was dropped"
+        );
+    }
+
+    /// A turn with no narration says so with `None`, never an empty string.
+    #[test]
+    fn a_turn_without_commentary_has_none() {
+        let parsed: ApiResponse = serde_json::from_value(json!({
+            "status": "completed",
+            "output": [{ "type": "message", "role": "assistant",
+                         "content": [{ "type": "output_text", "text": "done" }] }],
+        }))
+        .expect("parse");
+        assert_eq!(parsed.commentary(), None);
     }
 
     #[test]
@@ -1653,7 +1719,9 @@ mod continuation_tests {
                     },
                     json!({"balance": 42}),
                 )],
+                &[],
                 Some(&state),
+                None,
             )
             .expect("lossless reasoning continuation");
 
@@ -1695,8 +1763,10 @@ mod continuation_tests {
                 json!([{"type": "function_call", "call_id": "call_2"}]),
             )),
             reasoning: None,
+            commentary: None,
+            compacted: None,
         };
-        accumulate_continuation(&mut completion, Some(&prior), &[exchange]);
+        accumulate_continuation(&mut completion, Some(&prior), &[exchange], &[]);
         let state = completion.continuation.unwrap().state;
         assert_eq!(state[0]["encrypted_content"], "first");
         assert_eq!(state[1]["type"], "function_call_output");

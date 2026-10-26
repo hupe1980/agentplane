@@ -748,7 +748,7 @@ impl<'a> StepCtx<'a> {
     /// the runtime needs the skill before the skill can have the runtime — so
     /// commissioning belongs to the runtime and is reached through here.
     ///
-    /// Three properties, none of them optional:
+    /// None of these is optional:
     ///
     /// * **Journaled**, so a strict replay reads the answer back instead of
     ///   commissioning the work a second time. A skill that called another
@@ -775,9 +775,10 @@ impl<'a> StepCtx<'a> {
     ///
     /// # Errors
     ///
-    /// [`StepError`] if the sub-run fails. Reported as *in doubt* rather than
-    /// *did not happen*: the commissioned agent may have performed effects
-    /// before failing, and its own journal is where that is answered.
+    /// [`StepError`] if the sub-run concludes without an answer. Reported as
+    /// performed rather than *did not happen*: the commissioned agent may have
+    /// performed effects before failing, and its own journal is where that is
+    /// answered.
     pub async fn commission(
         &mut self,
         capability: &str,
@@ -812,6 +813,46 @@ impl<'a> StepCtx<'a> {
         input: Tainted<Value>,
         pin: Option<crate::core::Digest>,
     ) -> Result<Tainted<Value>, StepError> {
+        let started = self.start_commission_with(capability, input, pin).await?;
+        self.await_commission(&started).await
+    }
+
+    /// Commission another agent **without waiting for its answer**.
+    ///
+    /// The sub-run is admitted and set working, and its id comes back at once;
+    /// [`await_commission`](Self::await_commission) collects the answer. Two
+    /// started before either is awaited run at the same time:
+    ///
+    /// ```ignore
+    /// let a = cx.start_commission("review.style", draft.clone()).await?;
+    /// let b = cx.start_commission("review.facts", draft).await?;
+    /// let (style, facts) = (cx.await_commission(&a).await?, cx.await_commission(&b).await?);
+    /// ```
+    ///
+    /// The start is the `agent.commission` effect, under every gate a
+    /// [`commission`](Self::commission) passes — depth, policy, the
+    /// commissioned run's own admission. Its sub-run is admitted under a key
+    /// derived from this run and this dispatch, so a start re-performed after
+    /// a crash finds the sub-run it already admitted instead of admitting a
+    /// second.
+    ///
+    /// # Errors
+    ///
+    /// As [`commission`](Self::commission)'s admission.
+    pub async fn start_commission(
+        &mut self,
+        capability: &str,
+        input: Tainted<Value>,
+    ) -> Result<Started, StepError> {
+        self.start_commission_with(capability, input, None).await
+    }
+
+    async fn start_commission_with(
+        &mut self,
+        capability: &str,
+        input: Tainted<Value>,
+        pin: Option<crate::core::Digest>,
+    ) -> Result<Started, StepError> {
         let plane = self.plane.clone();
         // A run acting under no chain starts from the plane's depth: it is
         // bounded by that chain, so it is no closer to the owner.
@@ -833,14 +874,14 @@ impl<'a> StepCtx<'a> {
             })
             .transpose()
             .map_err(|e| {
-                StepError::Effect(crate::core::EffectError::Refused(format!(
+                StepError::Effect(crate::core::EffectError::refused(format!(
                     "commissioning '{capability}' refused: {e}"
                 )))
             })?;
         let initiator = self.initiator().await?;
         let served_unchained = self.served_unchained().await?;
         let plane_chain = self.plane_chain().await?;
-        let commissioned = self
+        let started = self
             .effect(Commission {
                 plane_chain,
                 capability: capability.to_owned(),
@@ -852,6 +893,42 @@ impl<'a> StepCtx<'a> {
                 initiator,
                 served_unchained,
                 pin,
+                provenance: None,
+            })
+            .await?;
+        let run = crate::core::RunId::parse(&started.peek().run).map_err(|e| {
+            StepError::Effect(crate::core::EffectError::Other(format!(
+                "the commission named no run: {e}"
+            )))
+        })?;
+        Ok(Started {
+            capability: capability.to_owned(),
+            run,
+        })
+    }
+
+    /// The answer of a commission [started](Self::start_commission) earlier in
+    /// this run, once its sub-run rests.
+    ///
+    /// A journaled read: the sub-run's conclusion, its answer and what it
+    /// spent, so a replay reads them back rather than asking again, and a
+    /// crash mid-wait reads again on resume. What the sub-run spent is billed
+    /// to this run's ceilings, and its answer arrives labelled as from its
+    /// agent, as a [`commission`](Self::commission)'s does.
+    ///
+    /// # Errors
+    ///
+    /// As [`commission`](Self::commission), once the sub-run concluded
+    /// without an answer.
+    pub async fn await_commission(
+        &mut self,
+        started: &Started,
+    ) -> Result<Tainted<Value>, StepError> {
+        let commissioned = self
+            .effect(AwaitCommission {
+                capability: started.capability.clone(),
+                run: started.run,
+                plane: self.plane.clone(),
             })
             .await?;
         // What the sub-run spent counts against **this** run's ceilings, so a
@@ -1099,6 +1176,33 @@ impl<'a> StepCtx<'a> {
         tool: crate::tools::ToolId,
         arguments: Tainted<Value>,
     ) -> Result<Tainted<Value>, StepError> {
+        self.dispatch_tool(tool, arguments, None).await
+    }
+
+    /// [`call_tool`](Self::call_tool), as the answer to a model's call: the
+    /// `execute_tool` span carries the provider's call id, so a trace joins
+    /// the model's request to the execution that answered it.
+    ///
+    /// # Errors
+    ///
+    /// As [`call_tool`](Self::call_tool), and when `call` named another tool.
+    #[cfg(feature = "manifest")]
+    pub async fn call_tool_for(
+        &mut self,
+        call: &crate::model::ToolCall,
+        tool: crate::tools::ToolId,
+        arguments: Tainted<Value>,
+    ) -> Result<Tainted<Value>, StepError> {
+        self.dispatch_tool(tool, arguments, Some(call)).await
+    }
+
+    #[cfg(feature = "manifest")]
+    async fn dispatch_tool(
+        &mut self,
+        tool: crate::tools::ToolId,
+        arguments: Tainted<Value>,
+        answering: Option<&crate::model::ToolCall>,
+    ) -> Result<Tainted<Value>, StepError> {
         let (catalog, client) = self.tools.clone().ok_or_else(|| {
             StepError::NotWired(
                 "this plane has no tool catalogue — `RuntimeBuilder::toolbox(..)` derives \
@@ -1109,8 +1213,13 @@ impl<'a> StepCtx<'a> {
         })?;
         let egress = self.tool_egress();
         self.sink_with(&arguments, |value| {
-            crate::tools::ToolCall::prepare(&catalog, client, tool, value, egress.as_deref())
-                .map_err(|e| StepError::Effect(crate::core::EffectError::Rejected(e.to_string())))
+            let call =
+                crate::tools::ToolCall::prepare(&catalog, client, tool, value, egress.as_deref());
+            match answering {
+                Some(asked) => call.and_then(|call| call.answering(asked)),
+                None => call,
+            }
+            .map_err(|e| StepError::Effect(crate::core::EffectError::Rejected(e.to_string())))
         })
         .await
     }
@@ -3177,6 +3286,7 @@ impl<'a> StepCtx<'a> {
             { telemetry::GEN_AI_PROVIDER } = tracing::field::Empty,
             { telemetry::GEN_AI_REQUEST_MODEL } = tracing::field::Empty,
             { telemetry::GEN_AI_TOOL_NAME } = tracing::field::Empty,
+            { telemetry::GEN_AI_TOOL_CALL_ID } = tracing::field::Empty,
             { telemetry::GEN_AI_RESPONSE_MODEL } = tracing::field::Empty,
             { telemetry::GEN_AI_FINISH_REASON } = tracing::field::Empty,
             { telemetry::GEN_AI_INPUT_TOKENS } = tracing::field::Empty,
@@ -3208,6 +3318,9 @@ impl<'a> StepCtx<'a> {
                     span.record(telemetry::GEN_AI_REQUEST_MODEL, request.name.as_str());
                 } else {
                     span.record(telemetry::GEN_AI_TOOL_NAME, request.name.as_str());
+                }
+                if let Some(call) = &request.call_id {
+                    span.record(telemetry::GEN_AI_TOOL_CALL_ID, call.as_str());
                 }
                 span.record(
                     telemetry::OTEL_NAME,
@@ -3606,7 +3719,7 @@ impl<'a> StepCtx<'a> {
         // wake-up that disagree by a fraction of a second give "when does this
         // fire?" two answers.
         let until = until.replace_nanosecond(0).map_err(|e| {
-            StepError::Effect(crate::core::EffectError::Refused(format!(
+            StepError::Effect(crate::core::EffectError::refused(format!(
                 "unrepresentable wake instant: {e}"
             )))
         })?;
@@ -3730,13 +3843,13 @@ impl<'a> StepCtx<'a> {
         let now = self.now().await?;
         let until = now
             .checked_add(time::Duration::try_from(how_long).map_err(|e| {
-                StepError::Effect(crate::core::EffectError::Refused(format!(
+                StepError::Effect(crate::core::EffectError::refused(format!(
                     "unrepresentable sleep duration: {e}"
                 )))
             })?)
             .ok_or_else(|| {
-                StepError::Effect(crate::core::EffectError::Refused(
-                    "sleep duration overflows the representable range".into(),
+                StepError::Effect(crate::core::EffectError::refused(
+                    "sleep duration overflows the representable range",
                 ))
             })?;
         self.sleep_until(until).await
@@ -4747,6 +4860,7 @@ impl<'a> StepCtx<'a> {
                             permanent: permanent_failure(effect, &e),
                             unreproducible: unreproducible(&e).map(str::to_owned),
                             elapsed_ms,
+                            code: e.code().map(str::to_owned),
                         },
                     )
                     .await
@@ -5366,7 +5480,7 @@ impl StepCtx<'_> {
                 // Revoked, expired or spent since the listing: the store said
                 // no, nothing was drawn, and the next rule may still apply.
                 Err(StepError::Effect(
-                    crate::core::EffectError::Refused(_)
+                    crate::core::EffectError::Refused { .. }
                     | crate::core::EffectError::Final {
                         disposition: crate::core::Disposition::DidNotHappen,
                         ..
@@ -6569,6 +6683,16 @@ impl StepCtx<'_> {
         })?;
 
         escalation_names_its_audience(spec)?;
+        // Proceeding unattended pre-authorises an approval; a question has no
+        // answer to assume.
+        if spec.justification.asks.is_some() && matches!(spec.on_expiry, Expiry::ProceedUnattended)
+        {
+            return Err(StepError::NotWired(
+                "a question cannot proceed unattended: there is no answer to assume — \
+                 use `Deny`, or `Escalate` to widen who may answer"
+                    .into(),
+            ));
+        }
 
         let due_at = self.deadline_instant(&cx, &spec.deadline).await?;
         // The run's journaled clock, not the obligation's instant.
@@ -6581,6 +6705,7 @@ impl StepCtx<'_> {
         let case_id = cx.case_id;
         let spec = self.four_eyes(spec).await?;
         let spec_digest = spec.justification.digest();
+        let asks = spec.justification.asks.clone();
         let answer = self
             .wait_on(
                 TASK_DECIDED,
@@ -6625,22 +6750,56 @@ impl StepCtx<'_> {
         // A decision is a human's assertion, not a fact the engine verified.
         let decision: Decision = serde_json::from_value(answer.value.peek().clone())?;
         answered_by_the_worklist(&answer, &decision)?;
-        // A person's approval holds only for the task this run proposed. The
-        // digest is what the store held when they decided; any other value —
-        // or none — is an approval of something else, and acting on it would
-        // dispatch arguments nobody reviewed.
-        if decision.approved
+        // The worklist refuses a misfit before recording it; this refuses one
+        // that reached the run by any other door, by the same rule.
+        crate::core::verdict_fits(asks.as_ref(), &decision.verdict)
+            .map_err(|detail| StepError::Effect(crate::core::EffectError::refused(detail)))?;
+        // A person's approval — or answer — holds only for the task this run
+        // proposed. The digest is what the store held when they decided; any
+        // other value, or none, is a verdict on something else, and acting on
+        // it would dispatch arguments, or follow a question, nobody was shown.
+        if !matches!(decision.verdict, crate::core::TaskVerdict::Rejected)
             && decision.decided.operator().is_some()
             && decision.reviewed != Some(spec_digest)
         {
-            return Err(StepError::Effect(crate::core::EffectError::Refused(
+            return Err(StepError::Effect(crate::core::EffectError::refused(
                 "the approval does not name the task this run proposed — the task was \
                  changed between proposal and decision, so what was approved is not \
-                 what would be dispatched"
-                    .into(),
+                 what would be dispatched",
             )));
         }
         Ok(decision)
+    }
+
+    /// Ask a person a question, and wait for the answer.
+    ///
+    /// [`task`](Self::task) for a [`TaskSpec::question`]: the answer comes back
+    /// labelled trusted with provenance `task:<kind>` — the worklist checked
+    /// that an authenticated, eligible person gave it — and `None` when they
+    /// declined or the window closed unanswered.
+    ///
+    /// # Errors
+    ///
+    /// As [`task`](Self::task), and when `spec` asks no question.
+    pub async fn question(
+        &mut self,
+        spec: &TaskSpec,
+    ) -> Result<Option<Tainted<String>>, StepError> {
+        if spec.justification.asks.is_none() {
+            return Err(StepError::NotWired(
+                "this task asks for approval, not an answer — build it with \
+                 `TaskSpec::question`"
+                    .into(),
+            ));
+        }
+        let decision = self.task(spec).await?;
+        Ok(decision.answered().map(|answer| {
+            let mut label = crate::core::Label::trusted();
+            label
+                .provenance
+                .insert(crate::core::SourceId::new(format!("task:{}", spec.kind)));
+            Tainted::with_label(answer.to_owned(), label)
+        }))
     }
 
     /// Put something in front of a person **without waiting for them**.
@@ -7082,7 +7241,7 @@ fn unreproducible(failure: &crate::core::EffectError) -> Option<&str> {
 /// failure, unless its operator declared otherwise. Recorded on the failure,
 /// so a replay stops where the live run stopped.
 fn permanent_failure<E: Effect + ?Sized>(effect: &E, failure: &crate::core::EffectError) -> bool {
-    matches!(failure, crate::core::EffectError::Refused(_))
+    matches!(failure, crate::core::EffectError::Refused { .. })
         || (failure.disposition() == crate::core::Disposition::Landed && !effect.retries_landed())
 }
 
@@ -7159,10 +7318,11 @@ mod tests {
     }
 }
 
-/// One agent commissioning another on the same plane.
+/// Starting one agent's commission of another on the same plane.
 ///
-/// An effect rather than a direct call, so the sub-run's answer is journaled
-/// under a key and a replay reads it back. Its arguments carry the label, so
+/// An effect rather than a direct call, so the sub-run it admitted is
+/// journaled under a key and a replay reads back which run it started. Its
+/// arguments carry the label, so
 /// commissioning the same work with a *differently trusted* brief is a different
 /// effect rather than a cache hit on this one.
 #[derive(Debug)]
@@ -7194,6 +7354,44 @@ struct Commission {
     /// what was asked, and the sub-run's `RunAdmitted` records which revision
     /// answered.
     pin: Option<crate::core::Digest>,
+    /// Which run and dispatch this is, attached by the runtime: the sub-run's
+    /// admission key is derived from it.
+    provenance: Option<crate::core::Provenance>,
+}
+
+/// A commission started and not yet awaited: whose answer, from which run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Started {
+    capability: String,
+    run: crate::core::RunId,
+}
+
+impl Started {
+    /// The sub-run doing the work.
+    #[must_use]
+    pub const fn run(&self) -> crate::core::RunId {
+        self.run
+    }
+
+    /// The capability commissioned.
+    #[must_use]
+    pub fn capability(&self) -> &str {
+        &self.capability
+    }
+}
+
+/// What starting a commission recorded: the sub-run it admitted.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StartedRun {
+    run: String,
+}
+
+/// Waiting for a started commission's sub-run to rest, and reading its answer.
+#[derive(Debug)]
+struct AwaitCommission {
+    capability: String,
+    run: crate::core::RunId,
+    plane: std::sync::Weak<super::Runtime>,
 }
 
 /// Reading what a consulted agent's declaration permits.
@@ -7246,11 +7444,8 @@ impl crate::model::ModelStreamObserver for RunBound {
     }
 }
 
-/// What a commission produced, and what it cost.
-///
-/// The cost travels with the answer because [`Effect::spend`] is handed the
-/// output and nothing else — a commission whose output were the bare answer
-/// could not report what the sub-run spent.
+/// What a commission's sub-run produced, and what it cost: the await's
+/// journaled output, from which [`StepCtx::await_commission`] bills the spend.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Commissioned {
     answer: Value,
@@ -7300,7 +7495,11 @@ const fn internal_floor() -> crate::core::Sensitivity {
 
 #[async_trait::async_trait]
 impl Effect for Commission {
-    type Output = Commissioned;
+    type Output = StartedRun;
+
+    fn attach(&mut self, provenance: &crate::core::Provenance) {
+        self.provenance = Some(provenance.clone());
+    }
 
     fn descriptor(&self) -> EffectDescriptor {
         EffectDescriptor::new(
@@ -7322,13 +7521,13 @@ impl Effect for Commission {
         false
     }
 
-    /// Another agent's answer is somebody else's data.
+    /// What another agent's run returns is somebody else's data.
     fn trust(&self) -> crate::core::Trust {
         crate::core::Trust::Untrusted
     }
 
-    /// Which agent answered, so a source rule can name the specialist rather
-    /// than the act of delegating.
+    /// The agent commissioned, so a source rule can name the specialist
+    /// rather than the act of delegating.
     fn source(&self) -> crate::core::SourceId {
         crate::core::SourceId::new(format!("agent/{}", self.capability))
     }
@@ -7350,23 +7549,23 @@ impl Effect for Commission {
     }
 
     /// Nothing, as an effect: what the sub-run spent is its own run's to
-    /// settle. [`StepCtx::commission`] bills it to this run's ceilings
+    /// settle. [`StepCtx::await_commission`] bills it to this run's ceilings
     /// without settling it into the tenant's period a second time.
     fn spend(&self, _output: &Self::Output) -> crate::core::Spend {
         crate::core::Spend::ZERO
     }
 
-    /// Never asked twice. Each dispatch admits a sub-run of its own, so a
-    /// retry is a second specialist doing the work again beside the first.
+    /// Never asked twice as a fresh dispatch: a refusal at admission does not
+    /// change on asking again.
     fn retry(&self) -> crate::core::RetryPolicy {
         crate::core::RetryPolicy::never()
     }
 
-    /// A commission announced and never recorded may have admitted a sub-run
-    /// that is still working — the recovery sweep resumes that run — so
-    /// re-performing it would commission a second. Only a person can say.
+    /// Re-performed after a crash, and safely: the sub-run is admitted under a
+    /// key derived from this run and this dispatch, so a second attempt finds
+    /// the sub-run the first admitted rather than commissioning another.
     fn recovery(&self) -> crate::core::Recovery {
-        crate::core::Recovery::RequiresOperator
+        crate::core::Recovery::Retry
     }
 
     async fn perform(&self) -> Result<Self::Output, crate::core::EffectError> {
@@ -7401,15 +7600,29 @@ impl Effect for Commission {
         // An outcome rather than an `Admission`, because a commission carries no
         // idempotency key: there is no in-flight answer for a caller to have to
         // handle, and the key is the run's own effect key on the parent's chain.
-        let out = plane
-            .commission_run(
+        // The admission key: this run and this dispatch's first attempt, so a
+        // re-performed start finds its own sub-run, and no other run's start
+        // can name it.
+        let provenance = self.provenance.as_ref().ok_or_else(|| {
+            crate::core::EffectError::Other("a commission was performed unattached".into())
+        })?;
+        let key = format!(
+            "agentplane.commission/{}/{}",
+            provenance.run,
+            provenance.dispatch.unwrap_or(provenance.effect)
+        );
+        let run = plane
+            .start_commission_run(
+                provenance.run,
                 &self.capability,
                 Tainted::with_label(self.input.clone(), self.label.clone()),
                 terms,
+                &key,
             )
             .await
             .map_err(|e| match e {
-                // The store could not say whether the sub-run was admitted.
+                // The store could not say whether the sub-run was admitted;
+                // a re-performed start finds out.
                 crate::core::RuntimeError::Store(_) => crate::core::EffectError::Interrupted {
                     driver: self.capability.clone(),
                     detail: e.to_string(),
@@ -7417,9 +7630,60 @@ impl Effect for Commission {
                 // Refused at admission — unknown capability, scope, policy,
                 // quota, a halt, a pinned revision that moved: no sub-run
                 // exists and nothing ran.
-                e => crate::core::EffectError::Refused(e.to_string()),
+                e => crate::core::EffectError::refused(e.to_string()),
             })?;
+        Ok(StartedRun {
+            run: run.to_string(),
+        })
+    }
+}
 
+#[async_trait::async_trait]
+impl Effect for AwaitCommission {
+    type Output = Commissioned;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "agent.commission.await",
+            serde_json::json!({ "capability": self.capability, "run": self.run.to_string() }),
+        )
+    }
+
+    /// Reading a run's conclusion changes nothing.
+    fn mutates(&self) -> bool {
+        false
+    }
+
+    /// Another agent's answer is somebody else's data.
+    fn trust(&self) -> crate::core::Trust {
+        crate::core::Trust::Untrusted
+    }
+
+    /// Which agent answered, as the start names it.
+    fn source(&self) -> crate::core::SourceId {
+        crate::core::SourceId::new(format!("agent/{}", self.capability))
+    }
+
+    /// Nothing, as an effect: [`StepCtx::await_commission`] bills the
+    /// sub-run's spend to this run's ceilings.
+    fn spend(&self, _output: &Self::Output) -> crate::core::Spend {
+        crate::core::Spend::ZERO
+    }
+
+    /// A read, so read again after a crash.
+    fn recovery(&self) -> crate::core::Recovery {
+        crate::core::Recovery::Retry
+    }
+
+    async fn perform(&self) -> Result<Self::Output, crate::core::EffectError> {
+        let plane = self
+            .plane
+            .upgrade()
+            .ok_or_else(|| crate::core::EffectError::Other("the plane is gone".into()))?;
+        let out = plane
+            .rested_commission(self.run)
+            .await
+            .map_err(|e| crate::core::EffectError::Rejected(e.to_string()))?;
         let spend = out.spend();
         let run = Some(out.run_id.to_string());
         let Some(answer) = out.output else {

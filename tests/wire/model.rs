@@ -81,6 +81,8 @@ impl ModelProvider for EmitsStream {
             structured: None,
             continuation: None,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         })
     }
 }
@@ -285,6 +287,7 @@ fn a_died_mid_stream_call_is_landed_not_in_doubt() {
     // Refused before generating: nothing was metered, nothing happened.
     let refused = ModelError::Refused {
         model: model(),
+        code: None,
         detail: "unknown model".into(),
     };
     assert_eq!(refused.disposition(), Disposition::DidNotHappen);
@@ -336,6 +339,7 @@ async fn a_refusal_before_generation_costs_nothing() {
     let provider = FakeProvider::new();
     provider.will_fail(ModelError::Refused {
         model: model(),
+        code: None,
         detail: "bad request".into(),
     });
     let call = ModelCall::new(provider as Arc<dyn ModelProvider>, model(), json!({}));
@@ -504,6 +508,8 @@ async fn a_failed_completion_spends_the_budget_that_stops_the_next_one() {
             structured: None,
             continuation: None,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         });
 
     let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
@@ -792,6 +798,8 @@ fn a_successful_completion_bills_its_usage() {
         structured: None,
         continuation: None,
         reasoning: None,
+        commentary: None,
+        compacted: None,
     };
     assert_eq!(call.spend(&completion).tokens, 10);
     assert_eq!(call.spend(&completion).minor_units, 5);
@@ -1145,6 +1153,8 @@ impl ModelProvider for IgnoresSchema {
             structured: self.0.clone(),
             continuation: None,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         })
     }
 }

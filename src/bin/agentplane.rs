@@ -534,8 +534,10 @@ impl QuarantineAnswer {
 enum Verdict {
     /// Let the proposed action happen.
     Approve,
-    /// Refuse it.
+    /// Refuse it, or decline a question.
     Reject,
+    /// Answer a question, with `--answer`.
+    Answer,
 }
 
 /// One run's journal, as a timeline.
@@ -643,6 +645,11 @@ struct DecideArgs {
     /// The words that go on the record beside the verdict. Required.
     #[arg(long)]
     reason: String,
+
+    /// A question's answer: one of the offered choices, or free text where
+    /// the question accepts it. Required with `answer`, refused otherwise.
+    #[arg(long)]
+    answer: Option<String>,
 
     /// A role this decider holds. Repeatable; the store checks eligibility
     /// and four-eyes against them, exactly as the HTTP route does.
@@ -3431,11 +3438,19 @@ fn decide_verb(opts: &DecideArgs) -> Result<ExitCode, Fault> {
                 .map_err(|e| usage(format!("--digest `{hex}` is not a digest: {e}")))
         })
         .transpose()?;
-    let approved = opts.verdict == Verdict::Approve;
-    let decision = if approved {
-        agentplane::core::Decision::approve(by.clone(), opts.reason.clone())
-    } else {
-        agentplane::core::Decision::reject(by.clone(), opts.reason.clone())
+    let decision = match (opts.verdict, opts.answer.as_deref()) {
+        (Verdict::Approve, None) => {
+            agentplane::core::Decision::approve(by.clone(), opts.reason.clone())
+        }
+        (Verdict::Reject, None) => {
+            agentplane::core::Decision::reject(by.clone(), opts.reason.clone())
+        }
+        (Verdict::Answer, Some(answer)) => agentplane::core::Decision {
+            reason: opts.reason.clone(),
+            ..agentplane::core::Decision::answer(by.clone(), answer)
+        },
+        (Verdict::Answer, None) => return Err(usage("`answer` needs --answer <TEXT>")),
+        (_, Some(_)) => return Err(usage("--answer goes with `answer`, not a verdict")),
     };
 
     blocking(async move {
@@ -3465,13 +3480,17 @@ fn decide_verb(opts: &DecideArgs) -> Result<ExitCode, Fault> {
                 eprintln!("{}", withheld_refusal(id, reason));
                 return Ok(ExitCode::from(exit::FINDING));
             }
+            Err(e @ agentplane::core::RuntimeError::DecisionRefused { .. }) => {
+                eprintln!("{e}");
+                return Ok(ExitCode::from(exit::FINDING));
+            }
             Err(e) => return Err(runtime_fault(e)),
         };
         println!(
             "{}",
             serde_json::json!({
                 "task": id.to_string(),
-                "approved": approved,
+                "verdict": decision.verdict,
                 "by": by.actor(),
                 "basis": by.basis().as_str(),
                 // Buffered rather than resumed is the ordinary answer here: a

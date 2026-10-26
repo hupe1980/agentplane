@@ -7,7 +7,7 @@
 //! runs.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 
 use crate::case::{BufferedEvent, EventStore, TargetedDelivery};
 use crate::core::{

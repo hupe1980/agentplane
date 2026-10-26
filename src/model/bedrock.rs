@@ -498,6 +498,7 @@ impl Bedrock {
     fn refused(model: &ModelId, detail: impl Into<String>) -> ModelError {
         ModelError::Refused {
             model: model.clone(),
+            code: None,
             detail: detail.into(),
         }
     }
@@ -506,6 +507,7 @@ impl Bedrock {
         model: &ModelId,
         prompt: &Value,
         exchanges: &[ToolExchange],
+        told: &[String],
         continuation: Option<&ProviderContinuation>,
     ) -> Result<Vec<Message>, ModelError> {
         let mut messages = match crate::model::prompt::turns(prompt, &["messages", "input"]) {
@@ -531,9 +533,10 @@ impl Bedrock {
             }
         };
 
-        if exchanges.is_empty() {
+        if exchanges.is_empty() && told.is_empty() {
             return Ok(messages);
         }
+        let prompt_len = messages.len();
 
         if let Some(state) = continuation {
             if state.provider != "bedrock" {
@@ -553,7 +556,7 @@ impl Bedrock {
                 .map(|message| continuation_message_from_json(message, model))
                 .collect::<Result<Vec<_>, _>>()?;
             messages.extend(transcript);
-        } else {
+        } else if !exchanges.is_empty() {
             let assistant = exchanges
                 .iter()
                 .map(|exchange| {
@@ -576,8 +579,11 @@ impl Bedrock {
             );
         }
 
-        messages.push(tool_results_message(exchanges, model)?);
-        Ok(messages)
+        messages.push(continuation_message_from_json(
+            &user_turn(exchanges, told),
+            model,
+        )?);
+        join_at_the_prompt(messages, prompt_len, model)
     }
 
     fn message_from_value(model: &ModelId, value: &Value) -> Result<Message, ModelError> {
@@ -754,6 +760,7 @@ impl Bedrock {
                     classify_service(
                         model,
                         detail,
+                        aws_sdk_bedrockruntime::error::ProvideErrorMetadata::code(service),
                         service.is_throttling_exception() || service.is_model_not_ready_exception(),
                         service.is_access_denied_exception()
                             || service.is_resource_not_found_exception()
@@ -987,7 +994,9 @@ impl Bedrock {
             });
         }
         let stop_reason = output.stop_reason().as_str().to_owned();
-        let continuation = (!calls.is_empty()).then(|| {
+        // Every answer leaves the turn it was, so a person can speak after it
+        // — except the forced tool that shapes a schema answer.
+        let continuation = (!emulating).then(|| {
             ProviderContinuation::new(
                 "bedrock",
                 json!([{ "role": "assistant", "content": state }]),
@@ -1006,6 +1015,8 @@ impl Bedrock {
             structured,
             continuation,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         })
     }
 }
@@ -1057,15 +1068,25 @@ impl ModelProvider for Bedrock {
             schema,
             tools,
             exchanges,
+            told,
             continuation,
+            compaction,
             stream,
         } = request;
         super::refuse_provider_side_media(prompt, model)?;
         super::refuse_in_thread_instructions(prompt, model)?;
+        // Converse offers no compaction; Anthropic's lives on the Messages
+        // API, which this driver does not speak.
+        if compaction.is_some() {
+            return Err(Self::refused(
+                model,
+                "Bedrock Converse has no server-side compaction",
+            ));
+        }
         let reasoning_config = self.reasoning_config(model, reasoning_effort)?;
         let max_tokens = i32::try_from(max_output_tokens)
             .map_err(|_| Self::refused(model, "max_output_tokens exceeds Bedrock's i32 limit"))?;
-        let messages = Self::messages(model, prompt, exchanges, continuation)?;
+        let messages = Self::messages(model, prompt, exchanges, told, continuation)?;
         let tools = Self::tool_config(model, schema, tools, self.schema_mode)?;
         let output_config = Self::output_config(model, schema, self.schema_mode)?;
         if self.stream {
@@ -1083,7 +1104,7 @@ impl ModelProvider for Bedrock {
                 )
                 .await?;
             let mut completion = streamed;
-            accumulate_continuation(&mut completion, continuation, exchanges);
+            accumulate_continuation(&mut completion, continuation, exchanges, told);
             return Ok(completion);
         }
         let mut operation = self
@@ -1119,6 +1140,7 @@ impl ModelProvider for Bedrock {
                 classify_service(
                     model,
                     detail,
+                    aws_sdk_bedrockruntime::error::ProvideErrorMetadata::code(service),
                     service.is_throttling_exception() || service.is_model_not_ready_exception(),
                     service.is_access_denied_exception()
                         || service.is_resource_not_found_exception()
@@ -1133,7 +1155,7 @@ impl ModelProvider for Bedrock {
                 label.clone(),
             ));
         }
-        accumulate_continuation(&mut completion, continuation, exchanges);
+        accumulate_continuation(&mut completion, continuation, exchanges, told);
         Ok(completion)
     }
 }
@@ -1147,25 +1169,52 @@ fn tool_result_json(exchange: &ToolExchange) -> Value {
     })
 }
 
-fn tool_results_message(
-    exchanges: &[ToolExchange],
+/// Converse refuses two user messages in a row, and a person's turn right
+/// after the prompt — on a first call, or first in the history — is the
+/// second: it joins the prompt's last message.
+fn join_at_the_prompt(
+    mut messages: Vec<Message>,
+    prompt_len: usize,
     model: &ModelId,
-) -> Result<Message, ModelError> {
-    let content = exchanges
-        .iter()
-        .map(|exchange| tool_result_from_json(&tool_result_json(exchange), model))
-        .collect::<Result<Vec<_>, _>>()?;
-    Message::builder()
+) -> Result<Vec<Message>, ModelError> {
+    let user = |m: &Message| m.role() == &ConversationRole::User;
+    if prompt_len == 0
+        || prompt_len >= messages.len()
+        || !user(&messages[prompt_len - 1])
+        || !user(&messages[prompt_len])
+    {
+        return Ok(messages);
+    }
+    let next = messages.remove(prompt_len);
+    let last = &messages[prompt_len - 1];
+    let mut content = last.content().to_vec();
+    content.extend(next.content().iter().cloned());
+    messages[prompt_len - 1] = Message::builder()
         .role(ConversationRole::User)
         .set_content(Some(content))
         .build()
-        .map_err(|error| Bedrock::refused(model, error.to_string()))
+        .map_err(|error| Bedrock::refused(model, error.to_string()))?;
+    Ok(messages)
+}
+
+/// The user turn that follows an answer: the tool results, then what a
+/// person said, as one message in the continuation's JSON shape.
+fn user_turn(exchanges: &[ToolExchange], told: &[String]) -> Value {
+    json!({
+        "role": "user",
+        "content": exchanges
+            .iter()
+            .map(tool_result_json)
+            .chain(told.iter().map(|text| json!({ "type": "text", "text": text })))
+            .collect::<Vec<_>>(),
+    })
 }
 
 fn accumulate_continuation(
     completion: &mut Completion,
     prior: Option<&ProviderContinuation>,
     exchanges: &[ToolExchange],
+    told: &[String],
 ) {
     let Some(current) = completion.continuation.as_mut() else {
         return;
@@ -1174,11 +1223,8 @@ fn accumulate_continuation(
         .and_then(|value| value.state.as_array())
         .cloned()
         .unwrap_or_default();
-    if !exchanges.is_empty() {
-        transcript.push(json!({
-            "role": "user",
-            "content": exchanges.iter().map(tool_result_json).collect::<Vec<_>>(),
-        }));
+    if !exchanges.is_empty() || !told.is_empty() {
+        transcript.push(user_turn(exchanges, told));
     }
     if let Some(messages) = current.state.as_array() {
         transcript.extend(messages.iter().cloned());
@@ -1298,7 +1344,13 @@ where
 /// validation failures are refusals. Anything else — a timeout, a model or
 /// service fault — may have generated, and Converse exposes no partial usage
 /// for it, so it is `Unavailable` rather than free or absent.
-fn classify_service(model: &ModelId, detail: String, throttled: bool, refused: bool) -> ModelError {
+fn classify_service(
+    model: &ModelId,
+    detail: String,
+    code: Option<&str>,
+    throttled: bool,
+    refused: bool,
+) -> ModelError {
     if throttled {
         ModelError::RateLimited {
             model: model.clone(),
@@ -1308,6 +1360,7 @@ fn classify_service(model: &ModelId, detail: String, throttled: bool, refused: b
     } else if refused {
         ModelError::Refused {
             model: model.clone(),
+            code: code.and_then(|code| super::bounded_code(code.to_owned())),
             detail,
         }
     } else {
@@ -1366,6 +1419,7 @@ fn classify_stream_event(
     ) {
         ModelError::Refused {
             model: model.clone(),
+            code: None,
             detail: detail.to_owned(),
         }
     } else {
@@ -1568,7 +1622,13 @@ fn continuation_message_from_json(value: &Value, model: &ModelId) -> Result<Mess
             ConversationRole::User,
             blocks
                 .iter()
-                .map(|block| tool_result_from_json(block, model))
+                .map(|block| {
+                    if block.get("type").and_then(Value::as_str) == Some("text") {
+                        content_from_json(block, model)
+                    } else {
+                        tool_result_from_json(block, model)
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         other => {
@@ -2252,6 +2312,48 @@ mod tests {
         );
     }
 
+    /// A person's turn follows the history as one user message after the
+    /// assistant's answer, as text beside any tool results.
+    #[test]
+    fn a_persons_turn_follows_the_history() {
+        let model = ModelId::new("bedrock", "test");
+        let continuation = ProviderContinuation::new(
+            "bedrock",
+            json!([{ "role": "assistant", "content": [{ "type": "text", "text": "42." }] }]),
+        );
+        let messages = Bedrock::messages(
+            &model,
+            &json!({"input": "balance?"}),
+            &[],
+            &["and in euros?".to_owned()],
+            Some(&continuation),
+        )
+        .expect("a person's turn after an answer");
+        assert_eq!(messages.len(), 3, "question, answer, the person's turn");
+        assert_eq!(messages[2].role(), &ConversationRole::User);
+        assert_eq!(
+            messages[2].content(),
+            &[ContentBlock::Text("and in euros?".to_owned())]
+        );
+    }
+
+    /// A person's first turn joins the prompt's user message: Converse
+    /// refuses two user messages in a row.
+    #[test]
+    fn a_first_persons_turn_joins_the_prompts_message() {
+        let model = ModelId::new("bedrock", "test");
+        let messages = Bedrock::messages(
+            &model,
+            &json!({"input": "balance?"}),
+            &[],
+            &["in euros".to_owned()],
+            None,
+        )
+        .expect("a first turn");
+        assert_eq!(messages.len(), 1, "two user messages in a row");
+        assert_eq!(messages[0].content().len(), 2);
+    }
+
     #[test]
     fn cumulative_bedrock_transcript_decodes_every_prior_turn() {
         let model = ModelId::new("bedrock", "test");
@@ -2278,6 +2380,7 @@ mod tests {
                 },
                 json!({"v": 2}),
             )],
+            &[],
             Some(&continuation),
         )
         .expect("decode cumulative transcript");
@@ -2321,7 +2424,8 @@ mod prompt_tests {
             matches!(&system[1], SystemContentBlock::CachePoint(p) if p.ttl() == Some(&WireCacheTtl::OneHour)),
             "{system:?}"
         );
-        let messages = Bedrock::messages(&model(), prompt.peek(), &[], None).expect("messages");
+        let messages =
+            Bedrock::messages(&model(), prompt.peek(), &[], &[], None).expect("messages");
         let content = messages[0].content();
         assert!(matches!(&content[0], ContentBlock::Text(t) if t == "context"));
         assert!(

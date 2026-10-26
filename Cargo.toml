@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.53.0"
+version      = "0.54.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -213,7 +213,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # ignored. +9 crates on `cli`, +0 on the library; re-derive with `cargo tree
 # --no-default-features --features cli -e normal --prefix none | sort -u | wc -l`.
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "env", "wrap_help"], optional = true }
-redb        = { version = "4", optional = true }
+# `experimental-multiprocess` backs `RedbStore::open_shared` and
+# `open_read_only`: one writer and readers in other processes on one file.
+redb        = { version = "4.4", optional = true, features = ["experimental-multiprocess"] }
 # YAML in safe Rust. Its options, and why `include` and `properties` stay off,
 # are in `src/yaml.rs`.
 serde-saphyr = { version = "2", optional = true, default-features = false, features = ["serialize", "deserialize"] }

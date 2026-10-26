@@ -188,7 +188,7 @@ impl Skill for SendRequest {
                 at,
                 json!({
                     "stage": "decided",
-                    "approved": decision.approved,
+                    "approved": decision.approved(),
                     "by": decision.decided.to_string(),
                 }),
             )
@@ -197,7 +197,7 @@ impl Skill for SendRequest {
 
             return Ok(Outcome::done(Tainted::trusted(json!({
                 "outcome": "human-decided",
-                "approved": decision.approved,
+                "approved": decision.approved(),
                 "by": decision.decided.to_string(),
             }))));
         }

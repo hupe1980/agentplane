@@ -3256,3 +3256,65 @@ async fn the_sweep_reads_are_planned_as_index_scans() {
         );
     }
 }
+
+/// **The feed never serves a position an older transaction could still
+/// commit behind.** Positions are taken in one order and committed in
+/// another; a reader that passed a later commit while an earlier transaction
+/// was open would skip that transaction's records forever. So while any
+/// transaction older than an append is running, the feed holds before it.
+#[tokio::test]
+async fn the_feed_holds_behind_a_transaction_still_running() {
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let store = Arc::new(connect_retrying(&url).await);
+
+    // An older transaction, holding an xid and not yet committed.
+    let (mut raw, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("a raw connection");
+    tokio::spawn(connection);
+    let older = raw.transaction().await.expect("begin");
+    older
+        .query_one("SELECT pg_current_xact_id()::text", &[])
+        .await
+        .expect("an xid for the older transaction");
+
+    // A later append commits while it is open.
+    let run = agentplane::core::RunId::generate();
+    let lease = store
+        .acquire(run, "feed", std::time::Duration::from_secs(60))
+        .await
+        .expect("lease");
+    store
+        .append(
+            lease.epoch,
+            vec![agentplane::journal::Append::new(
+                run,
+                agentplane::journal::RecordKind::Note {
+                    text: "later".into(),
+                },
+            )],
+        )
+        .await
+        .expect("append");
+
+    let held = store.feed(None, 10).await.expect("feed");
+    assert!(
+        held.records.is_empty(),
+        "the feed served a position while an older transaction could still commit \
+         behind it: {} record(s)",
+        held.records.len()
+    );
+
+    older.rollback().await.expect("end the older transaction");
+    let served = store.feed(None, 10).await.expect("feed");
+    assert_eq!(
+        served.records.len(),
+        1,
+        "the record behind the horizon never arrived"
+    );
+}

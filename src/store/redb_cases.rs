@@ -16,7 +16,7 @@
 //! describing a row that was never committed.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 use serde_json::Value;
 
 use crate::case::{CaseCensus, CaseStore, Correlation};

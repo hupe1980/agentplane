@@ -9,6 +9,46 @@ use crate::core::{Digest, Epoch, RunId, Seq, StoreError};
 
 use super::{Append, Record};
 
+/// A position in a store's feed: opaque, and only ever compared by the store
+/// that issued it.
+///
+/// Persist it as [`as_str`](Self::as_str) gives it and hand it back through
+/// [`FeedCursor::new`]: a host that keeps its cursor beside what it did with
+/// each record resumes exactly where it stopped, at least once.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FeedCursor(String);
+
+impl FeedCursor {
+    /// A cursor read back from wherever the host kept it.
+    #[must_use]
+    pub fn new(cursor: impl Into<String>) -> Self {
+        Self(cursor.into())
+    }
+
+    /// The cursor, to keep.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FeedCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// One page of a store's feed.
+#[derive(Debug, Clone)]
+pub struct FeedPage {
+    /// Records of every run in this tenant, in the feed's order.
+    pub records: Vec<Record>,
+    /// Where the next page starts: after the last record here, or the cursor
+    /// this page was asked from when it is empty. `None` only before the
+    /// first record the store ever wrote.
+    pub next: Option<FeedCursor>,
+}
+
 /// A run whose last record is a suspension.
 ///
 /// The pair an operator re-arms from: which run, and what it is waiting for —
@@ -312,6 +352,33 @@ pub trait JournalStore: Send + Sync + Debug {
     /// process, and `PostgreSQL` delivers a notification sent inside the
     /// append's transaction only when that transaction commits.
     async fn watch(&self, run: RunId) -> Option<crate::journal::AppendWatch>;
+
+    /// Every record of every run in this tenant, in an order no later page
+    /// contradicts, one bounded page after `after` (from the start when
+    /// `None`).
+    ///
+    /// The feed a host follows instead of polling every run: hooks on a task
+    /// opening or a run sealing, an inbox, a memory tier. Each record is
+    /// served once across pages, and a record committed after a reader passed
+    /// a position never appears behind it — on `PostgreSQL`, where commit
+    /// order is not position order, only positions below the oldest running
+    /// transaction are served, so a transaction left open holds the feed at
+    /// its position until it ends. Records read as [`read`](Self::read) reads
+    /// them. A sealed store opens them.
+    ///
+    /// No default, for the reason [`Self::watch`] has none: a decorator that
+    /// forgot to forward it would serve nothing.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable, or `after` is not a cursor this store
+    /// issued.
+    async fn feed(&self, after: Option<&FeedCursor>, limit: usize) -> Result<FeedPage, StoreError>;
+
+    /// A wake-up each time any run in this tenant appends, after the append
+    /// is durable — the feed's twin of [`Self::watch`]. A hint: read the feed
+    /// from your cursor when it fires, and poll anyway.
+    async fn watch_all(&self) -> Option<crate::journal::AppendWatch>;
 
     /// This store's own transaction, when a co-located resource can join it.
     ///

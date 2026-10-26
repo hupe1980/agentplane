@@ -242,6 +242,13 @@ impl RunTerms {
     }
 }
 
+/// A commissioned sub-run this process is executing: the run that started it,
+/// and the task running it.
+type Working = (
+    RunId,
+    tokio::task::JoinHandle<Result<RunOutcome, RuntimeError>>,
+);
+
 /// Default lease duration. A crashed owner's runs become claimable this long
 /// after its last heartbeat.
 ///
@@ -285,6 +292,11 @@ pub struct RunOutcome {
     /// confused-deputy reachable because the one fact that would have refused
     /// it had been dropped at the boundary.
     pub output: Option<Tainted<Value>>,
+    /// The effect a failed run ended on — its kind, disposition, permanence
+    /// and the peer's code — read from the run's records by
+    /// [`failed_effect`](crate::journal::failed_effect), so a replay answers
+    /// as the live run did. `None` unless the run failed on an effect.
+    pub failed_effect: Option<crate::journal::FailedEffect>,
 }
 
 impl RunOutcome {
@@ -1494,6 +1506,10 @@ pub struct Runtime {
     /// everywhere and survives a restart — a different question with a
     /// different audience.
     inflight: Arc<super::drain::InFlight>,
+    /// Sub-runs that started commissions set working in this process, by run: the
+    /// awaiting run takes the outcome from the task that executed it, rather
+    /// than replaying a run that already did its work here.
+    commissions: Arc<std::sync::Mutex<HashMap<RunId, Working>>>,
 }
 
 /// The witness set and the bar a submission round is held to.
@@ -3731,12 +3747,33 @@ impl Runtime {
                 .hash
         };
         Ok(Some(RunOutcome {
+            failed_effect: failure_of(&status, records),
             run_id: run,
             status,
             chain_head,
             consumed: Consumed::default(),
             output: None,
         }))
+    }
+
+    /// The effect this run ended on, read from its records, when it failed.
+    ///
+    /// Read only for a failure: every other ending answers `None` without a
+    /// read.
+    async fn failed_effect(
+        &self,
+        run: RunId,
+        status: &RunStatus,
+    ) -> Result<Option<crate::journal::FailedEffect>, RuntimeError> {
+        if !matches!(status, RunStatus::Failed(_)) {
+            return Ok(None);
+        }
+        let records = self
+            .store
+            .read(run, 1)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        Ok(failure_of(status, &records))
     }
 
     /// Return a closed run without continuing it, repairing a missing physical
@@ -3769,6 +3806,7 @@ impl Runtime {
                 .hash
         };
         Ok(Some(RunOutcome {
+            failed_effect: failure_of(&status, records),
             run_id: run,
             status,
             chain_head,
@@ -4198,6 +4236,7 @@ impl Runtime {
             return Ok(None);
         };
         Ok(Some(RunOutcome {
+            failed_effect: failure_of(&status, &records),
             run_id: run,
             status,
             chain_head: last.hash,
@@ -4275,31 +4314,80 @@ impl Runtime {
             .await
     }
 
-    /// Admit the run one already-executing run ordered from another agent.
+    /// Admit and set working the sub-run a started commission orders, under
+    /// `key`, answering with its id.
     ///
-    /// Apart from every other entry point for one reason: a commission is a
-    /// *step* of a run this process is executing, so the drain gate must not
-    /// see it. A drain that refused here would fail the commissioning step of
-    /// exactly the runs it is waiting for — and that step's failure is
-    /// `Interrupted`, the in-doubt classification, because a commissioning
-    /// caller cannot know what the agent it ordered from managed to do. The
-    /// drain would manufacture the state it exists to prevent.
-    pub(crate) async fn commission_run(
+    /// A key already held answers with the run that holds it: the start was
+    /// re-performed after a crash and its sub-run exists. A commission, not an
+    /// outside admission, so the drain gate does not see it — but the sub-run
+    /// is tracked in flight, so a drain waits for it.
+    pub(crate) async fn start_commission_run(
         &self,
+        parent: RunId,
         target: &str,
         input: Tainted<Value>,
         terms: RunTerms,
-    ) -> Result<RunOutcome, RuntimeError> {
+        key: &str,
+    ) -> Result<RunId, RuntimeError> {
         let skill = self.resolve(target)?;
-        let capability = first_capability(&skill.descriptor());
-        self.admit_plan_as(
-            RunId::generate(),
-            PlanIR::single(capability),
-            input,
-            terms,
-            Entry::Nested,
-        )
-        .await
+        let plan = PlanIR::single(first_capability(&skill.descriptor()));
+        let run = RunId::generate();
+        let ticket = self.inflight.enter(run);
+        let admit = Box::pin(self.admit_only(run, plan, input, terms.keyed(key), Entry::Nested));
+        match self.claimed(key, admit).await? {
+            Claimed::Fresh(admitted) => {
+                let plane = self.owned();
+                let working = tokio::spawn(
+                    async move {
+                        let _ticket = ticket;
+                        plane.execute_admitted(admitted).await
+                    }
+                    .in_current_span(),
+                );
+                self.commissions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(run, (parent, working));
+                Ok(run)
+            }
+            Claimed::Held(held) => Ok(held),
+        }
+    }
+
+    /// A commissioned sub-run once it rests, with its answer and everything
+    /// it spent.
+    ///
+    /// From the task that executed it, when this process set it working: that
+    /// pass did all its work, so its outcome is the whole. Otherwise — the
+    /// commissioning run resumed after a crash, or another instance started
+    /// it — the run is settled and read back by strict replay, which reads the
+    /// answer and every pass's spend from the journal; a resumed pass reports
+    /// only its own.
+    pub(crate) async fn rested_commission(&self, run: RunId) -> Result<RunOutcome, RuntimeError> {
+        let working = self
+            .commissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&run);
+        if let Some((_, working)) = working {
+            return working.await.map_err(|e| {
+                RuntimeError::Store(crate::core::StoreError::Backend(format!(
+                    "the commissioned run's task ended without an outcome: {e}"
+                )))
+            })?;
+        }
+        self.settled(run).await?;
+        self.replay(run, Mode::Strict).await
+    }
+
+    /// Let go of the tasks running `parent`'s unawaited commissions, once its
+    /// pass ends: the sub-runs carry on, and a later await reads them back
+    /// from the journal.
+    fn forget_commissions_of(&self, parent: RunId) {
+        self.commissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|_, (started_by, _)| *started_by != parent);
     }
 
     /// Record the chain this run acts under, beside the plan it authorizes.
@@ -7607,6 +7695,7 @@ impl Runtime {
         // the quota ledger and the metrics: a verification is not work the
         // tenant did today, and accruing a historical run's spend into the
         // current period on every audit would bill the past once per look.
+        self.forget_commissions_of(run);
         if writing {
             // Settlement precedes both physical sealing and lease release. If
             // it fails, the conclusion remains open under an owned lease; once
@@ -7645,6 +7734,7 @@ impl Runtime {
             announce(&self.meter, run, &status);
 
             return Ok(RunOutcome {
+                failed_effect: self.failed_effect(run, &status).await?,
                 run_id: run,
                 status,
                 chain_head,
@@ -7654,6 +7744,7 @@ impl Runtime {
         }
 
         Ok(RunOutcome {
+            failed_effect: self.failed_effect(run, &status).await?,
             run_id: run,
             status,
             chain_head,
@@ -7663,6 +7754,13 @@ impl Runtime {
             output,
         })
     }
+}
+
+/// The effect a run ended on, when it failed on one.
+fn failure_of(status: &RunStatus, records: &[Record]) -> Option<crate::journal::FailedEffect> {
+    matches!(status, RunStatus::Failed(_))
+        .then(|| crate::journal::failed_effect(records))
+        .flatten()
 }
 
 /// The run's result: the terminal step's output.
@@ -11338,6 +11436,7 @@ impl RuntimeBuilder {
             self_ref: self_ref.clone(),
             witnesses,
             inflight: Arc::default(),
+            commissions: Arc::default(),
             signer: self.signer,
             store: self.store,
             skills,

@@ -88,9 +88,9 @@
 //!
 //! The convention defines more that this plane does not emit, each for its own
 //! reason. `gen_ai.response.id`, because no shared part of a [`Completion`]
-//! carries one. `gen_ai.tool.call.id`, because a coded skill calls a tool by its
-//! id and its arguments, and the model's call id never reaches the call.
-//! `gen_ai.provider.name` on the **run** span, because the agent is executed here
+//! carries one. `gen_ai.tool.call.id` on a tool called with `call_tool`, which
+//! answers no model call — `StepCtx::call_tool_for` and the declarative loop
+//! carry it. `gen_ai.provider.name` on the **run** span, because the agent is executed here
 //! rather than served by anyone — the completion spans beneath it each name the
 //! provider that answered them. And `server.address`, because a driver's endpoint
 //! is deployment configuration that is identical for every call it makes: that
@@ -167,6 +167,8 @@ pub const GEN_AI_CACHE_READ_TOKENS: &str = "gen_ai.usage.cache_read.input_tokens
 pub const GEN_AI_CACHE_WRITE_TOKENS: &str = "gen_ai.usage.cache_write.input_tokens";
 /// The tool a call named, for `execute_tool` spans.
 pub const GEN_AI_TOOL_NAME: &str = "gen_ai.tool.name";
+/// The model's id for the call a tool execution answers.
+pub const GEN_AI_TOOL_CALL_ID: &str = "gen_ai.tool.call.id";
 /// Which declaration a run is executing.
 ///
 /// The convention's name for it, rather than one in this crate's namespace: an

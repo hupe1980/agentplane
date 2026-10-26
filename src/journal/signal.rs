@@ -21,6 +21,13 @@ use crate::core::RunId;
 #[derive(Debug, Default)]
 pub struct AppendSignals {
     runs: Mutex<HashMap<(String, RunId), watch::Sender<u64>>>,
+    /// Runs a poller is already looking at, for a handle whose writer is
+    /// another process.
+    polled: Mutex<std::collections::HashSet<(String, RunId)>>,
+    /// Every append in a tenant, for a follower of the whole feed.
+    tenants: Mutex<HashMap<String, watch::Sender<u64>>>,
+    /// Tenants a poller already watches as a whole.
+    polled_all: Mutex<std::collections::HashSet<String>>,
 }
 
 impl AppendSignals {
@@ -46,6 +53,7 @@ impl AppendSignals {
     /// followers have all gone is dropped here rather than kept for a run that
     /// may never append again.
     pub fn raise(&self, tenant: &str, run: RunId, head: u64) {
+        self.raise_all(tenant);
         let mut runs = self
             .runs
             .lock()
@@ -67,6 +75,82 @@ impl AppendSignals {
                 false
             }
         });
+    }
+}
+
+impl AppendSignals {
+    /// Follow every run in `tenant`'s keyspace.
+    pub fn subscribe_all(&self, tenant: &str) -> AppendWatch {
+        let rx = self
+            .tenants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(tenant.to_owned())
+            .or_insert_with(|| watch::channel(0).0)
+            .subscribe();
+        AppendWatch { rx }
+    }
+
+    /// Say that something in `tenant` appended. The value a follower sees is
+    /// a count of raises, meaningful only as *it moved*.
+    pub fn raise_all(&self, tenant: &str) {
+        let tenants = self
+            .tenants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = tenants.get(tenant) {
+            tx.send_modify(|seen| *seen = seen.wrapping_add(1));
+        }
+    }
+
+    /// Whether anybody still follows the whole of `tenant`.
+    pub fn followed_all(&self, tenant: &str) -> bool {
+        self.tenants
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(tenant)
+            .is_some_and(|tx| tx.receiver_count() > 0)
+    }
+
+    /// Take the one poller slot for the whole of `tenant`.
+    pub fn claim_poll_all(&self, tenant: &str) -> bool {
+        self.polled_all
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(tenant.to_owned())
+    }
+
+    /// Give the poller slot for the whole of `tenant` back.
+    pub fn release_poll_all(&self, tenant: &str) {
+        self.polled_all
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(tenant);
+    }
+
+    /// Whether anybody still follows `run`.
+    pub fn followed(&self, tenant: &str, run: RunId) -> bool {
+        self.runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(tenant.to_owned(), run))
+            .is_some_and(|tx| tx.receiver_count() > 0)
+    }
+
+    /// Take the one poller slot for `run`; `false` when a poller holds it.
+    pub fn claim_poll(&self, tenant: &str, run: RunId) -> bool {
+        self.polled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert((tenant.to_owned(), run))
+    }
+
+    /// Give the poller slot for `run` back.
+    pub fn release_poll(&self, tenant: &str, run: RunId) {
+        self.polled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(tenant.to_owned(), run));
     }
 }
 

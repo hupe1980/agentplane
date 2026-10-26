@@ -466,6 +466,12 @@ pub enum RecordKind {
         /// figure is measured.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         elapsed_ms: Option<u64>,
+        /// The peer's own name for a refusal, where it gave one — a model
+        /// provider's error type or code. Kept in the clear: it is an
+        /// identifier, bounded at the driver, and it is what tells a refusal
+        /// of the account from a refusal of the request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
     },
 
     /// A limit refused an operation before it started.

@@ -984,6 +984,13 @@ present only when an attempt failed because a blob answered with bytes other
 than its address names, holds what moved (`blob <digest>`). Clear: a digest,
 and strict replay quarantines the run from it without reading the store.
 
+**A refusal's code is on its failure.** `EffectFailed.code`, present when the
+peer named the refusal — a model provider's error type or code, such as
+`insufficient_quota` or `authentication_error` — holds that identifier, at most
+128 bytes of ASCII letters, digits and `_.:-`. Clear: it quotes nothing of the
+request, and it is what tells a refusal of the account from a refusal of the
+request.
+
 **How long a call took is on its outcome.** `EffectDone.elapsed_ms` and
 `EffectFailed.elapsed_ms` are the wall time this process measured around the
 call — clear, absent where nothing was performed live, and read by nothing a

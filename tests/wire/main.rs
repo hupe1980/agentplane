@@ -18,8 +18,10 @@
 mod a2a_interop;
 mod a2a_server;
 mod api;
+mod conversation;
 mod dev;
 mod drivers;
+mod failure;
 mod mcp;
 mod mcp_http;
 mod mcp_server;

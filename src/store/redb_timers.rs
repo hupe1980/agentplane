@@ -3,7 +3,7 @@
 use std::ops::Bound;
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 
 use crate::case::TimerStore;
 use crate::core::{CaseId, EffectKey, Phase, RunId, StoreError, Timer, Timestamp};
@@ -180,7 +180,7 @@ impl TimerStore for RedbStore {
                             )),
                             None => Bound::Included((tenant.as_str(), i64::MIN, "", "")),
                         };
-                        due.range::<(&str, i64, &str, &str)>((start, end))
+                        due.range((start, end))
                             .map_err(|e| be(&e))?
                             .take(chunk)
                             .map(|e| {

@@ -1855,6 +1855,8 @@ impl agentplane::model::ModelProvider for Summarises {
             truncated: false,
             continuation: None,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         })
     }
 }

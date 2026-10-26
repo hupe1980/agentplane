@@ -89,7 +89,7 @@ impl Skill for ProposesRefund {
         let decision = cx.task(&spec).await?;
 
         Ok(Outcome::done(Tainted::trusted(json!({
-            "approved": decision.approved,
+            "approved": decision.approved(),
             "by": decision.decided.to_string(),
         }))))
     }
@@ -458,14 +458,14 @@ async fn a_plane_holding_the_agent_under_another_policy_still_quarantines() {
 async fn an_expired_window_is_not_recorded_as_somebody_deciding() {
     let expired = Decision::expired(OnExpiry::Proceed);
     assert_eq!(expired.decided, Decided::OnExpiry(OnExpiry::Proceed));
-    assert!(expired.approved, "proceed was pre-authorised");
+    assert!(expired.approved(), "proceed was pre-authorised");
     assert!(
         expired.decided.operator().is_none(),
         "nobody decided, so there is no operator to name"
     );
 
     let denied = Decision::expired(OnExpiry::Deny);
-    assert!(!denied.approved);
+    assert!(!denied.approved());
     assert_eq!(denied.decided, Decided::OnExpiry(OnExpiry::Deny));
 
     // Serialised, the two are different shapes rather than two spellings of
@@ -828,7 +828,7 @@ async fn an_escalation_naming_nobody_is_refused() {
             .role("ops")
             .on_expiry(Expiry::Escalate { to: Vec::new() });
             let d = cx.task(&spec).await?;
-            Ok(Outcome::done(Tainted::trusted(json!(d.approved))))
+            Ok(Outcome::done(Tainted::trusted(json!(d.approved()))))
         }
     }
 
@@ -2557,6 +2557,8 @@ spec:
         truncated: false,
         continuation: None,
         reasoning: None,
+        commentary: None,
+        compacted: None,
     });
 
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
@@ -3892,5 +3894,142 @@ async fn a_caller_presenting_the_planes_chain_cannot_approve_its_run() {
         ),
         "the person a caller's run acts for decided it because their chain equals the plane's: \
          {refused:?}"
+    );
+}
+
+// ── Questions ───────────────────────────────────────────────────────────────
+
+/// Asks which currency to refund in, from two choices.
+#[derive(Debug)]
+struct AsksCurrency;
+
+#[async_trait::async_trait]
+impl Skill for AsksCurrency {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("asks-currency").provides("demo.currency")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.deadline("answer", &DeadlineSpec::days(2), None).await?;
+        let spec = TaskSpec::question(
+            "refund-currency",
+            Tainted::trusted("Refund in which currency?".to_owned()),
+            "answer",
+        )
+        .choices(["EUR", "USD"])
+        .role("compliance-officer");
+        let answer = cx.question(&spec).await?;
+        Ok(Outcome::done(Tainted::trusted(json!({
+            "answer": answer.as_ref().map(|a| a.peek().clone()),
+            "trusted": answer.as_ref().map(|a| a.label().trust == agentplane::core::Trust::Trusted),
+            "provenance": answer.as_ref().map(|a| a.label().provenance.iter().map(ToString::to_string).collect::<Vec<_>>()),
+        }))))
+    }
+}
+
+fn question_fixture() -> Fixture {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .skill(AsksCurrency)
+        .build();
+    Fixture { store, rt }
+}
+
+async fn asked(f: &Fixture) -> (RunOutcome, TaskId) {
+    let out =
+        f.rt.start("demo.currency", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("dispute", &[key("INV-Q")]))
+            .run()
+            .await
+            .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+    let task = f.store.queue(&officer(), 10).await.unwrap()[0].clone();
+    (out, task.id)
+}
+
+/// **A question is answered, and the answer is recorded as an answer.** It
+/// reaches the run labelled as the worklist's trusted value, from the task.
+#[tokio::test]
+async fn a_question_is_answered_with_an_offered_choice() {
+    let f = question_fixture();
+    let (out, task) = asked(&f).await;
+    f.rt.decide_task(task, &Decision::answer(by("rita"), "EUR"), &officer())
+        .await
+        .expect("an offered answer is recorded");
+    let done = f.rt.recorded_outcome(out.run_id).await.unwrap().unwrap();
+    assert_eq!(done.status, RunStatus::Succeeded, "{:?}", done.status);
+    let answered =
+        f.rt.replay(out.run_id, agentplane::runtime::Mode::Strict)
+            .await
+            .unwrap();
+    let value = answered.output.expect("an answer").peek().clone();
+    assert_eq!(value["answer"], "EUR");
+    assert_eq!(value["trusted"], true);
+    assert_eq!(value["provenance"], json!(["task:refund-currency"]));
+}
+
+/// An answer the question did not offer is refused before anything is
+/// recorded, and the task stays open.
+#[tokio::test]
+async fn an_answer_not_offered_is_refused() {
+    let f = question_fixture();
+    let (_, task) = asked(&f).await;
+    let refused =
+        f.rt.decide_task(task, &Decision::answer(by("rita"), "GBP"), &officer())
+            .await;
+    assert!(
+        matches!(
+            refused,
+            Err(agentplane::core::RuntimeError::DecisionRefused { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        f.store.task(task).await.unwrap().unwrap().state,
+        TaskState::Open,
+        "a refused answer moved the task"
+    );
+    // Nor is a question approved.
+    let approved =
+        f.rt.decide_task(task, &Decision::approve(by("rita"), "fine"), &officer())
+            .await;
+    assert!(
+        matches!(
+            approved,
+            Err(agentplane::core::RuntimeError::DecisionRefused { .. })
+        ),
+        "{approved:?}"
+    );
+}
+
+/// An approval task takes no answer: it would record no verdict on what the
+/// task proposes.
+#[tokio::test]
+async fn an_approval_task_takes_no_answer() {
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
+    let out =
+        f.rt.start("demo.refund", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("dispute", &[key("INV-A")]))
+            .run()
+            .await
+            .unwrap();
+    assert!(out.status.is_suspended());
+    let task = f.store.queue(&officer(), 10).await.unwrap()[0].id;
+    let refused =
+        f.rt.decide_task(task, &Decision::answer(by("rita"), "yes"), &officer())
+            .await;
+    assert!(
+        matches!(
+            refused,
+            Err(agentplane::core::RuntimeError::DecisionRefused { .. })
+        ),
+        "{refused:?}"
     );
 }

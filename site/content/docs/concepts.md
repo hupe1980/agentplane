@@ -304,8 +304,10 @@ already in the journal.
 This is a design statement, not an API detail, and it is the thing to know
 before designing around `commission`.
 
-`StepCtx::commission` takes `&mut self` and is singular, and there is no
-`join`/`select` helper — which does not make in-run fan-out impossible.
+`StepCtx::commission` takes `&mut self`, and there is no `join`/`select`
+helper — which does not make in-run fan-out impossible. A coded skill keeps
+several sub-runs working with `start_commission`, then `await_commission`s
+each in turn.
 
 Independent nodes are a **ready set**: `PlanIR::fan_out` dispatches every branch
 concurrently inside one run, each with its own journal slice, feeding one
@@ -420,15 +422,16 @@ discovering one call at a time.
 | `store_blob(bytes)`, `blobs()` | content-addressed payloads; on a case-bound run `blobs()` is read-only and `store_blob` writes, linking the bytes to the case |
 | `fetch_media(..)` | a governed remote fetch, SSRF controls and all |
 | `draw(..)` | spend against a standing authorization |
-| `commission(capability, input)` | hand work to another agent on this plane — asked once, never retried |
+| `commission(capability, input)` | hand work to another agent on this plane — a start and an await |
+| `start_commission(..)`, `await_commission(..)` | the same, split, so several sub-runs work at once |
 | `group()` | a transactional effect group |
 | `manifest()`, `budget()`, `run_id()` | what this agent was declared to be, and what it has spent |
 
-`commission` takes `&mut self` and is **singular**, so a step delegates to one
-peer at a time. `StepCtx` is the deterministic admission boundary — journal
-position, policy and budget decisions all pass through it — and handing out
-concurrent borrows would move those decisions outside it. Concurrency belongs to
-the plan: independent nodes are a
+Every one takes `&mut self`: `StepCtx` is the deterministic admission
+boundary — journal position, policy and budget decisions all pass through it —
+and handing out concurrent borrows would move those decisions outside it. A
+step keeps several commissions working by starting each before awaiting any;
+everything else concurrent belongs to the plan: independent nodes are a
 [ready set](#the-unit-of-concurrency-is-the-plan-node), each branch with its own
 journal slice.
 

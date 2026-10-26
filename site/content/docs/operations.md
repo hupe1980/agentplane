@@ -1428,8 +1428,8 @@ where the same values are sealed, labelled and erasable.
 
 The convention defines more that this plane does not emit, each for its own
 reason. `gen_ai.response.id`, because no shared part of a completion carries one.
-`gen_ai.tool.call.id`, because a coded skill calls a tool by its id and its
-arguments, and the model's call id never reaches the call.
+`gen_ai.tool.call.id` on a tool called with `call_tool`, which answers no model
+call; the tool-calling loop and `StepCtx::call_tool_for` carry it.
 `gen_ai.provider.name` on the **run** span, because the agent is executed here
 rather than served by anyone — the completion spans beneath it each name the
 provider that answered them. And `server.address`, because a driver's endpoint is
@@ -1566,7 +1566,7 @@ not a condition.
 
 `reconcile` establishes an effect the runtime could not decide; `quarantine`
 reopens or abandons the run afterwards; `tasks` lists the worklist and
-`decide <task> approve|reject` answers one; `acknowledge` accounts for a
+`decide <task> approve|reject|answer` answers one; `acknowledge` accounts for a
 breached obligation; `cancel` stops a run the ceiling or the halt will not
 release; `rearm` revives a parked push registration. Each but `rearm` requires
 `--actor`, recorded as **asserted** (the same act through the API records
@@ -2025,7 +2025,7 @@ Copy the file; it calls operator routes and runs no agent code.
 | `POST /tasks/{task}/claim` | This one is mine — don't let a colleague duplicate it |
 | `POST /tasks/{task}/release` | It isn't mine after all; give it back |
 | `POST /tasks/{task}/takeover` | The colleague holding it is out — displace their claim, naming whose it was |
-| `POST /tasks/{task}/decide` | Approve or reject, as myself |
+| `POST /tasks/{task}/decide` | Approve, reject or answer, as myself |
 | `GET /cases?status=…` | What is escalated and has not been cleared? Newest first; defaults to `escalated` |
 | `GET /cases/{case}` | What has happened on this matter, and by when must it end? |
 | `GET /obligations` | What did we miss and has nobody accounted for? Longest-overdue first, and it outlives the case's closure |

@@ -57,6 +57,9 @@ pub struct Accumulator {
     /// A transport-level `error` event inside a 200 response: the error
     /// object itself, wherever the event put it.
     error: Option<Value>,
+    /// The output positions of commentary-phase messages, from each item's
+    /// opening event — the text deltas name only the position.
+    commentary: std::collections::BTreeSet<u64>,
 }
 
 /// Which terminal event ended the stream.
@@ -105,9 +108,9 @@ impl Accumulator {
         self.error.as_ref()
     }
 
-    /// Absorb one event, returning the answer or reasoning-summary text it
-    /// carried — so a live observer is fed from the same parse the outcome is
-    /// read from.
+    /// Absorb one event, returning the answer, commentary or reasoning-summary
+    /// text it carried — so a live observer is fed from the same parse the
+    /// outcome is read from.
     ///
     /// Unknown types are ignored: `OpenAI` adds event types for new tool
     /// families regularly, and a driver that rejected them would break on a
@@ -146,7 +149,15 @@ impl Accumulator {
             // terminal event, which cannot disagree with its own usage.
             "response.output_text.delta" => {
                 self.generated = true;
-                return delta(&value).map(super::ModelStreamEvent::TextDelta);
+                let narrating = value
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|at| self.commentary.contains(&at));
+                return delta(&value).map(if narrating {
+                    super::ModelStreamEvent::CommentaryDelta
+                } else {
+                    super::ModelStreamEvent::TextDelta
+                });
             }
             "response.reasoning_summary_text.delta" => {
                 self.generated = true;
@@ -156,9 +167,17 @@ impl Accumulator {
             // too: with summaries disabled a reasoning model can burn
             // thousands of billed tokens and emit none of the delta kinds,
             // and a stream cut there must not read as safe to repeat.
-            "response.refusal.delta"
-            | "response.function_call_arguments.delta"
-            | "response.output_item.added" => self.generated = true,
+            "response.output_item.added" => {
+                self.generated = true;
+                if value.pointer("/item/phase").and_then(Value::as_str) == Some("commentary")
+                    && let Some(at) = value.get("output_index").and_then(Value::as_u64)
+                {
+                    self.commentary.insert(at);
+                }
+            }
+            "response.refusal.delta" | "response.function_call_arguments.delta" => {
+                self.generated = true;
+            }
             "response.completed" => self.finish(&value, Outcome::Completed),
             "response.incomplete" => self.finish(&value, Outcome::Incomplete),
             "response.failed" => self.finish(&value, Outcome::Failed),
@@ -219,6 +238,40 @@ mod tests {
               "output":[{"type":"message","content":[{"type":"output_text","text":"Hello"}]}],
               "usage":{"input_tokens":25,"output_tokens":15,"total_tokens":40}}}"#,
     );
+
+    /// Narration beside a call streams as commentary, never as answer text,
+    /// so the live view and the finished completion agree on what the answer
+    /// is.
+    #[test]
+    fn commentary_streams_apart_from_the_answer() {
+        let mut acc = Accumulator::new();
+        acc.event(
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":0,
+                "item":{"type":"message","role":"assistant","phase":"commentary","content":[]}}"#,
+        );
+        acc.event(
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","output_index":1,
+                "item":{"type":"message","role":"assistant","content":[]}}"#,
+        );
+        let narrated = acc.event(
+            "response.output_text.delta",
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"Checking. "}"#,
+        );
+        let answered = acc.event(
+            "response.output_text.delta",
+            r#"{"type":"response.output_text.delta","output_index":1,"delta":"42"}"#,
+        );
+        assert!(
+            matches!(narrated, Some(super::super::ModelStreamEvent::CommentaryDelta(ref t)) if t == "Checking. "),
+            "commentary streamed as {narrated:?}"
+        );
+        assert!(
+            matches!(answered, Some(super::super::ModelStreamEvent::TextDelta(ref t)) if t == "42"),
+            "the answer streamed as {answered:?}"
+        );
+    }
 
     #[test]
     fn a_whole_stream_yields_the_terminal_response_object() {

@@ -160,6 +160,12 @@ pub enum RuntimeError {
         reason: crate::core::Withheld,
     },
 
+    /// A decision that does not decide this task: an answer to an approval,
+    /// an approval of a question, or an answer the question did not offer.
+    /// Nothing was recorded, and the task is still open.
+    #[error("task {task} was not decided: {detail}")]
+    DecisionRefused { task: String, detail: String },
+
     /// A decision named a version of its task that is no longer the row's.
     ///
     /// Nothing was recorded, and no claim this call took is left behind. The
@@ -617,8 +623,16 @@ pub enum EffectError {
     /// The bit is recorded on the failure (`EffectFailed.permanent`), because
     /// the retry decision is replayed from history and a replay that could
     /// not see it would expect a retry the live run never made.
-    #[error("effect refused: {0}")]
-    Refused(String),
+    ///
+    /// `code` is the peer's own name for the refusal where it gave one — a
+    /// model provider's error type or code (`insufficient_quota`,
+    /// `authentication_error`) — kept so a caller can tell a refusal of the
+    /// account from a refusal of the request.
+    #[error("effect refused: {detail}")]
+    Refused {
+        detail: String,
+        code: Option<String>,
+    },
 
     /// The peer accepted the request and never answered in time.
     ///
@@ -696,6 +710,23 @@ pub enum EffectError {
 }
 
 impl EffectError {
+    /// A refusal no retry can change, with no code from the peer.
+    pub fn refused(detail: impl Into<String>) -> Self {
+        Self::Refused {
+            detail: detail.into(),
+            code: None,
+        }
+    }
+
+    /// The peer's own name for a refusal, where it gave one.
+    #[must_use]
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            Self::Refused { code, .. } => code.as_deref(),
+            _ => None,
+        }
+    }
+
     /// What this failure cost, if anything.
     ///
     /// Zero for everything that never reached a meter. The runtime bills this on
@@ -720,7 +751,7 @@ impl EffectError {
             Self::Unavailable { .. }
             | Self::Rejected(_)
             | Self::RateLimited { .. }
-            | Self::Refused(_)
+            | Self::Refused { .. }
             | Self::Timeout { .. }
             | Self::Interrupted { .. }
             | Self::Performed(_)
@@ -763,7 +794,7 @@ impl EffectError {
             Self::Unavailable { .. } => "unavailable",
             Self::Rejected(_) => "rejected",
             Self::RateLimited { .. } => "rate_limited",
-            Self::Refused(_) => "refused",
+            Self::Refused { .. } => "refused",
             Self::Timeout { .. } => "timeout",
             Self::Interrupted { .. } => "interrupted",
             Self::Metered { .. } => "metered",
@@ -783,7 +814,7 @@ impl EffectError {
             Self::Unavailable { .. }
             | Self::Rejected(_)
             | Self::RateLimited { .. }
-            | Self::Refused(_)
+            | Self::Refused { .. }
             | Self::Unreproducible { .. } => Disposition::DidNotHappen,
             Self::OutputShape(_) | Self::Performed(_) => Disposition::Landed,
             // `Other` shares the in-doubt arm deliberately: an error that does
@@ -1343,6 +1374,11 @@ pub enum StoreError {
     /// other holder, or stop it.
     #[error("the store is in use by another handle: {0}")]
     InUse(String),
+
+    /// The handle reads beside another process's writer, and nothing may be
+    /// written through it.
+    #[error("this store handle is read-only: it reads a journal another process writes")]
+    ReadOnly,
 
     /// The store's bytes are not a store this build can open — corrupted, or
     /// written in a format it does not read. Open it with the build that wrote

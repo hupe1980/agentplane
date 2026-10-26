@@ -78,6 +78,8 @@ fn plan(value: Value) -> agentplane::model::Completion {
         truncated: false,
         continuation: None,
         reasoning: None,
+        commentary: None,
+        compacted: None,
     }
 }
 

@@ -1,7 +1,7 @@
 //! Governed memory on redb.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 
 use crate::core::StoreError;
 use crate::memory::{MemoryItem, MemoryStore, Recall, access_expiry};

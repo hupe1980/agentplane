@@ -257,7 +257,44 @@ struct ApiUsage {
     /// The writes split by cache tier. Absent on a response that wrote none.
     #[serde(default)]
     cache_creation: Option<CacheCreation>,
+    /// Each sampling pass the request made, when compaction is on: the
+    /// top-level counts are the answering pass alone.
+    #[serde(default)]
+    iterations: Vec<Iteration>,
 }
+
+/// One sampling pass of a request.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(super) struct Iteration {
+    #[serde(default, rename = "type")]
+    kind: String,
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+}
+
+/// The input and output tokens of every pass that was not the answer — a
+/// compaction pass, which the top-level counts leave out and the provider
+/// bills.
+pub(super) fn beside_the_answer(iterations: &[Iteration]) -> (u64, u64) {
+    iterations
+        .iter()
+        .filter(|pass| pass.kind != "message")
+        .fold((0, 0), |(input, output), pass| {
+            (
+                input.saturating_add(pass.input_tokens),
+                output.saturating_add(pass.output_tokens),
+            )
+        })
+}
+
+/// The beta that turns server-side compaction on, and the edit that asks for
+/// it (platform.claude.com, compaction at a token threshold).
+const COMPACTION_BETA: &str = "compact-2026-01-12";
+const COMPACTION_EDIT: &str = "compact_20260112";
+/// The smallest trigger the provider accepts.
+const MIN_COMPACTION_TRIGGER: u32 = 50_000;
 
 /// How a call's cache writes divide between the two tiers.
 ///
@@ -295,9 +332,13 @@ impl ApiResponse {
         // inside it, which `with_cache_beside_input` is named for. The stream
         // accumulator reaches the same arithmetic through the same call, so the
         // two paths cannot come to disagree about what a cached call cost.
+        // A compaction pass is billed beside the answer and left out of the
+        // top-level counts; summing it in is what keeps a compacted call from
+        // reading as the cheap one.
+        let (input, output) = u.map_or((0, 0), |u| beside_the_answer(&u.iterations));
         Usage::with_cache_beside_input(
-            u.map_or(0, |u| u.input_tokens),
-            u.map_or(0, |u| u.output_tokens),
+            u.map_or(0, |u| u.input_tokens).saturating_add(input),
+            u.map_or(0, |u| u.output_tokens).saturating_add(output),
             write,
             read,
         )
@@ -392,9 +433,10 @@ impl ApiResponse {
 fn continue_with(
     messages: Value,
     exchanges: &[super::ToolExchange],
+    told: &[String],
     continuation: Option<&super::ProviderContinuation>,
 ) -> Value {
-    if exchanges.is_empty() {
+    if exchanges.is_empty() && told.is_empty() {
         return messages;
     }
     let mut out = match messages {
@@ -403,7 +445,7 @@ fn continue_with(
     };
     if let Some(state) = continuation.and_then(|state| state.state.as_array()) {
         out.extend(state.iter().cloned());
-    } else {
+    } else if !exchanges.is_empty() {
         out.push(json!({
             "role": "assistant",
             "content": exchanges
@@ -417,11 +459,15 @@ fn continue_with(
                 .collect::<Vec<_>>(),
         }));
     }
-    out.push(tool_results(exchanges));
+    out.push(user_turn(exchanges, told));
     Value::Array(out)
 }
 
-fn tool_results(exchanges: &[super::ToolExchange]) -> Value {
+/// The user turn that follows an answer: one `tool_result` per call, then
+/// what a person said, in one message — the API takes text after tool
+/// results in the same turn, and two consecutive user messages would read as
+/// two turns that never alternated with the model.
+fn user_turn(exchanges: &[super::ToolExchange], told: &[String]) -> Value {
     json!({
         "role": "user",
         "content": exchanges
@@ -435,6 +481,7 @@ fn tool_results(exchanges: &[super::ToolExchange]) -> Value {
                 },
                 "is_error": exchange.failed,
             }))
+            .chain(told.iter().map(|text| json!({ "type": "text", "text": text })))
             .collect::<Vec<_>>(),
     })
 }
@@ -443,6 +490,7 @@ fn accumulate_continuation(
     completion: &mut Completion,
     prior: Option<&super::ProviderContinuation>,
     exchanges: &[super::ToolExchange],
+    told: &[String],
 ) {
     let Some(current) = completion.continuation.as_mut() else {
         return;
@@ -451,8 +499,10 @@ fn accumulate_continuation(
         .and_then(|value| value.state.as_array())
         .cloned()
         .unwrap_or_default();
-    if !exchanges.is_empty() {
-        transcript.push(tool_results(exchanges));
+    // What followed the last answer — or, on a first call, the prompt — is
+    // the user turn this answer replied to, and the history keeps it.
+    if !exchanges.is_empty() || !told.is_empty() {
+        transcript.push(user_turn(exchanges, told));
     }
     if let Some(messages) = current.state.as_array() {
         transcript.extend(messages.iter().cloned());
@@ -665,7 +715,11 @@ fn interpret(
     };
 
     let reasoning = thinking_text(&continuation);
-    let continuation = (!tool_calls.is_empty()).then(|| {
+    let compacted = compaction(&continuation);
+    // Every answer leaves the turn it was, so a person can speak after it —
+    // except the forced tool that shapes a schema answer: its `tool_use` has
+    // no result to follow, and the conversation ends there.
+    let continuation = (!emulating).then(|| {
         super::ProviderContinuation::new(
             "anthropic",
             json!([{ "role": "assistant", "content": continuation }]),
@@ -673,6 +727,8 @@ fn interpret(
     });
     Ok(Completion {
         reasoning,
+        commentary: None,
+        compacted,
         structured: structured_value,
         tool_calls,
         text,
@@ -681,6 +737,30 @@ fn interpret(
         truncated,
         stop_reason,
         continuation,
+    })
+}
+
+/// Whether the turn compacted the conversation, with the summary the
+/// `compaction` block holds.
+fn compaction(blocks: &Value) -> Option<super::Compacted> {
+    let summaries = blocks
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("compaction"))
+        .map(|block| {
+            block
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    if summaries.is_empty() {
+        return None;
+    }
+    let summary = summaries.join("\n\n");
+    Some(super::Compacted {
+        summary: (!summary.is_empty()).then_some(summary),
     })
 }
 
@@ -720,6 +800,8 @@ impl Anthropic {
             schema,
             tools,
             exchanges,
+            &[],
+            None,
             None,
         )
     }
@@ -736,13 +818,16 @@ impl Anthropic {
         schema: Option<&Value>,
         tools: &[super::ToolDeclaration],
         exchanges: &[super::ToolExchange],
+        told: &[String],
         continuation: Option<&super::ProviderContinuation>,
+        compaction: Option<&super::Compaction>,
     ) -> Result<Value, ModelError> {
         if let Some(state) = continuation
             && (state.provider != "anthropic" || !state.state.is_array())
         {
             return Err(ModelError::Refused {
                 model: model.clone(),
+                code: None,
                 detail: "the continuation was not an Anthropic assistant-content array".to_owned(),
             });
         }
@@ -753,17 +838,39 @@ impl Anthropic {
         if thinks && !exchanges.is_empty() && continuation.is_none() {
             return Err(ModelError::Refused {
                 model: model.clone(),
+                code: None,
                 detail: "reasoning-enabled tool continuation requires the signed thinking \
                          and assistant blocks from the prior Anthropic response"
                     .to_owned(),
             });
         }
-        super::refuse_dangling_continuation(continuation, exchanges, model)?;
+        super::refuse_dangling_continuation(continuation, exchanges, told, model)?;
         let mut body = json!({
             "model": model.model,
             "max_tokens": max_output_tokens,
-            "messages": continue_with(messages(prompt), exchanges, continuation),
+            "messages": continue_with(messages(prompt), exchanges, told, continuation),
         });
+        if let Some(compaction) = compaction {
+            if compaction.trigger_tokens < MIN_COMPACTION_TRIGGER {
+                return Err(ModelError::Refused {
+                    model: model.clone(),
+                    code: None,
+                    detail: format!(
+                        "Anthropic compacts at no fewer than {MIN_COMPACTION_TRIGGER} input \
+                         tokens; {} was asked",
+                        compaction.trigger_tokens
+                    ),
+                });
+            }
+            let mut edit = json!({
+                "type": COMPACTION_EDIT,
+                "trigger": { "type": "input_tokens", "value": compaction.trigger_tokens },
+            });
+            if let Some(instructions) = &compaction.instructions {
+                edit["instructions"] = json!(instructions);
+            }
+            body["context_management"] = json!({ "edits": [edit] });
+        }
         if let Some(effort) = reasoning_effort {
             // `low` through `max` are the provider's own `output_config.effort`
             // vocabulary, `xhigh` included. `none` and `minimal` have no
@@ -776,6 +883,7 @@ impl Anthropic {
             ) {
                 return Err(ModelError::Refused {
                     model: model.clone(),
+                    code: None,
                     detail: format!(
                         "Anthropic adaptive thinking does not support reasoning effort '{}'",
                         effort.as_str()
@@ -808,6 +916,7 @@ impl Anthropic {
         {
             return Err(ModelError::Refused {
                 model: model.clone(),
+                code: None,
                 detail: format!(
                     "the schema cannot be used with strict constrained decoding: {problem}"
                 ),
@@ -862,6 +971,7 @@ impl Anthropic {
                         );
                         return Err(ModelError::Refused {
                             model: model.clone(),
+                            code: None,
                             detail: format!(
                                 "model '{}' has no native structured output here, so a declared \
                                  response schema is obtained by forcing a tool — and Anthropic \
@@ -875,6 +985,7 @@ impl Anthropic {
                     if !tools.is_empty() {
                         return Err(ModelError::Refused {
                             model: model.clone(),
+                            code: None,
                             detail: format!(
                                 "model '{}' has no native structured output here, so a declared \
                                  response schema is obtained by forcing a synthetic tool — which \
@@ -1126,6 +1237,7 @@ fn stream_error(
         | "not_found_error"
         | "request_too_large" => ModelError::Refused {
             model: model.clone(),
+            code: super::bounded_code(err.kind.clone()),
             detail,
         },
         _ => ModelError::Unavailable {
@@ -1164,7 +1276,9 @@ impl ModelProvider for Anthropic {
             schema,
             tools,
             exchanges,
+            told,
             continuation,
+            compaction,
             stream,
         } = request;
 
@@ -1175,12 +1289,16 @@ impl ModelProvider for Anthropic {
         // and reach nothing.
         self.check_egress(model)?;
 
-        let response = self
+        let mut builder = self
             .http
             .post(format!("{}/v1/messages", self.base))
             .timeout(self.timeout)
             .header("x-api-key", self.key.expose())
-            .header("anthropic-version", &self.version)
+            .header("anthropic-version", &self.version);
+        if compaction.is_some() {
+            builder = builder.header("anthropic-beta", COMPACTION_BETA);
+        }
+        let response = builder
             .json(&self.body_with_max(
                 model,
                 prompt,
@@ -1190,7 +1308,9 @@ impl ModelProvider for Anthropic {
                 schema,
                 tools,
                 exchanges,
+                told,
                 continuation,
+                compaction,
             )?)
             .send()
             .await
@@ -1226,7 +1346,7 @@ impl ModelProvider for Anthropic {
                 label.clone(),
             ));
         }
-        accumulate_continuation(&mut completion, continuation, exchanges);
+        accumulate_continuation(&mut completion, continuation, exchanges, told);
         Ok(completion)
     }
 }
@@ -1878,7 +1998,9 @@ mod continuation_tests {
                 None,
                 &[],
                 &[exchange(false)],
+                &[],
                 Some(&state),
+                None,
             )
             .expect("lossless thinking continuation");
 
@@ -1909,8 +2031,10 @@ mod continuation_tests {
                 json!([{ "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_02"}] }]),
             )),
             reasoning: None,
+            commentary: None,
+            compacted: None,
         };
-        accumulate_continuation(&mut completion, Some(&prior), &[exchange(false)]);
+        accumulate_continuation(&mut completion, Some(&prior), &[exchange(false)], &[]);
         let state = completion.continuation.unwrap().state;
         assert_eq!(state[0]["content"][0]["signature"], "first");
         assert_eq!(state[1]["role"], "user");

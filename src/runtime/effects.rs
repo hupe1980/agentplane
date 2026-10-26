@@ -1187,7 +1187,7 @@ impl Effect for DrawOnAuthority {
             // have been applied", and would quarantine any group it was
             // deferred in where the cheap abort is the truthful settlement.
             // The refusal's own message says which one it was.
-            _ => EffectError::Refused(error.to_string()),
+            _ => EffectError::refused(error.to_string()),
         })
     }
 }

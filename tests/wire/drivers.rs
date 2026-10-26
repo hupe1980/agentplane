@@ -166,7 +166,9 @@ fn request<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::Requ
         schema: None,
         tools: &[],
         exchanges: &[],
+        told: &[],
         continuation: None,
+        compaction: None,
         stream: None,
     }
 }
@@ -295,7 +297,9 @@ async fn model_drivers_bound_a_provider_that_never_responds() {
             schema: None,
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -316,7 +320,9 @@ async fn model_drivers_bound_a_provider_that_never_responds() {
             schema: None,
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -351,7 +357,9 @@ async fn reasoning_effort_uses_each_providers_native_request_shape() {
             schema: None,
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -388,7 +396,9 @@ async fn reasoning_effort_uses_each_providers_native_request_shape() {
             schema: Some(&schema),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -1253,7 +1263,9 @@ fn ask<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::Request<
         schema: None,
         tools: &[],
         exchanges: &[],
+        told: &[],
         continuation: None,
+        compaction: None,
         stream: None,
     }
 }
@@ -1496,7 +1508,9 @@ async fn anthropic_refuses_reasoning_with_a_forced_tool_before_dispatch() {
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -1678,7 +1692,9 @@ async fn a_schema_is_sent_as_a_strict_constraint() {
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -1723,7 +1739,9 @@ async fn the_anthropic_driver_sends_a_schema_too() {
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -1765,7 +1783,9 @@ async fn an_unparseable_structured_answer_is_billed_and_loud() {
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -1844,7 +1864,9 @@ async fn anthropic_can_emulate_a_schema_with_a_forced_tool() {
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -1902,7 +1924,9 @@ async fn openai_can_emulate_a_schema_with_a_forced_tool() {
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -1954,7 +1978,9 @@ async fn the_schema_mode_is_chosen_per_model() {
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -1991,7 +2017,9 @@ async fn the_schema_mode_is_chosen_per_model() {
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -2037,7 +2065,9 @@ async fn a_model_that_ignores_the_forced_tool_is_caught() {
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -2101,7 +2131,9 @@ async fn an_ignored_forced_tool_is_caught_even_by_a_schema_that_permits_null() {
             schema: Some(&permissive),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -2160,7 +2192,9 @@ async fn an_incompatible_schema_is_refused_with_the_reason() {
                 schema: Some(&sch),
                 tools: &[],
                 exchanges: &[],
+                told: &[],
                 continuation: None,
+                compaction: None,
                 stream: None,
             })
             .await
@@ -2206,7 +2240,9 @@ async fn a_conformant_schema_is_not_rewritten() {
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -2840,7 +2876,9 @@ data: {\"type\":\"message_stop\"}
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -2888,7 +2926,9 @@ data: {\"type\":\"message_stop\"}
             schema: Some(&sch),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         })
         .await
@@ -3350,7 +3390,9 @@ fn cc_request<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::R
         schema: None,
         tools: &[],
         exchanges: &[],
+        told: &[],
         continuation: None,
+        compaction: None,
         stream: None,
     }
 }
@@ -4013,7 +4055,9 @@ fn gemini_request<'a>(
         schema: None,
         tools,
         exchanges,
+        told: &[],
         continuation,
+        compaction: None,
         stream: None,
     }
 }
@@ -5655,7 +5699,9 @@ async fn a_schema_and_a_tool_calling_turn_coexist_on_every_driver() {
         schema: Some(&sch),
         tools: &tools,
         exchanges: &[],
+        told: &[],
         continuation: None,
+        compaction: None,
         stream: None,
     };
     let out = provider.complete(request.clone()).await.expect(
@@ -5732,7 +5778,9 @@ async fn a_schema_and_a_tool_calling_turn_coexist_on_the_compatible_wires() {
         schema: Some(&sch),
         tools: &tools,
         exchanges: &[],
+        told: &[],
         continuation: None,
+        compaction: None,
         stream: None,
     };
     let out = provider.complete(request.clone()).await.expect(

@@ -734,6 +734,7 @@ async fn a_failed_attempt_names_the_class_of_fault() {
     let provider = Arc::new(agentplane::testkit::FakeProvider::new());
     provider.will_fail(agentplane::model::ModelError::Refused {
         model: agentplane::model::ModelId::new("fake", "m"),
+        code: None,
         detail: "no".to_owned(),
     });
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
@@ -786,6 +787,7 @@ async fn an_erased_effect_reports_what_a_typed_one_does() {
         }
         fn gen_ai_request(&self) -> Option<agentplane::core::GenAiRequest> {
             Some(agentplane::core::GenAiRequest {
+                call_id: None,
                 provider: Some("erased".to_owned()),
                 name: "boxed-1".to_owned(),
             })
@@ -1294,4 +1296,195 @@ async fn a_spawned_run_is_a_child_of_the_callers_span() {
         .find(|(name, _)| name == telemetry::RUN_SPAN)
         .and_then(|(_, parent)| parent);
     assert_eq!(parent.as_deref(), Some("embedder.task"));
+}
+
+/// A tool the model reads, answering with a constant.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+/// Read a ledger account's balance.
+struct Balance {
+    /// The account to read.
+    account: String,
+}
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[async_trait::async_trait]
+impl agentplane::tools::Tool for Balance {
+    const SERVER: &'static str = "ledger";
+    const NAME: &'static str = "read";
+    fn mutates() -> bool {
+        false
+    }
+    async fn call(self) -> Result<Value, agentplane::tools::ToolFailure> {
+        let _ = self.account;
+        Ok(json!({ "balance": 42 }))
+    }
+}
+
+/// **A trace joins the model's call to the execution that answered it.**
+///
+/// `gen_ai.tool.call.id` on the `execute_tool` span is the provider's own id
+/// for the call, so a trace can pair the request inside a completion with the
+/// tool span that answered it — from the declarative loop, which has the call
+/// in hand.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_tool_span_carries_the_models_call_id() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::testkit::FakeProvider;
+    use agentplane::tools::ToolBox;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  identity:
+    role: A teller.
+  models:
+    privileged: { provider: fake, model: teller-1 }
+  tools:
+    - ref: tool://ledger/read
+      mutates: false
+      max_sensitivity: internal
+      description: Read a balance.
+  execution: { kind: tool-calling, max_turns: 3 }
+  security: { max_sensitivity_egress: internal }
+  budgets: {}
+"#,
+    )
+    .unwrap();
+    let provider = FakeProvider::new();
+    provider.will_call_tool("call_7f3", "ledger__read", json!({ "account": "AC-1" }));
+    provider.will_say("42");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .toolbox(ToolBox::new().with::<Balance>())
+        .build();
+
+    let rec = Recorder::default();
+    let _ambient = crate::ambient_subscriber();
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let out = rt
+        .start("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .run()
+        .await
+        .unwrap();
+    drop(guard);
+    assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
+    let want = format!("{}=call_7f3", telemetry::GEN_AI_TOOL_CALL_ID);
+    assert!(
+        rec.recorded().contains(&want),
+        "the tool span carries no `{want}`; recorded: {:?}",
+        rec.recorded()
+    );
+}
+
+/// Answering a call that named another tool is refused before the effect
+/// exists: the span would say the model asked for what ran.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[test]
+fn answering_another_tools_call_is_refused() {
+    use agentplane::tools::{ToolCatalog, ToolId, ToolSafety};
+    let id = ToolId::new("ledger", "read");
+    let catalog = ToolCatalog::new().allow(id.clone(), ToolSafety::read_only());
+    let client: Arc<dyn agentplane::tools::ToolClient> =
+        Arc::new(agentplane::tools::ToolBox::new().with::<Balance>());
+    let call = agentplane::tools::ToolCall::prepare(&catalog, client, id, json!({}), None).unwrap();
+    let other = agentplane::model::ToolCall {
+        id: "call_1".into(),
+        name: "ledger__write".into(),
+        arguments: json!({}),
+    };
+    assert!(call.answering(&other).is_err());
+}
+
+/// A coded skill answering a model's call says so, and its span carries the
+/// call's id as the declarative loop's does.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[derive(Debug)]
+struct AnswersTheCall;
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[async_trait::async_trait]
+impl Skill for AnswersTheCall {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("answers").provides("ledger.answer")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let asked = agentplane::model::ToolCall {
+            id: "call_9c1".into(),
+            name: "ledger__read".into(),
+            arguments: json!({ "account": "AC-1" }),
+        };
+        let answer = cx
+            .call_tool_for(
+                &asked,
+                agentplane::tools::ToolId::new("ledger", "read"),
+                Tainted::trusted(asked.arguments.clone()),
+            )
+            .await?;
+        Ok(Outcome::done(answer))
+    }
+}
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_coded_skills_tool_span_carries_the_call_it_answers() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::tools::ToolBox;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: answerer, version: "1.0.0" }
+spec:
+  capabilities: { provides: [ledger.answer] }
+  budgets: {}
+  tools:
+    - ref: "tool://ledger/read"
+      mutates: false
+"#,
+    )
+    .unwrap();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .toolbox(ToolBox::new().with::<Balance>())
+        .agent(Agent::new(&manifest).skill(AnswersTheCall))
+        .try_build()
+        .expect("a coherent plane");
+
+    let rec = Recorder::default();
+    let _ambient = crate::ambient_subscriber();
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let out = rt
+        .start("ledger.answer", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .unwrap();
+    drop(guard);
+    assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
+    let want = format!("{}=call_9c1", telemetry::GEN_AI_TOOL_CALL_ID);
+    assert!(
+        rec.recorded().contains(&want),
+        "the tool span carries no `{want}`; recorded: {:?}",
+        rec.recorded()
+    );
 }

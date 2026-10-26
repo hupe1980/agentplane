@@ -438,6 +438,63 @@ pub struct Justification {
     /// declaration changed since is a different digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reach: Option<Reach>,
+    /// The question a person answers instead of approving, with what may be
+    /// answered.
+    ///
+    /// Inside the justification so its digest covers it: an answer binds to
+    /// the question and the choices the person was shown. Absent on a task
+    /// asking for approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asks: Option<Ask>,
+}
+
+/// What a question task accepts as an answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ask {
+    /// The answers offered, in the order shown. Empty with `free_text` for an
+    /// open question.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+    /// Whether an answer outside `choices` is accepted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub free_text: bool,
+}
+
+/// Whether `verdict` decides a task that asks `asks` — `None` for an
+/// approval task.
+///
+/// One rule with two callers: the worklist refuses a misfit before anything
+/// is recorded, and the waiting run refuses one that reached it by any other
+/// door. A question is answered or declined, never approved; an approval task
+/// is approved or rejected, never answered; and an answer is one of the
+/// offered choices unless free text is accepted.
+///
+/// # Errors
+///
+/// Why the verdict does not fit, in the decider's terms.
+pub fn verdict_fits(asks: Option<&Ask>, verdict: &TaskVerdict) -> Result<(), String> {
+    match (asks, verdict) {
+        (Some(_), TaskVerdict::Approved) => Err(
+            "this task asks a question: answer it, or reject it to decline — an approval \
+             would record a permission nobody was asked for"
+                .to_owned(),
+        ),
+        (None, TaskVerdict::Answered(_)) => Err(
+            "this task asks for approval: approve or reject it — an answer would record \
+             no verdict on what it proposes"
+                .to_owned(),
+        ),
+        (Some(ask), TaskVerdict::Answered(answer))
+            if !ask.free_text && !ask.choices.contains(answer) =>
+        {
+            Err(format!(
+                "'{answer}' is not one of the answers offered: {}",
+                ask.choices.join(", ")
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// What a consulted agent may do: the reach a reviewer approves along with
@@ -516,6 +573,7 @@ impl Justification {
             cost: None,
             evidence: Vec::new(),
             reach: None,
+            asks: None,
         }
     }
 
@@ -612,6 +670,52 @@ impl TaskSpec {
     #[must_use]
     pub fn on_expiry(mut self, e: Expiry) -> Self {
         self.on_expiry = e;
+        self
+    }
+
+    /// A question for a person, answered in free text until
+    /// [`choices`](Self::choices) narrows it.
+    ///
+    /// The decision is [`TaskVerdict::Answered`], or a rejection to decline — never
+    /// an approval, so the record does not show a permission nobody was asked
+    /// for. The question is the justification's summary, labelled as it
+    /// arrived.
+    pub fn question(
+        kind: impl Into<String>,
+        question: crate::core::Tainted<String>,
+        deadline: impl Into<String>,
+    ) -> Self {
+        let mut justification = Justification::new(question, Value::Null);
+        justification.asks = Some(Ask {
+            choices: Vec::new(),
+            free_text: true,
+        });
+        Self::new(kind, justification, deadline)
+    }
+
+    /// Offer these answers, and only these unless [`free_text`](Self::free_text)
+    /// says otherwise. Makes the task a question.
+    #[must_use]
+    pub fn choices<S: Into<String>>(mut self, choices: impl IntoIterator<Item = S>) -> Self {
+        let ask = self.justification.asks.get_or_insert(Ask {
+            choices: Vec::new(),
+            free_text: false,
+        });
+        ask.choices = choices.into_iter().map(Into::into).collect();
+        ask.free_text = false;
+        self
+    }
+
+    /// Accept an answer outside the offered choices too.
+    #[must_use]
+    pub fn free_text(mut self) -> Self {
+        self.justification
+            .asks
+            .get_or_insert(Ask {
+                choices: Vec::new(),
+                free_text: true,
+            })
+            .free_text = true;
         self
     }
 }
@@ -952,10 +1056,22 @@ impl std::fmt::Display for Decided {
     }
 }
 
+/// What a person decided.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskVerdict {
+    /// The proposed action may happen.
+    Approved,
+    /// It may not — or, on a question, the person declined to answer.
+    Rejected,
+    /// A question's answer, in the person's words.
+    Answered(String),
+}
+
 /// A human's answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
-    pub approved: bool,
+    pub verdict: TaskVerdict,
     /// Who decided. Recorded permanently: an approval with no name attached is
     /// not an approval.
     pub decided: Decided,
@@ -985,7 +1101,7 @@ impl Decision {
     /// which constructor applies, and that is the claim a reviewer reads.
     pub fn approve(by: Operator, reason: impl Into<String>) -> Self {
         Self {
-            approved: true,
+            verdict: TaskVerdict::Approved,
             decided: Decided::By(by),
             reason: reason.into(),
             amendment: Value::Null,
@@ -996,11 +1112,37 @@ impl Decision {
     /// A refusal, from a named operator.
     pub fn reject(by: Operator, reason: impl Into<String>) -> Self {
         Self {
-            approved: false,
+            verdict: TaskVerdict::Rejected,
             decided: Decided::By(by),
             reason: reason.into(),
             amendment: Value::Null,
             reviewed: None,
+        }
+    }
+
+    /// A question's answer, from a named operator.
+    pub fn answer(by: Operator, answer: impl Into<String>) -> Self {
+        Self {
+            verdict: TaskVerdict::Answered(answer.into()),
+            decided: Decided::By(by),
+            reason: String::new(),
+            amendment: Value::Null,
+            reviewed: None,
+        }
+    }
+
+    /// Whether the proposed action may happen.
+    #[must_use]
+    pub const fn approved(&self) -> bool {
+        matches!(self.verdict, TaskVerdict::Approved)
+    }
+
+    /// A question's answer, when this decision gave one.
+    #[must_use]
+    pub fn answered(&self) -> Option<&str> {
+        match &self.verdict {
+            TaskVerdict::Answered(answer) => Some(answer),
+            TaskVerdict::Approved | TaskVerdict::Rejected => None,
         }
     }
 
@@ -1014,7 +1156,11 @@ impl Decision {
     #[must_use]
     pub fn expired(on_expiry: OnExpiry) -> Self {
         Self {
-            approved: on_expiry == OnExpiry::Proceed,
+            verdict: if on_expiry == OnExpiry::Proceed {
+                TaskVerdict::Approved
+            } else {
+                TaskVerdict::Rejected
+            },
             decided: Decided::OnExpiry(on_expiry),
             reason: match on_expiry {
                 OnExpiry::Proceed => {
@@ -1051,13 +1197,13 @@ mod tests {
 
         assert_eq!(amended.amendment, json!({"cap": 5000}));
         assert_eq!(plain.amendment, Value::Null, "the default carries none");
-        assert_eq!(amended.approved, plain.approved);
+        assert_eq!(amended.verdict, plain.verdict);
         assert_eq!(amended.decided, plain.decided);
         assert_eq!(amended.reason, plain.reason);
 
         // A rejection may be amended too — "no, and here is what would pass".
         let rejected = Decision::reject(rita(), "over her limit").amend(json!({"cap": 5000}));
-        assert!(!rejected.approved, "amending must not approve");
+        assert!(!rejected.approved(), "amending must not approve");
     }
 
     /// A task id parses back from the form it prints.

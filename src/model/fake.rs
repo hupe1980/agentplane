@@ -92,6 +92,12 @@ pub struct Ask {
     /// handing back the precise policy message instead of
     /// `PolicyError::for_model` would pass every test in the suite.
     pub exchanges: Vec<crate::model::ToolExchange>,
+    /// What a person said since the last answer.
+    pub told: Vec<String>,
+    /// The conversation so far, as the continuation this turn carried.
+    pub continuation: Option<crate::model::ProviderContinuation>,
+    /// The compaction this call asked for.
+    pub compaction: Option<crate::model::Compaction>,
 }
 
 /// A `ModelProvider` that answers without a model.
@@ -199,6 +205,8 @@ impl FakeProvider {
             structured: None,
             continuation: None,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         })
     }
 
@@ -224,6 +232,8 @@ impl FakeProvider {
             structured: None,
             continuation: None,
             reasoning: Some(reasoning.into()),
+            commentary: None,
+            compacted: None,
         })
     }
 
@@ -248,6 +258,8 @@ impl FakeProvider {
             structured: Some(value),
             continuation: None,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         })
     }
 
@@ -275,6 +287,8 @@ impl FakeProvider {
             structured: None,
             continuation: None,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         })
     }
 
@@ -422,6 +436,8 @@ fn echo(request: &Request<'_>) -> Completion {
             structured: None,
             continuation: None,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         };
     }
     let stop_reason = Some(if truncated { "max_tokens" } else { "end_turn" }.to_owned());
@@ -442,6 +458,8 @@ fn echo(request: &Request<'_>) -> Completion {
                 structured: Some(value),
                 continuation: None,
                 reasoning: None,
+                commentary: None,
+                compacted: None,
             }
         }
         None => Completion {
@@ -454,6 +472,8 @@ fn echo(request: &Request<'_>) -> Completion {
             structured: None,
             continuation: None,
             reasoning: None,
+            commentary: None,
+            compacted: None,
         },
     }
 }
@@ -501,6 +521,9 @@ impl ModelProvider for FakeProvider {
             schema: request.schema.cloned(),
             tools: request.tools.to_vec(),
             exchanges: request.exchanges.to_vec(),
+            told: request.told.to_vec(),
+            continuation: request.continuation.cloned(),
+            compaction: request.compaction.cloned(),
         });
 
         // Scoped so the guard is gone before anything else happens: a lock held
@@ -521,6 +544,7 @@ impl ModelProvider for FakeProvider {
         crate::model::refuse_dangling_continuation(
             request.continuation,
             request.exchanges,
+            request.told,
             request.model,
         )?;
 
@@ -536,6 +560,7 @@ impl ModelProvider for FakeProvider {
         {
             return Err(ModelError::Refused {
                 model: request.model.clone(),
+                code: None,
                 detail: format!(
                     "the schema cannot be used with strict constrained decoding: {problem}"
                 ),
@@ -551,6 +576,7 @@ impl ModelProvider for FakeProvider {
                 if !request.reasoning_summary {
                     completion.reasoning = None;
                 }
+                remember(&mut completion, &request);
                 completion
             });
 
@@ -584,6 +610,37 @@ impl ModelProvider for FakeProvider {
         }
         answer
     }
+}
+
+/// Leave the turn behind as a real driver does, so a conversation can follow
+/// it: the history so far, what followed the last answer, and this answer —
+/// except after a schema answer, which a real driver's forced tool ends. A
+/// scripted completion that carries a continuation of its own keeps it.
+fn remember(completion: &mut Completion, request: &Request<'_>) {
+    if completion.continuation.is_some() || request.schema.is_some() {
+        return;
+    }
+    let mut history = request
+        .continuation
+        .and_then(|c| c.state.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if !request.exchanges.is_empty() || !request.told.is_empty() {
+        history.push(json!({
+            "role": "user",
+            "results": request.exchanges.iter().map(|e| &e.output).collect::<Vec<_>>(),
+            "told": request.told,
+        }));
+    }
+    history.push(json!({
+        "role": "assistant",
+        "text": completion.text,
+        "tool_calls": completion.tool_calls.iter().map(|c| &c.id).collect::<Vec<_>>(),
+    }));
+    completion.continuation = Some(crate::model::ProviderContinuation::new(
+        "fake",
+        Value::Array(history),
+    ));
 }
 
 /// Answer as a provider that served what it was asked for.
@@ -684,7 +741,9 @@ mod tests {
             schema: schema.map(|s| &*Box::leak(Box::new(s.clone()))),
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         }
     }
@@ -779,7 +838,9 @@ mod tests {
                 schema: None,
                 tools: &[],
                 exchanges: &[],
+                told: &[],
                 continuation: None,
+                compaction: None,
                 stream: None,
             };
             let error = fake
@@ -810,7 +871,9 @@ mod tests {
             schema: None,
             tools: &[],
             exchanges: &[],
+            told: &[],
             continuation: None,
+            compaction: None,
             stream: None,
         };
         assert!(
@@ -860,7 +923,9 @@ mod tests {
                 schema: None,
                 tools: &[],
                 exchanges: &[],
+                told: &[],
                 continuation: None,
+                compaction: None,
                 stream: None,
             })
             .await
@@ -875,7 +940,9 @@ mod tests {
                 schema: None,
                 tools: &[],
                 exchanges: &[],
+                told: &[],
                 continuation: None,
+                compaction: None,
                 stream: None,
             })
             .await

@@ -711,6 +711,18 @@ impl JournalStore for BlindToKeys {
     ) -> Option<agentplane::journal::AppendWatch> {
         self.0.watch(run).await
     }
+
+    async fn watch_all(&self) -> Option<agentplane::journal::AppendWatch> {
+        self.0.watch_all().await
+    }
+
+    async fn feed(
+        &self,
+        after: Option<&agentplane::journal::FeedCursor>,
+        limit: usize,
+    ) -> Result<agentplane::journal::FeedPage, agentplane::core::StoreError> {
+        self.0.feed(after, limit).await
+    }
     fn is_shared(&self) -> bool {
         self.0.is_shared()
     }

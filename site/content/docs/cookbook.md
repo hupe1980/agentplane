@@ -155,11 +155,13 @@ A **commission** is an effect. Use it when one agent needs an answer from
 another and the shape is decided *while running* — an editor that reads a brief
 and then decides it needs research. It is journaled like any other effect, the
 answer comes back untrusted, and the sub-run has its own journal and its own
-ceiling. It is never retried, since a retry would commission a second
-specialist, and one interrupted in flight waits on an operator
-(`RequiresOperator`). A sub-run that concludes without an answer fails the
-commission; the failure is recorded, so a replay reads the same verdict, and
-the sub-run's spend is billed to the commissioning run all the same.
+ceiling. It is a start and an await: the sub-run is admitted under a key
+derived from the commissioning run and the dispatch, so a start re-performed
+after a crash attaches to the sub-run it already admitted rather than
+commissioning a second, and the await reads the sub-run's conclusion again. A
+sub-run that concludes without an answer fails the commission; the failure is
+recorded, so a replay reads the same verdict, and the sub-run's spend is
+billed to the commissioning run all the same.
 
 The rule of thumb: **if you can draw the graph before you start, draw it.** A
 plan is checkable in advance and a commission is not; the commission's advantage
@@ -171,7 +173,7 @@ graph.
 
 ### Fan out to several specialists at once
 
-The unit of concurrency is the **plan node**, not the call. Nodes with no edge
+In a plan, the unit of concurrency is the **plan node**. Nodes with no edge
 between them are one ready set and are dispatched together, each with its own
 journal slice — so "ask every relevant specialist, then decide" is one plan:
 
@@ -203,6 +205,23 @@ Two things it deliberately does not do:
   effect with no terminal record — the unknown outcome the effect protocol
   exists to prevent — and makes the answer depend on which machine was less
   loaded. Every branch runs to completion and every outcome is on the record.
+
+### Commission several agents from a skill, at once
+
+When a coded skill decides at run time whom to ask, start the commissions
+before awaiting any of them:
+
+```rust
+let style = cx.start_commission("review.style", draft.clone()).await?;
+let facts = cx.start_commission("review.facts", draft).await?;
+let style = cx.await_commission(&style).await?;   // both sub-runs are working
+let facts = cx.await_commission(&facts).await?;
+```
+
+Each start is an ordinary commission — same gates, depth ceiling, policy and
+grants report — and each sub-run works from the moment it is started. An await
+bills the sub-run's spend to this run and labels its answer as from that
+agent. `cx.commission(..)` is a start followed by its await.
 
 **The trap:** letting untrusted text become the instruction. A model reads its
 order and its data as the same undifferentiated text, so a document saying
@@ -1517,6 +1536,28 @@ From a terminal, `agentplane tasks --store …` lists the worklist (`--role` to
 see it as a reviewer holding that role does, `--show <task>` for one task whole)
 and `agentplane decide <task> approve|reject --reason … --actor …` answers it.
 
+## ❓ Ask a person a question {#ask-a-person-a-question}
+
+When the answer is a choice rather than a permission, ask a question:
+
+```rust
+let currency = cx.question(
+    &TaskSpec::question("refund-currency", Tainted::trusted("Refund in which currency?".into()), "answer")
+        .choices(["EUR", "USD"])
+        .role("support"),
+).await?;   // Some(answer), or None if declined or the window closed
+```
+
+The decision is recorded as *answered*, never *approved*, so the audit does
+not show a permission nobody was asked for. An answer outside the choices is
+refused before anything is recorded (`.free_text()` accepts one), a question
+cannot be approved and an approval task cannot be answered. The question and
+its choices are in the justification, so the answer binds to what the person
+was shown. The answer arrives labelled trusted with provenance
+`task:<kind>`; a question cannot proceed unattended. Answer from a terminal
+with `agentplane decide <task> answer --answer EUR --reason … --actor …`, or
+over the API with `{"answer": "EUR"}` in place of `"approved"`.
+
 ## 🔍 Show a reviewer the consequences, not the instruction {#show-a-reviewer-the-consequences-not-the-instruction}
 
 `requires_approval: true` shows the exact call — which for
@@ -2026,7 +2067,7 @@ loop {
     }
     for call in calls {
         let arguments = Tainted::with_label(call.arguments.clone(), answer.label().clone());
-        match cx.call_tool(tool_for(&call), arguments).await {
+        match cx.call_tool_for(&call, tool_for(&call), arguments).await {
             Ok(output) => transcript.answered(call, &output),
             Err(error) => match cx.relayed(&error) {
                 Some(detail) => transcript.failed(call, detail),
@@ -2044,6 +2085,9 @@ labelled with it — so a field rule that admits only the model's authorship
 refuses arguments a tool's output steered. `/system` keeps its own label
 throughout. `cx.relayed` answers what a failed call may tell the model, labelled
 by whoever wrote it, or `None` for an error the executor must see.
+`call_tool_for` is `call_tool` naming the model's call it answers, so the
+tool's span carries `gen_ai.tool.call.id`; it refuses a call that named
+another tool.
 
 **The trap:** fixing the instruction's label by hand. Re-wrapping it —
 `Tainted::trusted(prompt.peek()["system"].clone())` — asserts trust over
@@ -2052,6 +2096,101 @@ whole prompt taints it, and the next turn is refused for untrusted data in
 `/system`. Build the prompt once and let the transcript carry the rest.
 `examples/coded_tool_loop.rs` runs a three-turn loop, including an
 argument-less mutating tool granted by its one call.
+
+## 💬 Hold a conversation in one run {#hold-a-conversation-in-one-run}
+
+A conversation is one run: each message a person sends is an event the run
+waits for, and the transcript carries everything said so far.
+
+```rust
+cx.deadline("window", &DeadlineSpec::days(1), None).await?;
+let prompt = Tainted::object([
+    ("system", Tainted::trusted(json!("Answer briefly."))),
+    ("input", Tainted::trusted(json!("A support chat."))),
+]);
+let mut transcript = Transcript::new(&prompt);
+loop {
+    let message = cx
+        .await_event(&AwaitSpec::new("chat.message", "window")
+            .correlate(CorrelationKey::new("chat", &chat_id)))
+        .await?;
+    let text = message.map(|v| v["text"].as_str().unwrap_or_default().to_owned());
+    if text.peek() == "/end" {
+        return Ok(Outcome::done(Tainted::trusted(json!("closed"))));
+    }
+    transcript.told(&text);
+    let answer = cx.complete_with(&prompt, |call| call.continuing(&transcript)).await?;
+    transcript.asked(&answer);
+}
+```
+
+The run is in a case — admit it with the chat's correlation key — since a
+deadline belongs to a case. Deliver each message with
+`rt.deliver(&InboundEvent::new(source, id, "chat.message", json!({ "text": … })).correlate(CorrelationKey::new("chat", &chat_id)))`.
+Between messages the run is suspended and holds no
+task; on each delivery replay rebuilds the transcript from the journaled
+completions and the model is asked only the new turn. Read the answers with
+`model::turns`, or live through a `ModelStreamObserver`.
+
+The message joins the transcript with the label it arrived with — a delivered
+event is untrusted — so build the prompt with `Tainted::object`, as above: the
+instruction keeps its own trusted label while the conversation raises the
+rest. A person's turn after a schema answer is refused, since a forced schema
+call leaves no history to follow; ask for structured output on a separate call.
+
+## 🗜️ Keep a long conversation inside the window {#keep-a-long-conversation-inside-the-window}
+
+Ask the provider to compact once input reaches a size:
+
+```rust
+let answer = cx
+    .complete_with(&prompt, |call| {
+        call.continuing(&transcript)
+            .with_compaction(Compaction::at(150_000).instructions("Keep every figure and decision."))
+    })
+    .await?;
+if let Some(compacted) = &answer.peek().compacted {
+    tracing::info!(summary = ?compacted.summary, "the conversation was compacted");
+}
+```
+
+Or on the role, so every call asks:
+
+```yaml
+models:
+  privileged:
+    provider: anthropic
+    model: claude-opus-5-5
+    max_input_tokens: 400000
+    compaction: { trigger_tokens: 150000, instructions: "Keep every figure and decision." }
+```
+
+The provider writes the summary into its own continuation, which the next call
+sends back; the instruction is never compacted. Anthropic and OpenAI Responses
+compact (Responses refuses `instructions`); every other driver refuses rather
+than letting the conversation run into its window. `max_input_tokens` bounds
+everything a call is billed, and a compacting call is billed for the
+compaction pass and the answer together, so leave room above the trigger for
+both; a role's trigger at or above its bound is refused at validation.
+
+## 🧾 Tell an exhausted account from a bad request {#tell-an-exhausted-account-from-a-bad-request}
+
+A failed run names the effect it ended on, read from its journal:
+
+```rust
+let out = rt.start("draft", input).run().await?;
+if let Some(failed) = &out.failed_effect {
+    if failed.refuses_the_account() {
+        // Quota, billing, a bad key or a missing permission: pay, rotate or grant.
+    }
+    tracing::warn!(kind = %failed.kind, code = ?failed.code, permanent = failed.permanent);
+}
+```
+
+`code` is the provider's own name for the refusal (`insufficient_quota`,
+`authentication_error`, `PERMISSION_DENIED`), kept in the clear on the
+`EffectFailed` record, so a replay — and `journal::failed_effect` over a run's
+history — answers the same.
 
 ## 🔌 Call tools on an MCP server you already run {#call-tools-on-an-mcp-server-you-already-run}
 
@@ -2392,6 +2531,68 @@ commits, and the first follower in a process opens one listening connection.
 **The trap:** dropping the poll. A listener that is reconnecting misses what was
 sent meanwhile, and a store that cannot raise a hint answers `None`. The poll is
 what turns either into a delay instead of a stall.
+
+## 📡 Follow every run, from one cursor {#follow-every-run-from-one-cursor}
+
+A host that reacts to what any run does — a task opened, a run sealed —
+reads the store's feed instead of polling each run:
+
+```rust
+let mut follower = store.watch_all().await;
+let mut cursor: Option<FeedCursor> = load_cursor()?;   // wherever you keep it
+loop {
+    let page = store.feed(cursor.as_ref(), 100).await?;
+    for record in &page.records {
+        react(record).await?;                         // record.body.run says whose
+    }
+    if page.next != cursor {
+        cursor = page.next;
+        save_cursor(cursor.as_ref())?;               // after acting: at least once
+    }
+    if page.records.is_empty() {
+        match follower.as_mut() {
+            Some(f) => { let _ = tokio::time::timeout(Duration::from_secs(5), f.changed()).await; }
+            None => tokio::time::sleep(Duration::from_secs(5)).await,
+        }
+    }
+}
+```
+
+Every record of every run in the tenant arrives once, in an order no later
+page contradicts, read as `read` reads it. Keep the cursor beside what you did
+with each record and a restart resumes where it stopped. On redb the order is
+commit order. On `PostgreSQL` a position alone is not, so the feed serves only
+transactions older than every one still running: nothing can later appear
+behind your cursor, and a transaction left open holds the feed until it ends.
+
+## 🔭 Read a running project from another process {#read-a-running-project-from-another-process}
+
+A redb file has one writing process. To let a second process of your own — a
+dashboard, a report — read it while the first works, the writer opens it
+shared and the reader read-only:
+
+```rust
+// The process that runs agents.
+let store = Arc::new(RedbStore::open_shared("project.redb")?);
+let rt = Runtime::builder_on(store).skill(Worker).build();
+
+// Another process, at the same time.
+let view = Arc::new(RedbStore::open_read_only("project.redb")?);
+let history = view.read(run, 1).await?;
+let mut follower = view.watch(run).await;   // polled: the writer is elsewhere
+```
+
+Every read works — histories, listings, the worklist, `model::turns` — and
+sees what the writer had committed when it began. Every write is refused as
+`StoreError::ReadOnly`, and opening writes nothing. A follower is woken by
+polling every 200 ms, since the writer's own wake-ups live in its memory.
+
+**The trade:** a shared writer commits in two phases so a reader can follow
+it, which costs about twice `open`'s commit time — measured 8 ms against 4 ms
+per append on one laptop disk with redb 4.4 (`ConcurrencyMode::SingleWriter`
+against `ExclusiveWriter`, 500 durable single-row commits). A writer opened
+with `open` holds the file alone, and a reader beside it is refused as
+`StoreError::InUse`, as is a second writer beside either.
 
 ## 📤 Emit an event per run, without an outbox table {#emit-an-event-per-run-without-an-outbox-table}
 
@@ -3457,6 +3658,11 @@ let router = Api::new(
 Your `Authenticator` sets `Caller::tenant` — that is the whole wiring. The gate
 resolves the plane from it and hands it to the route, so a handler has no way to
 reach a store it did not resolve.
+
+Tenants partition **one** store. Separate projects — each with its own
+journal file, say, in one desktop host — are separate runtimes on separate
+stores instead, and those share nothing in the process: no runs, waits,
+leases, halts, follower signals or listings cross between them.
 
 Give each tenant a ceiling while you are there — the plane's store already
 implements the accounting:

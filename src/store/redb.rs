@@ -28,7 +28,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    ConcurrencyMode, Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition,
+};
 
 use crate::core::{Digest, EffectKey, Epoch, RunId, Seq, StoreError};
 use crate::journal::{Append, Cancellation, Head, JournalStore, Lease, Record, WaitingRun};
@@ -168,6 +170,14 @@ const SEAL_LOG: TableDefinition<(&str, u64), &str> = TableDefinition::new("seal_
 const RUN_CANCEL: TableDefinition<&str, (&str, &str, &str, u64)> =
     TableDefinition::new("run_cancel");
 
+/// `(tenant, position) -> (run key, seq)`: every record in the order it was
+/// committed, for a reader of the whole store. One writer per file, so
+/// position order is commit order.
+const FEED: TableDefinition<(&str, u64), (&str, u64)> = TableDefinition::new("feed");
+
+/// The next feed position, per tenant.
+const NEXT_FEED: &str = "next_feed";
+
 /// The next log position to hand out. `MAX + 1` over a table that keeps its gaps
 /// would reuse a removed run's slot.
 const COUNTERS: TableDefinition<&str, u64> = TableDefinition::new("counters");
@@ -187,10 +197,39 @@ const NEXT_CONCLUSION: &str = "next_conclusion";
 /// sequence UTF-8 admits, so no valid key can sort above it.
 pub(super) const MAX_STR: &str = "\u{10FFFF}";
 
+/// The database a handle opened: the one writer, or a reader beside it.
+pub(super) enum Db {
+    Writer(Database),
+    Reader(ReadOnlyDatabase),
+}
+
+impl std::fmt::Debug for Db {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Writer(_) => "Db::Writer",
+            Self::Reader(_) => "Db::Reader",
+        })
+    }
+}
+
+impl Db {
+    /// A snapshot of the file as its writer last committed it.
+    pub(super) fn begin_read(&self) -> Result<redb::ReadTransaction, redb::TransactionError> {
+        match self {
+            Self::Writer(db) => db.begin_read(),
+            Self::Reader(db) => db.begin_read(),
+        }
+    }
+}
+
+/// How often a reader in another process looks for a followed run's appends:
+/// the writer's wake-ups live in the writer's memory.
+const READER_POLL: Duration = Duration::from_millis(200);
+
 /// A single-node journal store on redb.
 #[derive(Debug, Clone)]
 pub struct RedbStore {
-    db: Arc<Database>,
+    db: Arc<Db>,
     /// Attached to the store rather than passed per append, because only the
     /// store knows a record's chain hash — it assigns `seq` and `prev_hash`
     /// inside the same transaction that writes. Signing anywhere else would be
@@ -209,8 +248,8 @@ pub struct RedbStore {
     /// What every read lifts a stored record through. The bytes and their
     /// hash are never touched; only the body this build reads is.
     upcaster: Arc<dyn crate::journal::Upcaster>,
-    /// Wake-ups for followers, shared by every handle onto this database: one
-    /// file has one writing process, so these see every append it accepts.
+    /// Wake-ups for followers, shared by every handle onto this database:
+    /// raised by the file's one writer, or on a read-only handle by its poller.
     signals: Arc<crate::journal::AppendSignals>,
 }
 
@@ -223,6 +262,56 @@ impl RedbStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let db = Database::create(path).map_err(open_error)?;
         Self::init(db)
+    }
+
+    /// Open (or create) a database file that other processes may read while
+    /// this one writes, through [`open_read_only`](Self::open_read_only).
+    ///
+    /// The cost is the commit: every append is made durable in two phases so
+    /// a reader can follow it, which measured about twice the time of
+    /// [`open`](Self::open)'s single-phase commit on the same disk. A file
+    /// written this way and one written by `open` are the same format; only
+    /// how the live writer shares it differs. A second writer is still refused
+    /// as [`StoreError::InUse`].
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    pub fn open_shared(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let db = Database::builder()
+            .set_concurrency_mode(ConcurrencyMode::SingleWriter)
+            .create(path)
+            .map_err(open_error)?;
+        Self::init(db)
+    }
+
+    /// Open a database file for reading beside a writer in another process.
+    ///
+    /// Every read the store offers works, and each sees the writer's commits
+    /// durable when it began. Every write is refused as
+    /// [`StoreError::ReadOnly`], and opening writes nothing — no table is
+    /// created and no lease lapsed, both of which are a writer's acts. A run
+    /// is followed by polling, since the writer's wake-ups live in its own
+    /// memory. The writer must have opened with
+    /// [`open_shared`](Self::open_shared); one opened with `open` holds the
+    /// file alone, and this is refused as [`StoreError::InUse`].
+    ///
+    /// # Errors
+    ///
+    /// When the file does not exist or cannot be read, or its writer holds it
+    /// alone.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let db = Database::builder()
+            .set_concurrency_mode(ConcurrencyMode::SingleWriter)
+            .open_read_only(path)
+            .map_err(open_error)?;
+        Ok(Self::with(Db::Reader(db)))
+    }
+
+    /// Whether this handle reads beside another process's writer.
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        matches!(*self.db, Db::Reader(_))
     }
 
     /// An ephemeral database — for tests, for the simulator, and for the CLI's
@@ -257,7 +346,7 @@ impl RedbStore {
     /// Create every table, so a read on a fresh database is not a missing-table
     /// error the read paths would each have to special-case.
     fn init(db: Database) -> Result<Self, StoreError> {
-        let w = begin_write(&db)?;
+        let w = begin_write_on(&db)?;
         {
             w.open_table(JOURNAL).map_err(table_error)?;
             w.open_table(JOURNAL_BY_CASE).map_err(table_error)?;
@@ -271,6 +360,7 @@ impl RedbStore {
             w.open_table(SEAL_LOG).map_err(table_error)?;
             w.open_table(RUN_CANCEL).map_err(table_error)?;
             w.open_table(COUNTERS).map_err(table_error)?;
+            w.open_table(FEED).map_err(table_error)?;
             super::redb_cases::create_tables(&w)?;
             super::redb_events::create_tables(&w)?;
             super::redb_tasks::create_tables(&w)?;
@@ -279,14 +369,18 @@ impl RedbStore {
             lapse_every_lease(&w)?;
         }
         w.commit().map_err(|e| be(&e))?;
-        Ok(Self {
+        Ok(Self::with(Db::Writer(db)))
+    }
+
+    fn with(db: Db) -> Self {
+        Self {
             db: Arc::new(db),
             signer: None,
             origin: "agentplane".to_owned(),
             tenant: crate::core::TenantId::default(),
             upcaster: crate::journal::current_upcaster(),
             signals: Arc::default(),
-        })
+        }
     }
 
     /// A handle addressing one tenant's keyspace.
@@ -393,7 +487,7 @@ impl RedbStore {
     pub(super) async fn with_db<T, F>(&self, f: F) -> Result<T, StoreError>
     where
         T: Send + 'static,
-        F: FnOnce(&Database) -> Result<T, StoreError> + Send + 'static,
+        F: FnOnce(&Db) -> Result<T, StoreError> + Send + 'static,
     {
         let db = Arc::clone(&self.db);
         tokio::task::spawn_blocking(move || f(&db))
@@ -678,7 +772,14 @@ fn digest(bytes: &[u8]) -> Result<Digest, StoreError> {
 /// What this does *not* buy is a test: no suite here kills a process mid-commit,
 /// so a regression would not be caught. It is a belt on a guarantee the tests
 /// cannot reach, not a checked invariant.
-pub(super) fn begin_write(db: &Database) -> Result<redb::WriteTransaction, StoreError> {
+pub(super) fn begin_write(db: &Db) -> Result<redb::WriteTransaction, StoreError> {
+    match db {
+        Db::Writer(db) => begin_write_on(db),
+        Db::Reader(_) => Err(StoreError::ReadOnly),
+    }
+}
+
+fn begin_write_on(db: &Database) -> Result<redb::WriteTransaction, StoreError> {
     let mut w = db.begin_write().map_err(|e| be(&e))?;
     w.set_durability(redb::Durability::Immediate)
         .map_err(|e| be(&e))?;
@@ -762,9 +863,9 @@ pub(super) fn decoded<T>(what: &str, raw: &str, parsed: Option<T>) -> Result<T, 
 
 /// Lapse every lease still running, keeping its holder and epoch.
 ///
-/// A database file has one opener at a time — a second gets
-/// [`StoreError::InUse`] — so a lease alive at open was taken under an open
-/// that has ended, by a process that crashed or was killed. Its holder can
+/// A database file has one writer at a time — a second gets
+/// [`StoreError::InUse`], and a read-only handle lapses nothing — so a lease
+/// alive when a writer opens was taken under a writer that has ended, by a process that crashed or was killed. Its holder can
 /// write nothing more, and waiting out its TTL would only keep a crashed run
 /// from resuming: a CLI that restarts after a kill would find its own run
 /// held for the rest of the lease. Lapsed rather than released: the next
@@ -919,13 +1020,37 @@ fn epoch_after_history(
 }
 
 #[allow(clippy::too_many_lines)]
+/// One file, one writer. That single writer is what makes exactly-once a
+/// table key and fencing race-free here — and it is why a plane that needs two
+/// instances needs `PostgreSQL` instead.
 #[async_trait]
 impl JournalStore for RedbStore {
-    /// One file, one writer. That single writer is what makes exactly-once a
-    /// table key and fencing race-free here — and it is why a plane that needs
-    /// two instances needs `PostgreSQL` instead.
+    /// Raised by this handle's own appends; on a read-only handle, whose
+    /// writer is another process, by polling the run's head every 200 ms.
     async fn watch(&self, run: RunId) -> Option<crate::journal::AppendWatch> {
-        Some(self.signals.subscribe(&self.tenant_name(), run))
+        let tenant = self.tenant_name();
+        let watch = self.signals.subscribe(&tenant, run);
+        // The writer is another process, so nothing here raises its appends:
+        // look for them, until nobody follows this run any more.
+        if self.is_read_only() && self.signals.claim_poll(&tenant, run) {
+            let store = self.clone();
+            tokio::spawn(async move {
+                let mut seen = 0;
+                while store.signals.followed(&tenant, run) {
+                    // Raised only when it moved: a raise wakes the whole
+                    // tenant's feed followers too.
+                    if let Ok(head) = store.head(run).await
+                        && head.seq > seen
+                    {
+                        seen = head.seq;
+                        store.signals.raise(&tenant, run, head.seq);
+                    }
+                    tokio::time::sleep(READER_POLL).await;
+                }
+                store.signals.release_poll(&tenant, run);
+            });
+        }
+        Some(watch)
     }
 
     fn is_shared(&self) -> bool {
@@ -1001,6 +1126,18 @@ impl JournalStore for RedbStore {
 
                 let mut head = head_of(&journal, &key)?;
                 let mut sealed = Vec::with_capacity(batch.len());
+                // Positions taken in the transaction that writes the records
+                // they point at, so the feed cannot hold a position for a
+                // record that never committed, nor miss one that did.
+                let mut feed = w.open_table(FEED).map_err(|e| be(&e))?;
+                let feed_counter = format!("{NEXT_FEED}/{tenant}");
+                let mut position = {
+                    let counters = w.open_table(COUNTERS).map_err(|e| be(&e))?;
+                    counters
+                        .get(feed_counter.as_str())
+                        .map_err(|e| be(&e))?
+                        .map_or(1, |v| v.value())
+                };
                 // A run that suspends and then makes any progress has
                 // stopped waiting, and a listing an operator re-arms from must
                 // not still name it.
@@ -1057,6 +1194,9 @@ impl JournalStore for RedbStore {
                     journal
                         .insert((key.as_str(), seq), row.encode()?.as_slice())
                         .map_err(|e| be(&e))?;
+                    feed.insert((tenant.as_str(), position), (key.as_str(), seq))
+                        .map_err(|e| be(&e))?;
+                    position += 1;
                     // Written in the same transaction as the row it points at,
                     // so the index cannot outlive or precede its record.
                     if let Some(case) = record.body.case {
@@ -1210,6 +1350,11 @@ impl JournalStore for RedbStore {
                         )
                         .map_err(|e| be(&e))?;
                 }
+                drop(feed);
+                w.open_table(COUNTERS)
+                    .map_err(|e| be(&e))?
+                    .insert(feed_counter.as_str(), position)
+                    .map_err(|e| be(&e))?;
                 sealed
             };
             w.commit().map_err(|e| be(&e))?;
@@ -1223,6 +1368,91 @@ impl JournalStore for RedbStore {
 
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
         self.read_page(run, from, usize::MAX).await
+    }
+
+    async fn feed(
+        &self,
+        after: Option<&crate::journal::FeedCursor>,
+        limit: usize,
+    ) -> Result<crate::journal::FeedPage, StoreError> {
+        let from = match after {
+            None => 1,
+            Some(cursor) => cursor
+                .as_str()
+                .parse::<u64>()
+                .map_err(|_| StoreError::Backend(format!("'{cursor}' is not a feed cursor")))?
+                .saturating_add(1),
+        };
+        let tenant = self.tenant_name();
+        let upcaster = Arc::clone(&self.upcaster);
+        let given = after.cloned();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let feed = r.open_table(FEED).map_err(|e| be(&e))?;
+            let journal = r.open_table(JOURNAL).map_err(|e| be(&e))?;
+            let mut records = Vec::new();
+            let mut last = None;
+            for entry in feed
+                .range((tenant.as_str(), from)..=(tenant.as_str(), u64::MAX))
+                .map_err(|e| be(&e))?
+                .take(limit)
+            {
+                let (position, at) = entry.map_err(|e| be(&e))?;
+                let (_, position) = position.value();
+                let (key, seq) = at.value();
+                last = Some(position);
+                // A run removed since keeps its positions as gaps.
+                if let Some(row) = journal.get((key, seq)).map_err(|e| be(&e))? {
+                    records.push(Row::decode(row.value())?.into_record(upcaster.as_ref())?);
+                }
+            }
+            Ok(crate::journal::FeedPage {
+                records,
+                next: last
+                    .map(|p| crate::journal::FeedCursor::new(p.to_string()))
+                    .or(given),
+            })
+        })
+        .await
+    }
+
+    async fn watch_all(&self) -> Option<crate::journal::AppendWatch> {
+        let tenant = self.tenant_name();
+        let watch = self.signals.subscribe_all(&tenant);
+        // As `watch`: a reader's writer is another process, so the feed's
+        // counter is looked at until nobody follows.
+        if self.is_read_only() && self.signals.claim_poll_all(&tenant) {
+            let store = self.clone();
+            tokio::spawn(async move {
+                let counter = format!("{NEXT_FEED}/{tenant}");
+                let read = |store: Self, counter: String| async move {
+                    store
+                        .with_db(move |db| {
+                            let r = db.begin_read().map_err(|e| be(&e))?;
+                            let counters = r.open_table(COUNTERS).map_err(|e| be(&e))?;
+                            Ok(counters
+                                .get(counter.as_str())
+                                .map_err(|e| be(&e))?
+                                .map_or(1, |v| v.value()))
+                        })
+                        .await
+                };
+                // Read once before following, so the first append after the
+                // subscription is a change, and a failed read is no change.
+                let mut seen = read(store.clone(), counter.clone()).await.ok();
+                while store.signals.followed_all(&tenant) {
+                    if let Ok(now) = read(store.clone(), counter.clone()).await {
+                        if seen.is_some_and(|seen| now != seen) {
+                            store.signals.raise_all(&tenant);
+                        }
+                        seen = Some(now);
+                    }
+                    tokio::time::sleep(READER_POLL).await;
+                }
+                store.signals.release_poll_all(&tenant);
+            });
+        }
+        Some(watch)
     }
 
     /// The bounded read, and the one that decodes — `read` is this with no

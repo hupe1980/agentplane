@@ -82,7 +82,9 @@ fn request<'a>(
         schema,
         tools,
         exchanges,
+        told: &[],
         continuation,
+        compaction: None,
         stream: None,
     }
 }

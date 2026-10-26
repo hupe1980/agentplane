@@ -57,6 +57,7 @@ pub fn classify_status(
     match status {
         429 if names_exhausted_quota(body) => ModelError::Refused {
             model: model.clone(),
+            code: body_code(body),
             detail,
         },
         429 | 529 => ModelError::RateLimited {
@@ -70,6 +71,7 @@ pub fn classify_status(
         },
         400..=499 => ModelError::Refused {
             model: model.clone(),
+            code: body_code(body),
             detail,
         },
         // The `Location` is named because it is the whole diagnosis: whoever
@@ -108,7 +110,7 @@ pub fn classify_status(
 ///
 /// An exhausted quota or a billing fault is a refusal, not a throttle: it ends
 /// when somebody pays, so a retry spends the ladder learning nothing.
-pub fn classify_named(model: &ModelId, kind: &str, detail: String) -> ModelError {
+pub fn classify_named(model: &ModelId, error: &serde_json::Value, detail: String) -> ModelError {
     const REFUSED: [&str; 8] = [
         "insufficient_quota",
         "billing",
@@ -119,9 +121,17 @@ pub fn classify_named(model: &ModelId, kind: &str, detail: String) -> ModelError
         "not_found",
         "context_length",
     ];
+    let named = |key: &str| {
+        error
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    };
+    let kind = format!("{} {}", named("type"), named("code"));
     if REFUSED.iter().any(|name| kind.contains(name)) {
         ModelError::Refused {
             model: model.clone(),
+            code: error_code(error),
             detail,
         }
     } else if kind.contains("rate_limit") {
@@ -138,6 +148,41 @@ pub fn classify_named(model: &ModelId, kind: &str, detail: String) -> ModelError
             detail,
         }
     }
+}
+
+/// The provider's own name for an error, from a response body: the `error`
+/// object's code, when the body is JSON and has one.
+#[must_use]
+pub fn body_code(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    error_code(
+        value
+            .get("error")
+            .filter(|e| e.is_object())
+            .unwrap_or(&value),
+    )
+}
+
+/// The provider's own name for an error, from its error object: `type` and
+/// `code` joined by `:` where both are present and differ (`OpenAI`'s
+/// `invalid_request_error:invalid_api_key`), else whichever is present —
+/// Anthropic's `type`, Gemini's `status`.
+///
+/// Held to an identifier by [`bounded_code`](super::bounded_code).
+#[must_use]
+pub fn error_code(error: &serde_json::Value) -> Option<String> {
+    let named = |key: &str| {
+        error
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| !v.is_empty())
+    };
+    let code = match (named("type"), named("code").or_else(|| named("status"))) {
+        (Some(kind), Some(code)) if kind != code => format!("{kind}:{code}"),
+        (Some(one), _) | (None, Some(one)) => one.to_owned(),
+        (None, None) => return None,
+    };
+    super::bounded_code(code)
 }
 
 /// Whether an error body names an exhausted quota (`OpenAI`'s

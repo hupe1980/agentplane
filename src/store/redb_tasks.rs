@@ -6,7 +6,7 @@
 //! separate write has exactly that window.
 
 use async_trait::async_trait;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 
 use crate::case::{ClaimError, TaskStore};
 use crate::core::{CaseId, RunId, StoreError, Task, TaskId, TaskState, Timestamp};
