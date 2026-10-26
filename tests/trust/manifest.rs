@@ -6126,8 +6126,8 @@ async fn an_agent_is_consulted_as_a_granted_tool_and_replay_wakes_nobody() {
         "strict replay called a model — a consultation was performed again"
     );
 
-    // The consultation's journaled answer names the sub-run that did the
-    // work, so a reader of the editor's journal can follow it there.
+    // The consultation's start names the sub-run it admitted, so a reader of
+    // the editor's journal can follow the delegation there.
     let records = store.read(out.run_id, 1).await.expect("records");
     let sub_run = records
         .iter()

@@ -7475,10 +7475,6 @@ struct Commissioned {
     /// delegation boundary.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     data_subjects: BTreeSet<crate::core::SubjectRef>,
-    /// The sub-run that answered, so a reader of this run's journal can
-    /// follow the delegation into the run that did the work.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    run: Option<String>,
     /// Why the sub-run gave no answer, when it concluded without one.
     ///
     /// Recorded as the commission's outcome rather than raised as an effect
@@ -7685,7 +7681,6 @@ impl Effect for AwaitCommission {
             .await
             .map_err(|e| crate::core::EffectError::Rejected(e.to_string()))?;
         let spend = out.spend();
-        let run = Some(out.run_id.to_string());
         let Some(answer) = out.output else {
             return Ok(Commissioned {
                 answer: Value::Null,
@@ -7693,7 +7688,6 @@ impl Effect for AwaitCommission {
                 minor_units: spend.minor_units,
                 sensitivity: internal_floor(),
                 data_subjects: BTreeSet::new(),
-                run,
                 failed: Some(format!(
                     "'{}' concluded {:?} without an answer; its run is {}",
                     self.capability, out.status, out.run_id
@@ -7701,7 +7695,6 @@ impl Effect for AwaitCommission {
             });
         };
         Ok(Commissioned {
-            run,
             sensitivity: answer.label().sensitivity,
             data_subjects: answer.label().data_subjects.clone(),
             answer: answer.into_unlabelled(),
