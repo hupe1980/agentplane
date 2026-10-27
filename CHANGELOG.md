@@ -16,6 +16,15 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.55.0] — 2026-10-27
+
+### Fixed
+
+- **A Bedrock tool result that is not an object.** Converse refuses the
+  whole call unless a JSON tool result is an object, so a tool answering with
+  a list, string, number or boolean failed the run, and so did every failed
+  tool. Such output now goes as text, streamed and buffered.
+
 ## [0.54.0] — 2026-10-26
 
 ### Added

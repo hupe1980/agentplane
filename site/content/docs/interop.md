@@ -1018,8 +1018,9 @@ Details worth stating:
   images/documents, tools/results, signed or redacted reasoning continuation,
   usage, truncation, native JSON Schema and forced-tool fallback are supported.
   Document names are constant and neutral because Bedrock treats them as model
-  input. `ConverseStream` is the default;
-  `.buffered()` opts out. Region, stream mode and schema mode enter the
+  input. A tool result goes as JSON only when it is an object, the one kind
+  Converse accepts there; any other output goes as text. `ConverseStream` is
+  the default; `.buffered()` opts out. Region, stream mode and schema mode enter the
   provider profile. Access, validation and not-found errors are refusals;
   throttling and model-not-ready are retryable. Stream failures follow the three-rung ladder
   above, reaching `Interrupted` because `ConverseStream` reports usage in its

@@ -1592,13 +1592,24 @@ fn tool_result_from_json(value: &Value, model: &ModelId) -> Result<ContentBlock,
     Ok(ContentBlock::ToolResult(
         ToolResultBlock::builder()
             .tool_use_id(id)
-            .content(ToolResultContentBlock::Json(document_from_json(
+            .content(tool_result_content(
                 value.get("output").unwrap_or(&Value::Null),
-            )))
+            ))
             .status(status)
             .build()
             .map_err(|error| Bedrock::refused(model, error.to_string()))?,
     ))
+}
+
+/// Converse takes only an object as a JSON tool result and refuses the whole
+/// request for anything else, so every other output — a list, a number, a
+/// failed tool's message — goes as text, the way the other wires send it.
+fn tool_result_content(output: &Value) -> ToolResultContentBlock {
+    match output {
+        Value::Object(_) => ToolResultContentBlock::Json(document_from_json(output)),
+        Value::String(text) => ToolResultContentBlock::Text(text.clone()),
+        other => ToolResultContentBlock::Text(other.to_string()),
+    }
 }
 
 fn continuation_message_from_json(value: &Value, model: &ModelId) -> Result<Message, ModelError> {
@@ -2352,6 +2363,45 @@ mod tests {
         .expect("a first turn");
         assert_eq!(messages.len(), 1, "two user messages in a row");
         assert_eq!(messages[0].content().len(), 2);
+    }
+
+    /// A failed tool's message is a string, so this covers every failure too.
+    #[test]
+    fn a_tool_result_is_json_only_when_it_is_an_object() {
+        let model = ModelId::new("bedrock", "test");
+        let call = super::super::ToolCall {
+            id: "tool_1".to_owned(),
+            name: "list_files".to_owned(),
+            arguments: json!({}),
+        };
+        let content = |exchange: ToolExchange| {
+            let messages =
+                Bedrock::messages(&model, &json!({"input": "files?"}), &[exchange], &[], None)
+                    .expect("a tool turn");
+            messages
+                .iter()
+                .flat_map(Message::content)
+                .find_map(|block| block.as_tool_result().ok())
+                .expect("a tool result")
+                .content()[0]
+                .clone()
+        };
+        let text = |text: &str| ToolResultContentBlock::Text(text.to_owned());
+
+        assert!(content(ToolExchange::ok(call.clone(), json!({"files": []}))).is_json());
+        for (output, sent) in [
+            (json!(["a.rs", "b.rs"]), r#"["a.rs","b.rs"]"#),
+            (json!("a.rs"), "a.rs"),
+            (json!(3), "3"),
+            (json!(true), "true"),
+            (Value::Null, "null"),
+        ] {
+            assert_eq!(content(ToolExchange::ok(call.clone(), output)), text(sent));
+        }
+        assert_eq!(
+            content(ToolExchange::failed(call, "permission denied")),
+            text("permission denied"),
+        );
     }
 
     #[test]

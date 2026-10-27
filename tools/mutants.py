@@ -797,6 +797,13 @@ pub struct Label {""",
         "    .with_cache_write_1h(one_hour)",
         "    .with_cache_write_1h(0 * one_hour)",
     ),
+    "BedrockSendsAListAsJson": (
+        "src/model/bedrock.rs",
+        "a_tool_result_is_json_only_when_it_is_an_object",
+        "a Bedrock tool that answers with a list or a number fails the whole Converse call",
+        "        other => ToolResultContentBlock::Text(other.to_string()),",
+        "        other => ToolResultContentBlock::Json(document_from_json(other)),",
+    ),
     "AKeyedSpawnReadsAsFresh": (
         "src/runtime/executor.rs",
         "spawning_twice_under_one_key_starts_one_run",
