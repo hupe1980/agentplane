@@ -1058,6 +1058,14 @@ Details worth stating:
   and `text` is the answer alone, so a schema answer still parses. Every other
   wire marks no phase, so the same words are in `text`.
 
+* **A schema answer in more than one Responses message is read message by
+  message.** Final messages that each parse to the same value are one answer;
+  ones that parse to different values are `Unusable`, naming each, rather than
+  the driver choosing one. Messages that do not parse alone are fragments and
+  are parsed joined. An answer that is not JSON says its length and quotes
+  itself where the parse broke, in the failure's detail, which the journal
+  seals.
+
 * **A person speaks after any answer.** `Transcript::told` adds a person's
   message as the user turn after the history — after the tool results, in the
   same turn — and every driver keeps a continuation on a text answer, so the

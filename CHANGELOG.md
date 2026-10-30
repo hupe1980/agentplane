@@ -16,6 +16,20 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.56.1] — unreleased
+
+### Fixed
+
+- **A Responses schema answer sent as two messages failed as "trailing
+  characters".** The OpenAI driver joined every final message before parsing,
+  so two whole answers read as one value and junk. Each message is now parsed
+  alone: copies of one value are that answer, different values are
+  `ModelError::Unusable` naming each message, and fragments are still joined.
+- **An answer that is not JSON could not be diagnosed from the journal.** The
+  failure's detail now carries the answer's length and the text around the
+  point where the parse broke, sealed in `EffectFailed.error` like any
+  provider text.
+
 ## [0.56.0] — 2026-10-30
 
 ### Added

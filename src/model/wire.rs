@@ -290,6 +290,41 @@ pub fn classify_transport(model: &ModelId, e: &reqwest::Error) -> ModelError {
     }
 }
 
+/// The answer's text around byte `at`, quoted: what an unusable answer says
+/// about itself, so the failure can be diagnosed from the journal.
+///
+/// The words are the model's, over the caller's data. They travel only in a
+/// failure's detail, which the journal seals and telemetry reduces to a
+/// digest, exactly as a provider's error text does.
+pub(crate) fn excerpt(text: &str, at: usize) -> String {
+    const SPAN: usize = 48;
+    let floor = |mut i: usize| {
+        i = i.min(text.len());
+        while !text.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    };
+    let start = floor(at.saturating_sub(SPAN));
+    let end = floor(at.saturating_add(SPAN));
+    format!(
+        "{}{:?}{}",
+        if start > 0 { "…" } else { "" },
+        &text[start..end],
+        if end < text.len() { "…" } else { "" }
+    )
+}
+
+/// The byte a JSON error points at, from its one-based line and column.
+fn error_offset(text: &str, error: &serde_json::Error) -> usize {
+    let line_start: usize = text
+        .split_inclusive('\n')
+        .take(error.line().saturating_sub(1))
+        .map(str::len)
+        .sum();
+    line_start + error.column().saturating_sub(1)
+}
+
 /// Parse the answer when a schema was declared.
 ///
 /// Provider constrained generation is the first line of defence. This also
@@ -328,7 +363,12 @@ pub fn structured(
         serde_json::from_str(text).map_err(|e| ModelError::Unusable {
             model: model.clone(),
             usage,
-            detail: format!("a schema was required and the answer is not JSON: {e}"),
+            detail: format!(
+                "a schema was required and the answer is not JSON: {e}; the answer is \
+                 {} bytes, and reads {} there",
+                text.len(),
+                excerpt(text, error_offset(text, &e))
+            ),
         })?;
     super::validate_schema(schema, &value).map_err(|detail| ModelError::Unusable {
         model: model.clone(),
@@ -364,6 +404,38 @@ fn trim(body: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// An answer that is not JSON says where and what: the journal keeps the
+    /// failure's detail and not the answer, so the detail is all a later
+    /// reader has.
+    #[test]
+    fn an_unparsable_answer_quotes_itself_where_it_broke() {
+        let schema = serde_json::json!({ "type": "object" });
+        let answer = format!(r#"{{"note":"{}"}}{{"note":"again"}}"#, "x".repeat(200));
+        let error = super::structured(
+            Some(&schema),
+            &answer,
+            &[],
+            &crate::model::ModelId::new("openai", "gpt-x"),
+            crate::model::Usage::default(),
+        )
+        .expect_err("two objects are not one");
+        let detail = error.to_string();
+        assert!(
+            detail.contains("trailing characters")
+                && detail.contains(&format!("{} bytes", answer.len()))
+                && detail.contains(r#"xx\"}{\"note"#),
+            "the detail does not quote the answer where it broke: {detail}"
+        );
+    }
+
+    #[test]
+    fn an_excerpt_never_splits_a_character() {
+        let text = "ä".repeat(100);
+        for at in 0..=text.len() + 4 {
+            let _ = super::excerpt(&text, at);
+        }
+    }
+
     use super::*;
     use crate::core::Disposition;
 

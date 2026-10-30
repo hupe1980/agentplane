@@ -386,7 +386,15 @@ impl ApiResponse {
     /// into `text` it pollutes the answer, and on a schema-bearing final turn
     /// it breaks the JSON parse of an otherwise valid answer. Absent `phase`
     /// means the final answer. The narration is [`commentary`](Self::commentary).
+    ///
+    /// A schema turn reads [`answers`](Self::answers) instead: more than one
+    /// final message is more than one answer, never one split in two.
     fn text(&self) -> String {
+        self.answers().concat()
+    }
+
+    /// Each final message's text, one entry per message.
+    fn answers(&self) -> Vec<String> {
         self.message_text(|phase| phase != Some("commentary"))
     }
 
@@ -401,19 +409,29 @@ impl ApiResponse {
 
     /// The commentary-phase messages' text, or `None` when there was none.
     fn commentary(&self) -> Option<String> {
-        Some(self.message_text(|phase| phase == Some("commentary"))).filter(|t| !t.is_empty())
+        Some(
+            self.message_text(|phase| phase == Some("commentary"))
+                .concat(),
+        )
+        .filter(|t| !t.is_empty())
     }
 
-    fn message_text(&self, phase: impl Fn(Option<&str>) -> bool) -> String {
+    /// The text of each message in the phases asked for, its parts joined:
+    /// parts are fragments of one message, messages are separate utterances.
+    fn message_text(&self, phase: impl Fn(Option<&str>) -> bool) -> Vec<String> {
         self.output
             .iter()
             .filter(|item| phase(item.get("phase").and_then(Value::as_str)))
             .filter_map(|item| item.get("content").and_then(Value::as_array))
-            .flatten()
-            .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("")
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<String>()
+            })
+            .filter(|text| !text.is_empty())
+            .collect()
     }
 
     /// The arguments a forced function call carried, as the raw JSON string.
@@ -913,6 +931,10 @@ impl OpenAi {
             };
             (raw.to_owned(), structured(schema, raw, &[], model, usage)?)
         } else {
+            let text = match schema {
+                Some(_) if calls.is_empty() => one_answer(parsed.answers(), text, model, usage)?,
+                _ => text,
+            };
             let parsed_schema = structured(schema, &text, &calls, model, usage)?;
             (text, parsed_schema)
         };
@@ -1060,6 +1082,58 @@ impl OpenAi {
         }
         Ok(completion)
     }
+}
+
+/// The one answer a schema turn gave, however many final messages carried it.
+///
+/// Responses can end a turn with more than one final message. Under strict
+/// decoding each is a whole answer, and joined they read as one value followed
+/// by trailing characters. Messages that each parse to the same value are one
+/// answer said twice. Messages that each parse to different values are
+/// refused: taking one would be the driver choosing which of the model's
+/// answers the run acts on. When any message does not parse alone, the messages
+/// are fragments of one answer, and the joined text is what is parsed.
+fn one_answer(
+    answers: Vec<String>,
+    joined: String,
+    model: &ModelId,
+    usage: Usage,
+) -> Result<String, ModelError> {
+    if answers.len() < 2 {
+        return Ok(joined);
+    }
+    let values: Vec<Option<Value>> = answers
+        .iter()
+        .map(|answer| serde_json::from_str(answer).ok())
+        .collect();
+    if values.iter().any(Option::is_none) {
+        return Ok(joined);
+    }
+    if values.windows(2).all(|pair| pair[0] == pair[1]) {
+        return Ok(answers.into_iter().next().unwrap_or_default());
+    }
+    let each = answers
+        .iter()
+        .enumerate()
+        .map(|(at, answer)| {
+            format!(
+                "message {} ({} bytes) begins {}",
+                at + 1,
+                answer.len(),
+                super::wire::excerpt(answer, 0)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(ModelError::Unusable {
+        model: model.clone(),
+        usage,
+        detail: format!(
+            "a schema was required and the answer arrived as {} final messages \
+             that parse to different values: {each}",
+            answers.len()
+        ),
+    })
 }
 
 /// An `error` event inside a 200.
@@ -1658,6 +1732,57 @@ mod continuation_tests {
             Some("Let me check the ledger. "),
             "the narration beside the call was dropped"
         );
+    }
+
+    fn schema_turn(answers: &[&str]) -> Result<Completion, ModelError> {
+        let output: Vec<Value> = answers
+            .iter()
+            .map(|text| {
+                json!({ "type": "message", "role": "assistant", "phase": "final_answer",
+                        "content": [{ "type": "output_text", "text": text }] })
+            })
+            .collect();
+        let parsed: ApiResponse =
+            serde_json::from_value(json!({ "status": "completed", "output": output }))
+                .expect("parse");
+        let schema = json!({ "type": "object", "required": ["balance"],
+                             "properties": { "balance": { "type": "integer" } } });
+        OpenAi::new("test-key")
+            .expect("build the driver")
+            .interpret(&parsed, &ModelId::new("openai", "gpt-x"), Some(&schema))
+    }
+
+    /// Two final messages are two answers, never one: joined, two valid
+    /// objects read as one followed by trailing characters. When they agree,
+    /// the turn answered once.
+    #[test]
+    fn two_final_messages_that_agree_are_one_answer() {
+        let completion = schema_turn(&[r#"{"balance":42}"#, r#"{ "balance": 42 }"#])
+            .expect("two copies of one answer are that answer");
+        assert_eq!(completion.structured, Some(json!({ "balance": 42 })));
+        assert_eq!(completion.text, r#"{"balance":42}"#);
+    }
+
+    /// Final messages that disagree are refused, naming each one: taking
+    /// either would be the driver choosing which answer the run acts on.
+    #[test]
+    fn final_messages_that_disagree_are_refused() {
+        let error = schema_turn(&[r#"{"balance":42}"#, r#"{"balance":7}"#])
+            .expect_err("two different answers are no answer");
+        let ModelError::Unusable { detail, .. } = &error else {
+            panic!("a generated answer is metered: {error:?}");
+        };
+        assert!(
+            detail.contains("2 final messages") && detail.contains(r#"balance\":7"#),
+            "the detail names neither the messages nor what they said: {detail}"
+        );
+    }
+
+    /// One answer split across messages is still parsed whole.
+    #[test]
+    fn fragments_across_messages_are_joined() {
+        let completion = schema_turn(&[r#"{"bal"#, r#"ance":42}"#]).expect("one answer, split");
+        assert_eq!(completion.structured, Some(json!({ "balance": 42 })));
     }
 
     /// A turn with no narration says so with `None`, never an empty string.
