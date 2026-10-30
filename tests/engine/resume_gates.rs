@@ -841,6 +841,7 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                 Append::new(
                     run,
                     RecordKind::EffectFailed {
+                        account: false,
                         error: "connection lost mid-call".into(),
                         disposition: Disposition::InDoubt,
                         spend: agentplane::core::Spend::default(),

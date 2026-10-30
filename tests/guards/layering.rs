@@ -177,6 +177,19 @@ fn every_hash_goes_through_the_canonical_writer() {
                  because `preserve_order` is enabled transitively by cedar."
             );
         }
+        // `RequestBuilder::json` is `serde_json::to_vec` on the wire: one
+        // request, two byte strings, depending on the build. A JSON body goes
+        // through `netguard::json_body`. Matched by its argument, so a
+        // tracing subscriber's `.json()` is not mistaken for a body.
+        for call in [".json(&", ".json(body"] {
+            assert!(
+                !src.contains(call),
+                "{file} sets a request body with `{call}..)`. Send JSON through \
+                 `netguard::json_body`, which writes canonical bytes: \
+                 `RequestBuilder::json` keeps insertion order whenever \
+                 `preserve_order` is enabled anywhere in the build."
+            );
+        }
     }
 
     // Shape 3: a checker that read nothing passes for the wrong reason. This

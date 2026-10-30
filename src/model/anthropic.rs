@@ -15,7 +15,7 @@
 //! | Response | Meaning | Metered |
 //! |---|---|---|
 //! | connect/DNS/TLS failure | never arrived | no |
-//! | `400 invalid_request_error` | refused before generating | no |
+//! | `400 invalid_request_error` | refused before generating — the account's when it names an empty credit balance | no |
 //! | `401`, `403` | refused before generating | no |
 //! | `429`, `529 overloaded` | rate limited before generating | no |
 //! | `5xx` | arrived; whether it generated is unknowable here | see below |
@@ -826,6 +826,7 @@ impl Anthropic {
             && (state.provider != "anthropic" || !state.state.is_array())
         {
             return Err(ModelError::Refused {
+                account: false,
                 model: model.clone(),
                 code: None,
                 detail: "the continuation was not an Anthropic assistant-content array".to_owned(),
@@ -837,6 +838,7 @@ impl Anthropic {
         let thinks = reasoning_effort.is_some() || reasoning_summary;
         if thinks && !exchanges.is_empty() && continuation.is_none() {
             return Err(ModelError::Refused {
+                account: false,
                 model: model.clone(),
                 code: None,
                 detail: "reasoning-enabled tool continuation requires the signed thinking \
@@ -853,6 +855,7 @@ impl Anthropic {
         if let Some(compaction) = compaction {
             if compaction.trigger_tokens < MIN_COMPACTION_TRIGGER {
                 return Err(ModelError::Refused {
+                    account: false,
                     model: model.clone(),
                     code: None,
                     detail: format!(
@@ -882,6 +885,7 @@ impl Anthropic {
                 super::ReasoningEffort::None | super::ReasoningEffort::Minimal
             ) {
                 return Err(ModelError::Refused {
+                    account: false,
                     model: model.clone(),
                     code: None,
                     detail: format!(
@@ -915,6 +919,7 @@ impl Anthropic {
             && let Err(problem) = budget.admit(schema)
         {
             return Err(ModelError::Refused {
+                account: false,
                 model: model.clone(),
                 code: None,
                 detail: format!(
@@ -970,6 +975,7 @@ impl Anthropic {
                             |effort| format!("reasoning effort '{}'", effort.as_str()),
                         );
                         return Err(ModelError::Refused {
+                            account: false,
                             model: model.clone(),
                             code: None,
                             detail: format!(
@@ -984,6 +990,7 @@ impl Anthropic {
                     }
                     if !tools.is_empty() {
                         return Err(ModelError::Refused {
+                            account: false,
                             model: model.clone(),
                             code: None,
                             detail: format!(
@@ -1201,6 +1208,30 @@ fn severed(model: &ModelId, acc: &anthropic_stream::Accumulator, detail: &str) -
     }
 }
 
+/// `error`, marked the account's when it is Anthropic's empty credit balance.
+///
+/// Anthropic answers an exhausted balance with HTTP 400 `invalid_request_error`
+/// — "Your credit balance is too low to access the Anthropic API…" — the code
+/// a malformed request gets. No retry and no rewording changes it, and a
+/// caller deciding whether to stop a batch must not have to read the words,
+/// so the driver reads them once, here. The recorded code stays Anthropic's.
+fn on_the_account(error: ModelError, said: &str) -> ModelError {
+    match error {
+        ModelError::Refused {
+            model,
+            detail,
+            code,
+            account: false,
+        } if said.contains("credit balance is too low") => ModelError::Refused {
+            model,
+            detail,
+            code,
+            account: true,
+        },
+        other => other,
+    }
+}
+
 /// An `error` event delivered inside a 200 response.
 ///
 /// `overloaded_error` is the documented in-stream spelling of a 529, so it maps
@@ -1235,11 +1266,15 @@ fn stream_error(
         | "billing_error"
         | "permission_error"
         | "not_found_error"
-        | "request_too_large" => ModelError::Refused {
-            model: model.clone(),
-            code: super::bounded_code(err.kind.clone()),
-            detail,
-        },
+        | "request_too_large" => on_the_account(
+            ModelError::Refused {
+                account: super::wire::account_code(&err.kind),
+                model: model.clone(),
+                code: super::bounded_code(err.kind.clone()),
+                detail,
+            },
+            &err.message,
+        ),
         _ => ModelError::Unavailable {
             model: model.clone(),
             detail,
@@ -1298,20 +1333,20 @@ impl ModelProvider for Anthropic {
         if compaction.is_some() {
             builder = builder.header("anthropic-beta", COMPACTION_BETA);
         }
-        let response = builder
-            .json(&self.body_with_max(
-                model,
-                prompt,
-                max_output_tokens,
-                reasoning_effort,
-                reasoning_summary,
-                schema,
-                tools,
-                exchanges,
-                told,
-                continuation,
-                compaction,
-            )?)
+        let body = self.body_with_max(
+            model,
+            prompt,
+            max_output_tokens,
+            reasoning_effort,
+            reasoning_summary,
+            schema,
+            tools,
+            exchanges,
+            told,
+            continuation,
+            compaction,
+        )?;
+        let response = crate::netguard::json_body(builder, &body)
             .send()
             .await
             .map_err(|e| classify_transport(model, &e))?;
@@ -1330,7 +1365,10 @@ impl ModelProvider for Anthropic {
             // Shared doctrine, in `super::wire`: which statuses mean the call
             // never generated, which mean it was throttled, and which mean the
             // provider will not say. Two copies of that table would drift.
-            return Err(classify_status(model, status.as_u16(), &headers, &detail));
+            return Err(on_the_account(
+                classify_status(model, status.as_u16(), &headers, &detail),
+                &detail,
+            ));
         }
 
         let mut completion = if self.stream {

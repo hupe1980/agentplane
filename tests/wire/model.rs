@@ -286,6 +286,7 @@ fn a_died_mid_stream_call_is_landed_not_in_doubt() {
 
     // Refused before generating: nothing was metered, nothing happened.
     let refused = ModelError::Refused {
+        account: false,
         model: model(),
         code: None,
         detail: "unknown model".into(),
@@ -338,6 +339,7 @@ async fn a_metered_failure_carries_its_spend_into_the_effect_layer() {
 async fn a_refusal_before_generation_costs_nothing() {
     let provider = FakeProvider::new();
     provider.will_fail(ModelError::Refused {
+        account: false,
         model: model(),
         code: None,
         detail: "bad request".into(),

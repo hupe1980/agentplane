@@ -1179,21 +1179,56 @@ impl<'a> StepCtx<'a> {
         self.dispatch_tool(tool, arguments, None).await
     }
 
-    /// [`call_tool`](Self::call_tool), as the answer to a model's call: the
-    /// `execute_tool` span carries the provider's call id, so a trace joins
-    /// the model's request to the execution that answered it.
+    /// Answer a model's call with the tool behind the offer it named.
+    ///
+    /// `offered` is what the model was given; the call names one of those
+    /// offers, and the offer names its tool
+    /// ([`ToolDeclaration::offering`](crate::model::ToolDeclaration::offering)),
+    /// so an offer renamed for the model is answered by the tool it stands for
+    /// and the skill keeps no table of its own. Then exactly
+    /// [`call_tool`](Self::call_tool), and the `execute_tool` span carries the
+    /// provider's call id, so a trace joins the model's request to the
+    /// execution that answered it.
     ///
     /// # Errors
     ///
-    /// As [`call_tool`](Self::call_tool), and when `call` named another tool.
+    /// As [`call_tool`](Self::call_tool), and before anything is dispatched
+    /// when the call names no offer, two offers share its name, or its offer
+    /// stands for no catalogue tool.
     #[cfg(feature = "manifest")]
     pub async fn call_tool_for(
         &mut self,
         call: &crate::model::ToolCall,
-        tool: crate::tools::ToolId,
+        offered: &[crate::model::ToolDeclaration],
         arguments: Tainted<Value>,
     ) -> Result<Tainted<Value>, StepError> {
-        self.dispatch_tool(tool, arguments, Some(call)).await
+        let refused =
+            |detail: String| StepError::Effect(crate::core::EffectError::Rejected(detail));
+        let mut named = offered.iter().filter(|offer| offer.name == call.name);
+        let offer = match (named.next(), named.next()) {
+            (Some(offer), None) => offer,
+            (None, _) => {
+                return Err(refused(format!(
+                    "the model called '{}', which nothing offered it is named",
+                    call.name
+                )));
+            }
+            (Some(_), Some(_)) => {
+                return Err(refused(format!(
+                    "two offers are named '{}', so the call does not say which it answers",
+                    call.name
+                )));
+            }
+        };
+        let Some(tool) = offer.tool.clone() else {
+            return Err(refused(format!(
+                "the offer '{}' stands for no catalogue tool — declare it with \
+                 `ToolDeclaration::offering`",
+                call.name
+            )));
+        };
+        self.dispatch_tool(tool, arguments, Some((call, offer)))
+            .await
     }
 
     #[cfg(feature = "manifest")]
@@ -1201,7 +1236,7 @@ impl<'a> StepCtx<'a> {
         &mut self,
         tool: crate::tools::ToolId,
         arguments: Tainted<Value>,
-        answering: Option<&crate::model::ToolCall>,
+        answering: Option<(&crate::model::ToolCall, &crate::model::ToolDeclaration)>,
     ) -> Result<Tainted<Value>, StepError> {
         let (catalog, client) = self.tools.clone().ok_or_else(|| {
             StepError::NotWired(
@@ -1216,7 +1251,7 @@ impl<'a> StepCtx<'a> {
             let call =
                 crate::tools::ToolCall::prepare(&catalog, client, tool, value, egress.as_deref());
             match answering {
-                Some(asked) => call.and_then(|call| call.answering(asked)),
+                Some((asked, offered)) => call.and_then(|call| call.answering(asked, offered)),
                 None => call,
             }
             .map_err(|e| StepError::Effect(crate::core::EffectError::Rejected(e.to_string())))
@@ -1955,6 +1990,7 @@ impl<'a> StepCtx<'a> {
             policy,
             &failure.to_string(),
             permanent_failure(effect, failure),
+            (failure.code(), failure.refuses_the_account()),
             effect.mutates(),
         ) {
             return Err(stop);
@@ -3445,6 +3481,8 @@ impl<'a> StepCtx<'a> {
                 disposition,
                 spend,
                 permanent,
+                code,
+                account,
                 unreproducible: None,
             }) => Ok(Replayed::Continue(self.replay_recorded_failure(
                 descriptor,
@@ -3457,6 +3495,7 @@ impl<'a> StepCtx<'a> {
                 disposition,
                 spend,
                 permanent,
+                (code.as_deref(), account),
                 // Recomputed from the code, like the recovery and the policy:
                 // replay assumes the same program, and the record's own
                 // `mutates` lives on the start record the cursor has already
@@ -3512,6 +3551,7 @@ impl<'a> StepCtx<'a> {
         error: &str,
         disposition: crate::core::Disposition,
         permanent: bool,
+        refusal: (Option<&str>, bool),
         mutates: bool,
     ) -> Result<u32, StepError> {
         // Deliberately bills nothing. The recorded failure was billed by the
@@ -3546,6 +3586,7 @@ impl<'a> StepCtx<'a> {
             policy,
             error,
             permanent,
+            refusal,
             mutates,
         ) {
             return Err(stop);
@@ -3590,9 +3631,11 @@ impl<'a> StepCtx<'a> {
         policy: &crate::core::RetryPolicy,
         message: &str,
         permanent: bool,
+        refusal: (Option<&str>, bool),
         mutates: bool,
     ) -> Option<StepError> {
         use crate::core::{Disposition, Recovery};
+        let (code, account) = refusal;
 
         match disposition {
             // A call that changed nothing may be asked again: what landed was
@@ -3605,6 +3648,8 @@ impl<'a> StepCtx<'a> {
             Disposition::Landed if !mutates && !permanent => {}
             Disposition::Landed if !mutates => {
                 return Some(StepError::Effect(crate::core::EffectError::Final {
+                    account: false,
+                    code: None,
                     detail: format!(
                         "effect {key} ran and failed on attempt {attempt}, and the failure is \
                          its answer rather than a fault ({message}); no retry would change it"
@@ -3614,6 +3659,8 @@ impl<'a> StepCtx<'a> {
             }
             Disposition::Landed => {
                 return Some(StepError::Effect(crate::core::EffectError::Final {
+                    account: false,
+                    code: None,
                     detail: format!(
                         "effect {key} took effect and its response could not be used \
                          ({message}); repeating it would perform it a second time"
@@ -3673,6 +3720,8 @@ impl<'a> StepCtx<'a> {
                 // stop at the same attempt.
                 if permanent {
                     return Some(StepError::Effect(crate::core::EffectError::Final {
+                        account,
+                        code: code.map(str::to_owned),
                         detail: format!(
                             "effect {key} was refused on attempt {attempt}, and the refusal is an answer rather than a fault ({message}); no retry would change it"
                         ),
@@ -3688,6 +3737,8 @@ impl<'a> StepCtx<'a> {
         // that act on doubt are exactly the ones that must not be misled.
         (!policy.permits(attempt)).then(|| {
             StepError::Effect(crate::core::EffectError::Final {
+                account,
+                code: code.map(str::to_owned),
                 detail: format!(
                     "effect {key} failed on attempt {attempt} of {}: {message}",
                     policy.max_attempts
@@ -4650,6 +4701,7 @@ impl<'a> StepCtx<'a> {
         disposition: crate::core::Disposition,
         spend: crate::core::Spend,
         permanent: bool,
+        refusal: (Option<&str>, bool),
         mutates: bool,
         outbound_bytes: u64,
     ) -> Result<u32, StepError> {
@@ -4664,6 +4716,7 @@ impl<'a> StepCtx<'a> {
             error,
             disposition,
             permanent,
+            refusal,
             mutates,
         )
     }
@@ -4861,6 +4914,7 @@ impl<'a> StepCtx<'a> {
                             unreproducible: unreproducible(&e).map(str::to_owned),
                             elapsed_ms,
                             code: e.code().map(str::to_owned),
+                            account: e.refuses_the_account(),
                         },
                     )
                     .await

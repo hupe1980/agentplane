@@ -174,7 +174,7 @@ impl VaultTransit {
             .request(method, url)
             .header("X-Vault-Token", self.token.expose());
         if let Some(b) = body {
-            req = req.json(&b);
+            req = crate::netguard::json_body(req, &b);
         }
         let response = req
             .send()

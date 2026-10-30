@@ -825,6 +825,7 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                 Append::new(
                     run,
                     RecordKind::EffectFailed {
+                        account: false,
                         error: "peer said no".into(),
                         disposition: Disposition::DidNotHappen,
                         spend: agentplane::core::Spend::default(),

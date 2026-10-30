@@ -626,12 +626,16 @@ pub enum EffectError {
     ///
     /// `code` is the peer's own name for the refusal where it gave one — a
     /// model provider's error type or code (`insufficient_quota`,
-    /// `authentication_error`) — kept so a caller can tell a refusal of the
-    /// account from a refusal of the request.
+    /// `authentication_error`). `account` says the refusal is of the
+    /// **account**, not of the request — an exhausted credit or quota, a
+    /// missing, invalid or expired credential, a permission the credential
+    /// lacks — decided by the driver that read the wire, which is the one
+    /// place that knows: a peer can give both kinds one code.
     #[error("effect refused: {detail}")]
     Refused {
         detail: String,
         code: Option<String>,
+        account: bool,
     },
 
     /// The peer accepted the request and never answered in time.
@@ -691,10 +695,15 @@ pub enum EffectError {
     /// then refuse to, for a call that provably did nothing; and the failure
     /// that most needs an operator would be indistinguishable from the one that
     /// needs nobody.
+    ///
+    /// A refusal keeps its `code` and `account` here, so a skill that sees the
+    /// final failure can tell a refused account from a refused request.
     #[error("{detail}")]
     Final {
         detail: String,
         disposition: Disposition,
+        code: Option<String>,
+        account: bool,
     },
 
     /// A pinned read answered with other content than was written under its
@@ -710,11 +719,13 @@ pub enum EffectError {
 }
 
 impl EffectError {
-    /// A refusal no retry can change, with no code from the peer.
+    /// A refusal of the request no retry can change, with no code from the
+    /// peer.
     pub fn refused(detail: impl Into<String>) -> Self {
         Self::Refused {
             detail: detail.into(),
             code: None,
+            account: false,
         }
     }
 
@@ -722,8 +733,19 @@ impl EffectError {
     #[must_use]
     pub fn code(&self) -> Option<&str> {
         match self {
-            Self::Refused { code, .. } => code.as_deref(),
+            Self::Refused { code, .. } | Self::Final { code, .. } => code.as_deref(),
             _ => None,
+        }
+    }
+
+    /// Whether the peer refused the **account** rather than the request:
+    /// paying, rotating the credential or granting the permission changes the
+    /// answer; rewording the request does not.
+    #[must_use]
+    pub const fn refuses_the_account(&self) -> bool {
+        match self {
+            Self::Refused { account, .. } | Self::Final { account, .. } => *account,
+            _ => false,
         }
     }
 
@@ -1385,6 +1407,12 @@ pub enum StoreError {
     /// it, or recreate it; retrying will not help.
     #[error("the store cannot be read by this build: {0}")]
     Unreadable(String),
+
+    /// The store was left open by a writer that stopped — killed, crashed, out
+    /// of memory — and a read-only handle cannot repair it. Nothing is lost:
+    /// open it once for writing, then read it. Never recreate it for this.
+    #[error("the store needs the repair a writer's open makes: {0}")]
+    NeedsRepair(String),
 
     #[error("not found: {0}")]
     NotFound(String),

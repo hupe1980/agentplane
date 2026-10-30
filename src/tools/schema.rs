@@ -198,9 +198,12 @@ fn composes(node: &Value) -> bool {
     tables.chain(lists).chain(single).any(composes)
 }
 
-/// List every property that admits `null` in `required`.
+/// List every property that admits `null` in `required`, appended sorted.
+///
+/// Sorted, not in map order, which `serde_json/preserve_order` makes
+/// insertion order: the array is in every model call's effect key.
 fn require_nullable(map: &mut Map<String, Value>) {
-    let nullable: Vec<String> = map
+    let mut nullable: Vec<String> = map
         .get("properties")
         .and_then(Value::as_object)
         .map(|properties| {
@@ -214,6 +217,7 @@ fn require_nullable(map: &mut Map<String, Value>) {
     if nullable.is_empty() {
         return;
     }
+    nullable.sort_unstable();
     let required = map
         .entry("required")
         .or_insert_with(|| Value::Array(Vec::new()));

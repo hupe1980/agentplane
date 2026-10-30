@@ -56,6 +56,7 @@ pub fn classify_status(
     let detail = format!("HTTP {status}: {}", trim(body));
     match status {
         429 if names_exhausted_quota(body) => ModelError::Refused {
+            account: true,
             model: model.clone(),
             code: body_code(body),
             detail,
@@ -69,11 +70,17 @@ pub fn classify_status(
             model: model.clone(),
             detail,
         },
-        400..=499 => ModelError::Refused {
-            model: model.clone(),
-            code: body_code(body),
-            detail,
-        },
+        // 401, 402 and 403 refuse the credential or the account whatever the
+        // body says, which matters for a compatible server that names no code.
+        400..=499 => {
+            let code = body_code(body);
+            ModelError::Refused {
+                account: matches!(status, 401..=403) || code.as_deref().is_some_and(account_code),
+                model: model.clone(),
+                code,
+                detail,
+            }
+        }
         // The `Location` is named because it is the whole diagnosis: whoever
         // reads this has a gateway, a proxy or a DNS entry sending the call
         // somewhere else, and the header says where. Absent when the endpoint
@@ -129,9 +136,11 @@ pub fn classify_named(model: &ModelId, error: &serde_json::Value, detail: String
     };
     let kind = format!("{} {}", named("type"), named("code"));
     if REFUSED.iter().any(|name| kind.contains(name)) {
+        let code = error_code(error);
         ModelError::Refused {
+            account: code.as_deref().is_some_and(account_code),
             model: model.clone(),
-            code: error_code(error),
+            code,
             detail,
         }
     } else if kind.contains("rate_limit") {
@@ -148,6 +157,31 @@ pub fn classify_named(model: &ModelId, error: &serde_json::Value, detail: String
             detail,
         }
     }
+}
+
+/// Whether a provider's error code refuses the **account** rather than the
+/// request: an exhausted quota or credit, billing, a missing, invalid or
+/// expired key, a permission the key lacks — paying, rotating the key or
+/// granting the permission changes the answer; rewording the request does not.
+///
+/// The vocabulary of the wires classified here: `OpenAI`-shaped
+/// `insufficient_quota`, `billing_*`, `invalid_api_key` and a code naming a
+/// credit balance; Anthropic's `authentication_error`, `billing_error` and
+/// `permission_error`; Gemini's `PERMISSION_DENIED` and `UNAUTHENTICATED`.
+/// A wire that gives an account refusal no code of its own decides it in its
+/// driver.
+pub(crate) fn account_code(code: &str) -> bool {
+    const ACCOUNT: [&str; 8] = [
+        "insufficient_quota",
+        "credit",
+        "billing",
+        "invalid_api_key",
+        "authentication",
+        "permission_error",
+        "PERMISSION_DENIED",
+        "UNAUTHENTICATED",
+    ];
+    ACCOUNT.iter().any(|name| code.contains(name))
 }
 
 /// The provider's own name for an error, from a response body: the `error`
@@ -502,5 +536,49 @@ mod schema_validation_tests {
         )
         .expect_err("provider-constrained output still needs defense-in-depth validation");
         assert!(matches!(error, ModelError::Unusable { usage: u, .. } if u == usage));
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use super::*;
+
+    /// Each wire's account refusals read as the account's, and a request's as
+    /// the request's.
+    #[test]
+    fn the_account_is_told_apart_from_the_request() {
+        for code in [
+            "insufficient_quota:credit_balance_exhausted",
+            "invalid_request_error:invalid_api_key",
+            "authentication_error",
+            "billing_error",
+            "permission_error",
+            "PERMISSION_DENIED",
+            "UNAUTHENTICATED",
+        ] {
+            assert!(account_code(code), "{code} read as the request's");
+        }
+        for code in [
+            "invalid_request_error",
+            "invalid_request_error:context_length_exceeded",
+            "not_found_error",
+            "INVALID_ARGUMENT",
+        ] {
+            assert!(!account_code(code), "{code} read as the account's");
+        }
+    }
+
+    /// A 401, 402 or 403 refuses the credential or the account even from a
+    /// compatible server whose body names no code.
+    #[test]
+    fn a_credential_status_is_the_accounts_without_a_code() {
+        let model = ModelId::new("compatible", "m");
+        let headers = reqwest::header::HeaderMap::new();
+        for status in [401, 402, 403] {
+            let refused = classify_status(&model, status, &headers, "denied");
+            assert!(refused.refuses_the_account(), "{status}: {refused}");
+        }
+        let bad = classify_status(&model, 400, &headers, "malformed");
+        assert!(!bad.refuses_the_account(), "{bad}");
     }
 }

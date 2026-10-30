@@ -201,13 +201,14 @@ fn effects() -> Vec<RecordKind> {
             elapsed_ms: Some(1840),
         },
         RecordKind::EffectFailed {
+            account: true,
             error: "the gateway timed out after 30s".into(),
             spend: Spend::tokens(70),
             disposition: Disposition::InDoubt,
             permanent: true,
             unreproducible: Some(format!("blob {}", digest())),
             elapsed_ms: Some(30_000),
-            code: None,
+            code: Some("insufficient_quota".into()),
         },
         RecordKind::EffectReconciled {
             disposition: Disposition::Landed,

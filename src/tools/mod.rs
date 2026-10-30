@@ -1054,21 +1054,26 @@ impl ToolCall {
         })
     }
 
-    /// Mark this execution as the answer to a model's call, so its span
-    /// carries the provider's call id (`gen_ai.tool.call.id`).
+    /// Mark this execution as the answer to a model's call made to `offered`,
+    /// so its span carries the provider's call id (`gen_ai.tool.call.id`).
     ///
     /// Telemetry only: the id is in neither the effect key nor the journal's
     /// descriptor. An id over 256 bytes is not recorded.
     ///
     /// # Errors
     ///
-    /// [`ToolError::Unreachable`] when the call named another tool: a span
-    /// joining this execution to it would say the model asked for what ran.
-    pub fn answering(mut self, call: &crate::model::ToolCall) -> Result<Self, ToolError> {
-        if call.name != self.id.wire_name() {
+    /// [`ToolError::Unreachable`] when the call named another offer, or the
+    /// offer stands for another tool: a span joining this execution to the
+    /// call would say the model asked for what ran.
+    pub fn answering(
+        mut self,
+        call: &crate::model::ToolCall,
+        offered: &crate::model::ToolDeclaration,
+    ) -> Result<Self, ToolError> {
+        if call.name != offered.name || offered.tool.as_ref() != Some(&self.id) {
             return Err(ToolError::Unreachable {
                 detail: format!(
-                    "the model's call '{}' named '{}', not this tool",
+                    "the model's call '{}' named '{}', which is not the offer of this tool",
                     call.id, call.name
                 ),
                 tool: self.id,

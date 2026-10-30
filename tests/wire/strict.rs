@@ -220,6 +220,44 @@ fn an_argument_less_tool_does_not_cost_its_strictness() {
     }
 }
 
+/// **A typed tool's `required` is one order in every build.** The nullable
+/// fields are appended sorted, not in map order, which
+/// `serde_json/preserve_order` makes declaration order. Fields declared out of
+/// alphabetical order tell the two apart; CI runs both feature sets.
+#[test]
+fn a_typed_tools_required_order_does_not_depend_on_the_build() {
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct ReadFile {
+        path: String,
+        start_line: Option<u32>,
+        end_line: Option<u32>,
+    }
+    let schema = agentplane::tools::strict_schema::<ReadFile>();
+    assert_eq!(
+        schema["required"],
+        json!(["path", "end_line", "start_line"]),
+        "{schema}"
+    );
+}
+
+/// The reasons a schema is not strict are recorded with the refusal, so they
+/// come in one order whatever order the schema's map keeps.
+#[test]
+fn the_reasons_a_schema_is_not_strict_come_in_one_order() {
+    let schema = json!({
+        "type": "object",
+        "properties": { "zeta": { "type": "string" }, "alpha": { "type": "string" } },
+        "additionalProperties": false,
+    });
+    let problem = StrictSubset::OpenAi
+        .problem(&schema)
+        .expect("both are optional");
+    let alpha = problem.find("alpha").expect("alpha is named");
+    let zeta = problem.find("zeta").expect("zeta is named");
+    assert!(alpha < zeta, "{problem}");
+}
+
 /// **A schema somebody else wrote is only narrowed.** Making an optional
 /// property nullable sends `null` where the server expected nothing, and
 /// dropping a declared bound lets a model send what the server never

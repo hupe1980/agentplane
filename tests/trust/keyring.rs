@@ -1298,6 +1298,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
                 Append::new(
                     run,
                     RecordKind::EffectFailed {
+                        account: false,
                         error: "payee Ada Lovelace was refused by the bank".into(),
                         spend: agentplane::core::Spend::default(),
                         disposition: agentplane::core::Disposition::DidNotHappen,

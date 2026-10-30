@@ -299,7 +299,9 @@ impl RedbStore {
     /// # Errors
     ///
     /// When the file does not exist or cannot be read, or its writer holds it
-    /// alone.
+    /// alone ([`StoreError::InUse`]). A file whose last writer stopped without
+    /// closing it is [`StoreError::NeedsRepair`]: open it once with a writer,
+    /// which repairs it.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let db = Database::builder()
             .set_concurrency_mode(ConcurrencyMode::SingleWriter)
@@ -809,12 +811,19 @@ pub(super) fn is_sealed(
 }
 
 /// Why a store did not open, in the terms its caller acts on: wait for a
-/// holder, recreate the file, or treat it as an outage.
+/// holder, let a writer repair it, recreate it, or treat it as an outage.
 fn open_error(e: redb::DatabaseError) -> StoreError {
     match e {
         redb::DatabaseError::DatabaseAlreadyOpen => StoreError::InUse(e.to_string()),
+        // A read-only open meets a file its last writer did not close and no
+        // live writer holds. Only that: this crate's writers install no repair
+        // callback, so a writer's open never aborts a repair, it makes one.
+        redb::DatabaseError::RepairAborted => StoreError::NeedsRepair(
+            "its last writer stopped without closing it; open it with a writer \
+             (`RedbStore::open` or `open_shared`), which repairs it, then read it"
+                .to_owned(),
+        ),
         redb::DatabaseError::UpgradeRequired(_)
-        | redb::DatabaseError::RepairAborted
         | redb::DatabaseError::Storage(redb::StorageError::Corrupted(_)) => {
             StoreError::Unreadable(e.to_string())
         }

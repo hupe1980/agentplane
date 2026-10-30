@@ -559,6 +559,7 @@ impl ModelProvider for FakeProvider {
             && let Some(problem) = crate::model::strict_schema_problem(schema)
         {
             return Err(ModelError::Refused {
+                account: false,
                 model: request.model.clone(),
                 code: None,
                 detail: format!(

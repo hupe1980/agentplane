@@ -214,6 +214,7 @@ impl OpenAi {
         egress
             .permits(host.as_deref())
             .map_err(|e| ModelError::Refused {
+                account: false,
                 model: model.clone(),
                 code: None,
                 detail: e.to_string(),
@@ -251,6 +252,7 @@ impl OpenAi {
         // this crate exists to prevent.
         if let Some(problem) = StrictSubset::OpenAi.problem(schema) {
             return Err(ModelError::Refused {
+                account: false,
                 model: model.clone(),
                 code: None,
                 detail: format!(
@@ -666,29 +668,25 @@ impl OpenAi {
         if let Some(state) = continuation
             && (state.provider != "openai" || !state.state.is_array())
         {
-            return Err(ModelError::Refused {
-                model: model.clone(),
-                code: None,
-                detail: "the continuation was not an OpenAI output-item array".to_owned(),
-            });
+            return Err(ModelError::refused(
+                model,
+                "the continuation was not an OpenAI output-item array",
+            ));
         }
         let reasons = reasoning_effort.is_some() || reasoning_summary;
         if reasons && !exchanges.is_empty() && continuation.is_none() {
-            return Err(ModelError::Refused {
-                model: model.clone(),
-                code: None,
-                detail: "reasoning-enabled tool continuation requires the complete opaque \
-                         output items from the prior OpenAI response"
-                    .to_owned(),
-            });
+            return Err(ModelError::refused(
+                model,
+                "reasoning-enabled tool continuation requires the complete opaque output \
+                 items from the prior OpenAI response",
+            ));
         }
         super::refuse_dangling_continuation(continuation, exchanges, told, model)?;
         if compaction.is_some_and(|c| c.instructions.is_some()) {
-            return Err(ModelError::Refused {
-                model: model.clone(),
-                code: None,
-                detail: "OpenAI Responses compaction takes no summary instructions".to_owned(),
-            });
+            return Err(ModelError::refused(
+                model,
+                "OpenAI Responses compaction takes no summary instructions",
+            ));
         }
         let mut body = json!({
             "model": model.model,
@@ -721,13 +719,11 @@ impl OpenAi {
             // level at worst — refused here, as every other driver refuses a
             // level its provider does not name.
             if effort == super::ReasoningEffort::Max {
-                return Err(ModelError::Refused {
-                    model: model.clone(),
-                    code: None,
-                    detail: "OpenAI Responses has no reasoning effort 'max' — it names none, \
-                             minimal, low, medium, high and xhigh"
-                        .to_owned(),
-                });
+                return Err(ModelError::refused(
+                    model,
+                    "OpenAI Responses has no reasoning effort 'max' — it names none, minimal, \
+                     low, medium, high and xhigh",
+                ));
             }
             body["reasoning"] = json!({ "effort": effort.as_str() });
         }
@@ -748,6 +744,7 @@ impl OpenAi {
                 // `tool_choice` still forced the replaced one — a request
                 // this driver itself constructed invalid.
                 return Err(ModelError::Refused {
+                    account: false,
                     model: model.clone(),
                     code: None,
                     detail: format!(
@@ -1150,24 +1147,25 @@ impl ModelProvider for OpenAi {
 
         self.check_egress(model)?;
 
-        let response = self
+        let builder = self
             .http
             .post(format!("{}/v1/responses", self.base))
             .timeout(self.timeout)
-            .bearer_auth(self.key.expose())
-            .json(&self.body_with_max(
-                model,
-                prompt,
-                max_output_tokens,
-                reasoning_effort,
-                reasoning_summary,
-                schema,
-                tools,
-                exchanges,
-                told,
-                continuation,
-                compaction,
-            )?)
+            .bearer_auth(self.key.expose());
+        let body = self.body_with_max(
+            model,
+            prompt,
+            max_output_tokens,
+            reasoning_effort,
+            reasoning_summary,
+            schema,
+            tools,
+            exchanges,
+            told,
+            continuation,
+            compaction,
+        )?;
+        let response = crate::netguard::json_body(builder, &body)
             .send()
             .await
             .map_err(|e| classify_transport(model, &e))?;

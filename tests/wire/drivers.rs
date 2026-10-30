@@ -2678,18 +2678,74 @@ async fn an_in_stream_overload_before_generating_is_rate_limiting() {
     assert_eq!(err.usage().spend().tokens, 0);
 }
 
-/// A billing fault inside a 200 is a refusal: no retry pays the bill.
+/// A billing fault inside a 200 is a refusal of the account: no retry pays
+/// the bill.
 #[tokio::test]
 async fn an_in_stream_billing_error_is_a_refusal() {
     let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"billing_error\",\
-                \"message\":\"Your credit balance is too low\"}}\n\n";
+                \"message\":\"There is an issue with your account's billing.\"}}\n\n";
     let (url, _) = serve_sse(body, false).await;
     let provider = Anthropic::new("k").unwrap().base(url);
     let err = provider
         .complete(ask(&model(), &json!("hi")))
         .await
         .expect_err("billing");
-    assert!(matches!(err, ModelError::Refused { .. }), "{err}");
+    assert!(
+        matches!(err, ModelError::Refused { account: true, .. }),
+        "{err}"
+    );
+}
+
+/// **Anthropic's empty credit balance refuses the account.** It answers HTTP
+/// 400 `invalid_request_error` — the code a malformed request gets — with
+/// "Your credit balance is too low…", so the code alone reads it as the
+/// request's, and a batch kept spending a refusal per case. The driver reads
+/// the message on both paths; the recorded code stays Anthropic's.
+#[tokio::test]
+async fn an_empty_credit_balance_refuses_the_account() {
+    const SAID: &str = "Your credit balance is too low to access the Anthropic API. \
+                        Please go to Plans & Billing to upgrade or purchase credits.";
+    let (c, _) = canned(
+        400,
+        json!({ "type": "error", "error": { "type": "invalid_request_error", "message": SAID } }),
+    );
+    let url = serve(c).await;
+    let buffered = Anthropic::new("k")
+        .unwrap()
+        .base(url)
+        .buffered()
+        .complete(ask(&model(), &json!("hi")))
+        .await
+        .expect_err("refused");
+    let body = format!(
+        "event: error\ndata: {}\n\n",
+        json!({ "type": "error", "error": { "type": "invalid_request_error", "message": SAID } })
+    );
+    let (url, _) = serve_sse(&body, false).await;
+    let streamed = Anthropic::new("k")
+        .unwrap()
+        .base(url)
+        .complete(ask(&model(), &json!("hi")))
+        .await
+        .expect_err("refused");
+    for err in [buffered, streamed] {
+        assert!(err.refuses_the_account(), "{err:?}");
+        assert_eq!(err.code().as_deref(), Some("invalid_request_error"));
+    }
+
+    let (c, _) = canned(
+        400,
+        json!({ "type": "error", "error": { "type": "invalid_request_error", "message": "max_tokens: field required" } }),
+    );
+    let url = serve(c).await;
+    let malformed = Anthropic::new("k")
+        .unwrap()
+        .base(url)
+        .buffered()
+        .complete(ask(&model(), &json!("hi")))
+        .await
+        .expect_err("refused");
+    assert!(!malformed.refuses_the_account(), "{malformed:?}");
 }
 
 /// The same error *after* generating is billed, not a free retry.
@@ -4206,6 +4262,7 @@ async fn gemini_returns_the_models_turn_verbatim_including_its_thought_signature
     let model = ModelId::new("gemini", "gemini-3.5-flash");
     let prompt = json!("look it up");
     let tools = [ToolDeclaration {
+        tool: None,
         cache: None,
         name: "lookup".to_owned(),
         description: "Look something up.".to_owned(),
@@ -5672,6 +5729,7 @@ async fn an_input_type_reaches_the_wire_and_the_revision() {
 async fn a_schema_and_a_tool_calling_turn_coexist_on_every_driver() {
     let sch = schema();
     let tool = || ToolDeclaration {
+        tool: None,
         cache: None,
         name: "lookup".to_owned(),
         description: "Look something up.".to_owned(),
@@ -5739,6 +5797,7 @@ async fn a_schema_and_a_tool_calling_turn_coexist_on_every_driver() {
 async fn a_schema_and_a_tool_calling_turn_coexist_on_the_compatible_wires() {
     let sch = schema();
     let tool = || ToolDeclaration {
+        tool: None,
         cache: None,
         name: "lookup".to_owned(),
         description: "Look something up.".to_owned(),
@@ -5842,6 +5901,7 @@ async fn gemini_two_tool_turns_accumulate_the_transcript_exactly_once() {
     let model = ModelId::new("gemini", "gemini-3.5-flash");
     let prompt = json!("start");
     let tools = [ToolDeclaration {
+        tool: None,
         cache: None,
         name: "lookup".to_owned(),
         description: "Look something up.".to_owned(),
@@ -5925,4 +5985,70 @@ async fn gemini_two_tool_turns_accumulate_the_transcript_exactly_once() {
         contents[1]["parts"][0]["thoughtSignature"], "SIG-lookup",
         "round one's signed turn fell out of the transcript: {sent3}"
     );
+}
+
+/// **A driver sends one request as one byte string, whatever the build.**
+/// Every body is canonical JSON. The schema's keys are written out of order so
+/// an insertion-ordered build would show it; CI runs both feature sets.
+#[tokio::test]
+async fn every_driver_sends_its_request_body_in_canonical_form() {
+    type Raw = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+    async fn keep(State(raw): State<Raw>, body: axum::body::Bytes) -> axum::http::StatusCode {
+        raw.lock().unwrap().push(body.to_vec());
+        axum::http::StatusCode::BAD_REQUEST
+    }
+    let raw: Raw = Arc::default();
+    let app = Router::new()
+        .fallback(post(keep))
+        .with_state(Arc::clone(&raw));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let tools = [ToolDeclaration::new(
+        "read_file",
+        "Read a file.",
+        json!({
+            "type": "object",
+            "properties": { "path": { "type": "string" }, "end": { "type": "integer" } },
+            "required": ["path", "end"],
+            "additionalProperties": false,
+        }),
+    )];
+    let prompt = json!({ "system": "s", "input": "hello" });
+    let drivers: Vec<(ModelId, Box<dyn ModelProvider>)> = vec![
+        (
+            ModelId::new("anthropic", "claude-x"),
+            Box::new(Anthropic::new("k").unwrap().base(url.clone())),
+        ),
+        (
+            ModelId::new("openai", "gpt-x"),
+            Box::new(OpenAi::new("k").unwrap().base(url.clone())),
+        ),
+        (
+            ModelId::new("chat-completions", "m"),
+            Box::new(ChatCompletions::new(url.clone()).unwrap()),
+        ),
+        (
+            ModelId::new("gemini", "g-x"),
+            Box::new(Gemini::new("k").unwrap().base(url.clone())),
+        ),
+    ];
+    for (model, driver) in &drivers {
+        let mut asked = ask(model, &prompt);
+        asked.tools = &tools;
+        let _ = driver.complete(asked).await;
+    }
+    let sent = raw.lock().unwrap().clone();
+    assert_eq!(sent.len(), drivers.len(), "every driver reached the server");
+    for body in sent {
+        let parsed: Value = serde_json::from_slice(&body).expect("a JSON body");
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            String::from_utf8(agentplane::core::canon::value_bytes(&parsed)).unwrap(),
+            "a body that is not canonical depends on the build's features"
+        );
+    }
 }

@@ -143,3 +143,80 @@ async fn a_reader_beside_a_live_writer_sees_its_commits() {
     assert!(child.wait().unwrap().success(), "the writer process failed");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+const DYING: &str = "AGENTPLANE_SHARED_JOURNAL_DYING_WRITER";
+
+/// The writer that dies, run in a child process: opens the file shared,
+/// appends, says so and waits to be killed.
+#[tokio::test]
+#[ignore = "the writer half of a_journal_whose_writer_died_needs_a_writers_repair, run in a child process"]
+async fn the_writer_that_dies() {
+    let Ok(dir) = std::env::var(DYING).map(PathBuf::from) else {
+        return;
+    };
+    let store = Arc::new(RedbStore::open_shared(dir.join("plane.redb")).expect("a shared writer"));
+    let run: RunId = std::fs::read_to_string(dir.join("run"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let lease = store
+        .acquire(run, "writer", Duration::from_secs(60))
+        .await
+        .unwrap();
+    store
+        .append(lease.epoch, vec![Append::new(run, note("one"))])
+        .await
+        .unwrap();
+    std::fs::write(dir.join("ready"), "").unwrap();
+    std::future::pending::<()>().await;
+}
+
+/// **A journal whose writer was killed is not damaged.** A read-only open is
+/// refused with `NeedsRepair` — not `Unreadable`, whose remedy is to recreate
+/// the file and would destroy a journal nothing was wrong with — and a
+/// writer's open repairs it, after which every commit is there.
+#[tokio::test]
+async fn a_journal_whose_writer_died_needs_a_writers_repair() {
+    let dir = std::env::temp_dir().join(format!(
+        "agentplane-dying-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = RunId::generate();
+    std::fs::write(dir.join("run"), run.to_string()).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "shared_journal::the_writer_that_dies",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(DYING, &dir)
+        .spawn()
+        .expect("the writer process");
+    until(&dir.join("ready")).await;
+    child.kill().expect("killed");
+    child.wait().unwrap();
+    let path = dir.join("plane.redb");
+
+    let refused = RedbStore::open_read_only(&path).err();
+    assert!(
+        matches!(refused, Some(StoreError::NeedsRepair(_))),
+        "a journal whose writer died read as {refused:?}"
+    );
+
+    let writer = RedbStore::open_shared(&path).expect("a writer's open repairs it");
+    assert_eq!(
+        writer.read(run, 1).await.unwrap().len(),
+        1,
+        "the repair lost a commit"
+    );
+    drop(writer);
+    let reader = RedbStore::open_read_only(&path).expect("readable once repaired");
+    assert_eq!(reader.read(run, 1).await.unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

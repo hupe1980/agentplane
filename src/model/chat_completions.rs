@@ -465,6 +465,7 @@ impl ChatCompletions {
             && (state.provider != PROVIDER || !state.state.is_array())
         {
             return Err(ModelError::Refused {
+                account: false,
                 model: model.clone(),
                 code: None,
                 detail: "the continuation was not a chat-completions message array".to_owned(),
@@ -488,6 +489,7 @@ impl ChatCompletions {
                 // `tool_choice` still forced the replaced one — a request
                 // this driver itself constructed invalid.
                 return Err(ModelError::Refused {
+                    account: false,
                     model: model.clone(),
                     code: None,
                     detail: format!(
@@ -945,6 +947,7 @@ impl ModelProvider for ChatCompletions {
         // for one would otherwise run into its window unannounced.
         if compaction.is_some() {
             return Err(ModelError::Refused {
+                account: false,
                 model: model.clone(),
                 code: None,
                 detail: "the chat-completions wire has no server-side compaction".to_owned(),
@@ -956,6 +959,7 @@ impl ModelProvider for ChatCompletions {
         // is the shape this crate refuses everywhere.
         if reasoning_effort.is_some() {
             return Err(ModelError::Refused {
+                account: false,
                 model: model.clone(),
                 code: None,
                 detail: "the chat-completions wire has no neutral reasoning-effort \
@@ -976,11 +980,12 @@ impl ModelProvider for ChatCompletions {
             told,
             continuation,
         )?;
-        let mut http = self
-            .http
-            .post(format!("{}/chat/completions", self.base))
-            .timeout(self.timeout)
-            .json(&body);
+        let mut http = crate::netguard::json_body(
+            self.http
+                .post(format!("{}/chat/completions", self.base))
+                .timeout(self.timeout),
+            &body,
+        );
         if let Some(key) = &self.key {
             http = http.bearer_auth(key.expose());
         }

@@ -136,6 +136,21 @@ pub(crate) fn transport_text(error: &reqwest::Error) -> String {
     text
 }
 
+/// `builder` with `body` as its JSON body, in canonical form.
+///
+/// In place of `RequestBuilder::json`, whose key order follows
+/// `serde_json/preserve_order`, so every build sends one request as one byte
+/// string. `tests/guards/layering.rs` refuses `.json(` bodies elsewhere.
+#[cfg(any(feature = "a2a", feature = "providers", feature = "keyring-vault"))]
+pub(crate) fn json_body(
+    builder: reqwest::RequestBuilder,
+    body: &serde_json::Value,
+) -> reqwest::RequestBuilder {
+    builder
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(crate::core::canon::value_bytes(body))
+}
+
 /// The host of a URL, for a log line: the one part of an address that is not a
 /// credential.
 #[cfg(feature = "push")]

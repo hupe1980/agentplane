@@ -800,8 +800,11 @@ fn walk(
                 );
             }
         }
+        // Sorted, not in map order: the first hit's pointer is recorded.
         Value::Object(map) => {
-            for (key, item) in map {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (key, item) in entries {
                 let segment = crate::core::canon::pointer_token(key);
                 let real = format!("{real}/{segment}");
                 let shown = if masks(key) {
@@ -915,5 +918,25 @@ mod tests {
             outcome.redacted,
             Some(serde_json::json!({"a": "Project [x] now", "b": "calm", "falcon": "k"}))
         );
+    }
+
+    /// Hits come sorted by key, whatever order the value was built in.
+    #[test]
+    fn hits_come_in_key_order_whatever_order_the_value_was_built_in() {
+        let content = rules(
+            "rules:
+  - id: falcon
+    match: {contains: [falcon], case: fold}
+    at: {sinks: [tool.call]}
+    then: refuse
+",
+        );
+        let value = serde_json::json!({"zulu": "falcon", "alpha": "falcon"});
+        let outcome = content
+            .rules()
+            .expect("compiled")
+            .at(At::Sink("tool.call"), &value);
+        let pointers: Vec<&str> = outcome.refused.iter().map(|h| h.pointer.as_str()).collect();
+        assert_eq!(pointers, ["/alpha", "/zulu"]);
     }
 }

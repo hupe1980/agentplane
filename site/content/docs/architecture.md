@@ -267,21 +267,38 @@ serialization time.
 
 It does not rely on `serde_json::Map` being a `BTreeMap`. Cargo unifies
 features across the entire dependency graph, so `serde_json/preserve_order` is
-not this crate's to refuse — `cedar-policy` enables it. With it on, an
-insertion-ordered form would give `{"b":1,"a":2}` and `{"a":2,"b":1}`
-**different effect keys**: two runs performing the same call would fail to
-recognise each other's work, and exactly-once would stop holding in the
-direction that issues a second payment. Output is byte-identical whether
-`preserve_order` is on or off — checked by deriving effect keys under both
-builds and diffing.
+not this crate's to refuse — `cedar-policy` enables it, and so does any
+dependency an embedder adds. With it on, an insertion-ordered form would give
+`{"b":1,"a":2}` and `{"a":2,"b":1}` **different effect keys**: two runs
+performing the same call would fail to recognise each other's work, and
+exactly-once would stop holding in the direction that issues a second payment.
 
-Two consequences:
+Sorting at serialization covers objects, not an **array built by iterating a
+map**: an array's order is data, and canonical form keeps it. So every array
+this crate derives from a map — a schema's `required` list, the reasons a
+schema is not strict, content-rule hits — is sorted where it is built. Every
+JSON request body goes out as canonical bytes too, so a tool schema reaches a
+provider, and its prompt cache, in one order from every build.
+
+Three consequences:
 
 * **`tests/guards/layering.rs` does not look for `indexmap` in the lockfile.** That
   question is unanswerable once a legitimate dependency wants the feature. It
   checks what would actually break canonical order: no code outside
-  `canon` may call `serde_json::to_vec`, because with `preserve_order` on such a
-  call takes insertion order into a hash.
+  `canon` may call `serde_json::to_vec`, and no request body is set with
+  `RequestBuilder::json`, which is the same call on the wire.
 * **CI runs the suite under default features *and* `--all-features`.** They are
   not redundant: `--all-features` enables `cedar` and therefore `preserve_order`,
-  so the two builds exercise genuinely different canonicalization paths.
+  so the two builds exercise genuinely different orders. Every derived array
+  above has a test pinning its exact order, so the build whose order differs
+  fails it.
+* **A schema's property order is not a channel to the model.** Both builds send
+  properties sorted. A structured answer whose field order matters — a
+  reasoning field meant to precede the verdict — cannot rely on declaration
+  order; name the fields so that sorted order is the order wanted.
+
+The one wire this crate does not serialize itself is Bedrock's: the AWS SDK
+writes a tool schema from its `Document`, whose objects are hash maps, so the
+key order of a Bedrock request varies from one process to the next. It reaches
+no effect key — the key is taken from the call, not the wire — but it can cost
+a Bedrock prompt-cache hit on the tool prefix.

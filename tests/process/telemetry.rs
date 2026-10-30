@@ -733,6 +733,7 @@ async fn a_failed_attempt_names_the_class_of_fault() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let provider = Arc::new(agentplane::testkit::FakeProvider::new());
     provider.will_fail(agentplane::model::ModelError::Refused {
+        account: false,
         model: agentplane::model::ModelId::new("fake", "m"),
         code: None,
         detail: "no".to_owned(),
@@ -1390,23 +1391,44 @@ spec:
     );
 }
 
-/// Answering a call that named another tool is refused before the effect
-/// exists: the span would say the model asked for what ran.
+/// Answering a call made to another offer, or with an offer that stands for
+/// another tool, is refused before the effect exists: the span would say the
+/// model asked for what ran. A renamed offer of this tool answers its call.
 #[cfg(all(feature = "manifest", feature = "testkit"))]
 #[test]
-fn answering_another_tools_call_is_refused() {
+fn answering_another_offers_call_is_refused() {
+    use agentplane::model::ToolDeclaration;
     use agentplane::tools::{ToolCatalog, ToolId, ToolSafety};
     let id = ToolId::new("ledger", "read");
     let catalog = ToolCatalog::new().allow(id.clone(), ToolSafety::read_only());
     let client: Arc<dyn agentplane::tools::ToolClient> =
         Arc::new(agentplane::tools::ToolBox::new().with::<Balance>());
-    let call = agentplane::tools::ToolCall::prepare(&catalog, client, id, json!({}), None).unwrap();
-    let other = agentplane::model::ToolCall {
+    let call = || {
+        agentplane::tools::ToolCall::prepare(
+            &catalog,
+            Arc::clone(&client),
+            id.clone(),
+            json!({}),
+            None,
+        )
+        .unwrap()
+    };
+    let asked = |name: &str| agentplane::model::ToolCall {
         id: "call_1".into(),
-        name: "ledger__write".into(),
+        name: name.into(),
         arguments: json!({}),
     };
-    assert!(call.answering(&other).is_err());
+    let renamed =
+        ToolDeclaration::offering(id.clone(), "Read a balance.", json!({})).named("read_balance");
+    assert!(call().answering(&asked("read_balance"), &renamed).is_ok());
+    assert!(call().answering(&asked("ledger__write"), &renamed).is_err());
+    let elsewhere = ToolDeclaration::offering(ToolId::new("ledger", "write"), "", json!({}))
+        .named("read_balance");
+    assert!(
+        call()
+            .answering(&asked("read_balance"), &elsewhere)
+            .is_err()
+    );
 }
 
 /// A coded skill answering a model's call says so, and its span carries the
@@ -1426,17 +1448,21 @@ impl Skill for AnswersTheCall {
         cx: &mut StepCtx<'_>,
         _input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
+        // Offered under a name of the skill's own, not the wire name: the
+        // offer is what maps the model's name to the tool.
+        let offered = [agentplane::model::ToolDeclaration::offering(
+            agentplane::tools::ToolId::new("ledger", "read"),
+            "Read a balance.",
+            json!({ "type": "object" }),
+        )
+        .named("read_balance")];
         let asked = agentplane::model::ToolCall {
             id: "call_9c1".into(),
-            name: "ledger__read".into(),
+            name: "read_balance".into(),
             arguments: json!({ "account": "AC-1" }),
         };
         let answer = cx
-            .call_tool_for(
-                &asked,
-                agentplane::tools::ToolId::new("ledger", "read"),
-                Tainted::trusted(asked.arguments.clone()),
-            )
+            .call_tool_for(&asked, &offered, Tainted::trusted(asked.arguments.clone()))
             .await?;
         Ok(Outcome::done(answer))
     }
@@ -1487,4 +1513,117 @@ spec:
         "the tool span carries no `{want}`; recorded: {:?}",
         rec.recorded()
     );
+}
+
+/// A call that names nothing offered, a name two offers share, and an offer
+/// that stands for no catalogue tool are refused before anything runs.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[derive(Debug)]
+struct OffersBadly;
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[async_trait::async_trait]
+impl Skill for OffersBadly {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("offers-badly").provides("ledger.answer")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        use agentplane::model::ToolDeclaration;
+        let read = || {
+            ToolDeclaration::offering(
+                agentplane::tools::ToolId::new("ledger", "read"),
+                "Read a balance.",
+                json!({ "type": "object" }),
+            )
+        };
+        let asked = |name: &str| agentplane::model::ToolCall {
+            id: "call_1".into(),
+            name: name.into(),
+            arguments: json!({ "account": "AC-1" }),
+        };
+        let mut refused = Vec::new();
+        for (call, offered) in [
+            (asked("write_balance"), vec![read().named("read_balance")]),
+            (
+                asked("read_balance"),
+                vec![read().named("read_balance"), read().named("read_balance")],
+            ),
+            (
+                asked("read_balance"),
+                vec![ToolDeclaration::new(
+                    "read_balance",
+                    "",
+                    json!({ "type": "object" }),
+                )],
+            ),
+        ] {
+            let outcome = cx
+                .call_tool_for(&call, &offered, Tainted::trusted(call.arguments.clone()))
+                .await;
+            refused.push(matches!(
+                outcome,
+                Err(agentplane::core::StepError::Effect(
+                    agentplane::core::EffectError::Rejected(_)
+                ))
+            ));
+        }
+        Ok(Outcome::done(Tainted::trusted(json!(refused))))
+    }
+}
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_call_no_single_catalogue_offer_answers_is_refused() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+    use agentplane::tools::ToolBox;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: answerer, version: "1.0.0" }
+spec:
+  capabilities: { provides: [ledger.answer] }
+  budgets: {}
+  tools:
+    - ref: "tool://ledger/read"
+      mutates: false
+"#,
+    )
+    .unwrap();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("test")
+        .toolbox(ToolBox::new().with::<Balance>())
+        .agent(Agent::new(&manifest).skill(OffersBadly))
+        .try_build()
+        .expect("a coherent plane");
+    let out = rt
+        .start("ledger.answer", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
+    assert_eq!(
+        out.output.as_ref().map(Tainted::peek),
+        Some(&json!([true, true, true]))
+    );
+    let started = store
+        .read(out.run_id, 1)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.body.kind,
+                agentplane::journal::RecordKind::EffectStarted { .. }
+            )
+        })
+        .count();
+    assert_eq!(started, 0, "a refused call reached dispatch");
 }

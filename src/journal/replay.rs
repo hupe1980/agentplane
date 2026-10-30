@@ -90,6 +90,10 @@ pub enum EffectReplay {
         /// could not see this bit would expect a retry the live run never
         /// made.
         permanent: bool,
+        /// The peer's code and the account verdict, read back so the final
+        /// failure a replayed skill sees says what the live one said.
+        code: Option<String>,
+        account: bool,
         /// What the live run could not reproduce — see
         /// [`RecordKind::EffectFailed`](crate::journal::RecordKind::EffectFailed).
         unreproducible: Option<String>,
@@ -476,7 +480,8 @@ impl StepCursor {
                 permanent,
                 unreproducible,
                 elapsed_ms: _,
-                code: _,
+                code,
+                account,
             } => {
                 self.settle(
                     key,
@@ -485,6 +490,8 @@ impl StepCursor {
                         disposition: *disposition,
                         spend: *spend,
                         permanent: *permanent,
+                        code: code.clone(),
+                        account: *account,
                         unreproducible: unreproducible.clone(),
                     },
                 );
@@ -526,6 +533,8 @@ impl StepCursor {
             // already: `settle` carries it forward, and stating a figure here
             // would add the attempt's cost to itself.
             (disposition, _) => EffectReplay::Failed {
+                account: false,
+                code: None,
                 error: "resolved by reconciliation".to_owned(),
                 disposition,
                 spend: crate::core::Spend::default(),
@@ -1413,6 +1422,7 @@ mod tests {
                 S0,
                 key(1),
                 RecordKind::EffectFailed {
+                    account: false,
                     error: "boom".into(),
                     disposition: Disposition::DidNotHappen,
                     spend: crate::core::Spend::default(),
@@ -1427,6 +1437,8 @@ mod tests {
         assert_eq!(
             next(&mut cur, S0, key(1)).unwrap(),
             Some(EffectReplay::Failed {
+                account: false,
+                code: None,
                 error: "boom".into(),
                 disposition: Disposition::DidNotHappen,
                 spend: crate::core::Spend::default(),

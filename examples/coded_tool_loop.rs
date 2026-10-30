@@ -19,6 +19,10 @@
 //! 4. **A refusal reaches the model as one word.** `StepCtx::relayed` answers
 //!    what a failed call may tell the model and with which label, or hands the
 //!    error back to the executor when it is not the model's business.
+//! 5. **The offer answers the call.** Each tool is offered with
+//!    `ToolDeclaration::offering` under a name the skill chose, and
+//!    `call_tool_for` runs the tool behind the offer the model named — the
+//!    skill keeps no table of its own from names to tools.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -70,7 +74,9 @@ impl Tool for Format {
 /// Read, format, report — however many turns the model takes.
 #[derive(Debug)]
 struct Tidy {
-    tools: Vec<(ToolId, ToolDeclaration)>,
+    /// What the model is offered. Each offer names the tool it stands for, so
+    /// a call is answered from the offer it named — no second table.
+    offered: Vec<ToolDeclaration>,
 }
 
 #[async_trait]
@@ -94,13 +100,13 @@ impl Skill for Tidy {
                 Tainted::array([input.map(|i| json!({ "role": "user", "content": i }))]),
             ),
         ]);
-        let declared: Vec<ToolDeclaration> = self.tools.iter().map(|(_, d)| d.clone()).collect();
         let mut transcript = Transcript::new(&prompt);
 
         for _turn in 0..4 {
             let answer = cx
                 .complete_with(&prompt, |call| {
-                    call.with_tools(declared.clone()).continuing(&transcript)
+                    call.with_tools(self.offered.clone())
+                        .continuing(&transcript)
                 })
                 .await?;
             let calls = transcript.asked(&answer);
@@ -108,17 +114,11 @@ impl Skill for Tidy {
                 return Ok(Outcome::done(answer.map(|c| json!({ "text": c.text }))));
             }
             for call in calls {
-                let Some((id, _)) = self
-                    .tools
-                    .iter()
-                    .find(|(id, _)| id.wire_name() == call.name)
-                else {
-                    transcript.failed(call, Tainted::trusted("no such tool".to_owned()));
-                    continue;
-                };
                 // The arguments are the model's words, labelled as its answer.
                 let arguments = Tainted::with_label(call.arguments.clone(), answer.label().clone());
-                match cx.call_tool(id.clone(), arguments).await {
+                // A name nothing was offered under is refused before dispatch,
+                // and relayed to the model so it can correct itself.
+                match cx.call_tool_for(&call, &self.offered, arguments).await {
                     Ok(output) => transcript.answered(call, &output),
                     Err(error) => match cx.relayed(&error) {
                         Some(detail) => transcript.failed(call, detail),
@@ -160,26 +160,31 @@ fn declaration() -> Result<Manifest, agentplane::manifest::ManifestError> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store = Arc::new(RedbStore::open_in_memory()?);
     let toolbox = ToolBox::new().with::<ReadFile>().with::<Format>();
-    let tools = [ToolId::new("fs", "read"), ToolId::new("repo", "format")]
-        .into_iter()
-        .map(|id| {
-            let (description, schema, _) = toolbox.declared(&id).expect("registered");
-            let declaration = ToolDeclaration::new(id.wire_name(), description, schema.clone());
-            (id, declaration)
-        })
-        .collect();
+    // Offered under names of the skill's choosing; the offer remembers the
+    // tool behind each.
+    let offered = [
+        (ToolId::new("fs", "read"), "read_file"),
+        (ToolId::new("repo", "format"), "format"),
+    ]
+    .into_iter()
+    .map(|(id, name)| {
+        let (description, schema, _) = toolbox.declared(&id).expect("registered");
+        let (description, schema) = (description.to_owned(), schema.clone());
+        ToolDeclaration::offering(id, description, schema).named(name)
+    })
+    .collect();
 
     let provider = FakeProvider::new();
     provider
-        .will_call_tool("c1", "fs__read", json!({ "path": "src/main.rs" }))
-        .will_call_tool("c2", "repo__format", json!({}))
+        .will_call_tool("c1", "read_file", json!({ "path": "src/main.rs" }))
+        .will_call_tool("c2", "format", json!({}))
         .will_say("Formatted src/main.rs.");
     let driver: Arc<dyn ModelProvider> = provider.clone();
 
     let manifest = declaration()?;
     let rt = Runtime::builder_on(Arc::clone(&store))
         .provider("fake", driver)
-        .agent(Agent::new(&manifest).skill(Tidy { tools }))
+        .agent(Agent::new(&manifest).skill(Tidy { offered }))
         .toolbox(toolbox)
         .build();
 
@@ -210,7 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let turns = provider.asked();
     println!("turns    → {}", turns.len());
     assert_eq!(turns.len(), 3);
-    assert_eq!(turns[2].exchanges[0].call.name, "repo__format");
+    assert_eq!(turns[2].exchanges[0].call.name, "format");
 
     let replayed = rt
         .replay(run.run_id, agentplane::runtime::Mode::Strict)

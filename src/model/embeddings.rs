@@ -280,7 +280,8 @@ impl Embedder for OpenAiEmbedder {
         }
 
         let url = format!("{}/v1/embeddings", self.base.trim_end_matches('/'));
-        let mut request = self.http.post(&url).timeout(self.timeout).json(&body);
+        let mut request =
+            crate::netguard::json_body(self.http.post(&url).timeout(self.timeout), &body);
         if let Some(key) = &self.key {
             request = request.bearer_auth(key.expose());
         }
@@ -770,12 +771,12 @@ impl Embedder for GeminiEmbedder {
         );
         // The header form rather than a `?key=` query parameter: a URL reaches
         // proxy logs and crash reports, and a key in one is a key disclosed.
-        let response = self
+        let request = self
             .http
             .post(&url)
             .timeout(self.timeout)
-            .header("x-goog-api-key", self.key.expose())
-            .json(&body)
+            .header("x-goog-api-key", self.key.expose());
+        let response = crate::netguard::json_body(request, &body)
             .send()
             .await
             .map_err(|e| StoreError::Backend(crate::netguard::transport_text(&e)))?;

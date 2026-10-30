@@ -214,6 +214,8 @@ impl StrictSubset {
         if walk.problems.is_empty() {
             None
         } else {
+            // Sorted, not in map order: this text is recorded with the refusal.
+            walk.problems.sort_unstable();
             Some(walk.problems.join("; "))
         }
     }

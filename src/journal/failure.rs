@@ -23,14 +23,23 @@ pub struct FailedEffect {
     pub permanent: bool,
     /// The peer's own name for a refusal, where it gave one.
     pub code: Option<String>,
+    /// Whether the peer refused the **account** rather than the request, as
+    /// the driver that read the wire decided and the record keeps.
+    pub account: bool,
+    /// What the failure said, as recorded — sealed text when the journal is
+    /// read without the key that opens it.
+    pub detail: String,
 }
 
 impl FailedEffect {
-    /// Whether the peer refused the **account** rather than the request — see
-    /// [`refuses_the_account`].
+    /// Whether the peer refused the **account** rather than the request: an
+    /// exhausted quota or credit, billing, a missing, invalid or expired
+    /// credential, a permission it lacks. Paying, rotating the credential or
+    /// granting the permission changes the answer; rewording the request does
+    /// not, so a batch should stop.
     #[must_use]
-    pub fn refuses_the_account(&self) -> bool {
-        self.code.as_deref().is_some_and(refuses_the_account)
+    pub const fn refuses_the_account(&self) -> bool {
+        self.account
     }
 }
 
@@ -52,9 +61,11 @@ pub fn failed_effect(records: &[Record]) -> Option<FailedEffect> {
         }
         match &body.kind {
             RecordKind::EffectFailed {
+                error,
                 disposition,
                 permanent,
                 code,
+                account,
                 ..
             } => {
                 let Some(key) = body.effect_key else {
@@ -67,6 +78,8 @@ pub fn failed_effect(records: &[Record]) -> Option<FailedEffect> {
                     disposition: *disposition,
                     permanent: *permanent,
                     code: code.clone(),
+                    account: *account,
+                    detail: error.clone(),
                 });
             }
             RecordKind::EffectDone { .. } | RecordKind::EffectReconciled { .. }
@@ -96,40 +109,9 @@ fn started_kind(records: &[Record], key: EffectKey) -> Option<String> {
     })
 }
 
-/// Whether a provider's refusal code refuses the **account** rather than the
-/// request.
-///
-/// An exhausted quota or credit, billing, a missing, invalid or expired key,
-/// or a permission the key lacks: paying, rotating the key or granting the
-/// permission changes the answer; rewording the request does not.
-///
-/// The vocabulary is each shipped wire's: `OpenAI`-shaped `insufficient_quota`,
-/// `billing_*` and `invalid_api_key`; Anthropic's `authentication_error`,
-/// `billing_error` and `permission_error`; Gemini's `PERMISSION_DENIED` and
-/// `UNAUTHENTICATED`; Bedrock's `AccessDeniedException`,
-/// `UnrecognizedClientException` and `ExpiredTokenException`.
-#[must_use]
-pub fn refuses_the_account(code: &str) -> bool {
-    const ACCOUNT: [&str; 12] = [
-        "insufficient_quota",
-        "credit",
-        "billing",
-        "invalid_api_key",
-        "authentication",
-        "permission_error",
-        "PERMISSION_DENIED",
-        "UNAUTHENTICATED",
-        "AccessDenied",
-        "UnrecognizedClient",
-        "ExpiredToken",
-        "InvalidSignature",
-    ];
-    ACCOUNT.iter().any(|name| code.contains(name))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{failed_effect, refuses_the_account};
+    use super::failed_effect;
     use crate::core::{
         Digest, Disposition, EffectDescriptor, EffectKey, Recovery, RunId, Spend, StepId,
     };
@@ -169,8 +151,9 @@ mod tests {
         }
     }
 
-    fn failed(code: &str) -> RecordKind {
+    fn failed(code: &str, account: bool) -> RecordKind {
         RecordKind::EffectFailed {
+            account,
             error: "no".into(),
             spend: Spend::default(),
             disposition: Disposition::DidNotHappen,
@@ -189,7 +172,7 @@ mod tests {
         let s1 = StepId(1);
         let history = records(vec![
             (s0, Some(key(1)), started()),
-            (s0, Some(key(1)), failed("overloaded")),
+            (s0, Some(key(1)), failed("overloaded", false)),
             (s0, Some(key(2)), started()),
             (
                 s0,
@@ -205,43 +188,20 @@ mod tests {
                 },
             ),
             (s1, Some(key(3)), started()),
-            (s1, Some(key(3)), failed("billing_error")),
+            (s1, Some(key(3)), failed("billing_error", true)),
         ]);
         let failed = failed_effect(&history).expect("the standing failure");
         assert_eq!(failed.key, key(3));
         assert_eq!(failed.code.as_deref(), Some("billing_error"));
+        assert!(
+            failed.refuses_the_account(),
+            "the record's verdict was not read"
+        );
+        assert_eq!(failed.detail, "no");
         assert_eq!(failed.kind, "model.complete");
         assert!(
             failed_effect(&history[..4]).is_none(),
             "an answered retry left a failure standing"
         );
-    }
-
-    /// Each wire's account refusals read as the account's, and a request's as
-    /// the request's.
-    #[test]
-    fn the_account_is_told_apart_from_the_request() {
-        for code in [
-            "insufficient_quota:credit_balance_exhausted",
-            "invalid_request_error:invalid_api_key",
-            "authentication_error",
-            "billing_error",
-            "permission_error",
-            "PERMISSION_DENIED",
-            "UNAUTHENTICATED",
-            "AccessDeniedException",
-            "ExpiredTokenException",
-        ] {
-            assert!(refuses_the_account(code), "{code} read as the request's");
-        }
-        for code in [
-            "invalid_request_error",
-            "invalid_request_error:context_length_exceeded",
-            "not_found_error",
-            "INVALID_ARGUMENT",
-            "ValidationException",
-        ] {
-            assert!(!refuses_the_account(code), "{code} read as the account's");
-        }
     }
 }

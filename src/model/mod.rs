@@ -334,6 +334,7 @@ pub(crate) fn refuse_dangling_continuation(
 ) -> Result<(), ModelError> {
     if continuation.is_some() && exchanges.is_empty() && told.is_empty() {
         return Err(ModelError::Refused {
+            account: false,
             model: model.clone(),
             code: None,
             detail: "a continuation without tool exchanges has no request to follow — \
@@ -372,6 +373,7 @@ pub(crate) fn refuse_provider_side_media(
         return Ok(());
     };
     Err(ModelError::Refused {
+        account: false,
         model: model.clone(),
         code: None,
         detail: provider_side_media_refusal(kind),
@@ -424,6 +426,7 @@ pub(crate) fn refuse_in_thread_instructions(
         return Ok(());
     };
     Err(ModelError::Refused {
+        account: false,
         model: model.clone(),
         code: None,
         detail: format!(
@@ -1034,11 +1037,18 @@ pub enum ModelError {
     /// `code` is the provider's own name for the refusal where its body gave
     /// one — `insufficient_quota`, `authentication_error`, `PERMISSION_DENIED`
     /// — bounded to a short identifier, and absent otherwise.
+    ///
+    /// `account` is the driver's verdict that the provider refused the
+    /// **account** — credit, quota, billing, a missing, invalid or expired
+    /// credential, a permission it lacks — rather than this request. Decided
+    /// where the wire is read, from whatever the wire says: Anthropic names an
+    /// empty credit balance with the same code as a malformed request.
     #[error("'{model}' refused the request: {detail}")]
     Refused {
         model: ModelId,
         detail: String,
         code: Option<String>,
+        account: bool,
     },
 
     /// **This plane** refused to connect: the driver's host is not one the
@@ -1149,6 +1159,24 @@ impl ModelError {
             Self::Refused { code, .. } => code.clone(),
             _ => None,
         }
+    }
+
+    /// A refusal of the request, with no code from the provider — a driver
+    /// declining to send something it cannot express.
+    pub fn refused(model: &ModelId, detail: impl Into<String>) -> Self {
+        Self::Refused {
+            model: model.clone(),
+            detail: detail.into(),
+            code: None,
+            account: false,
+        }
+    }
+
+    /// Whether the provider refused the **account** rather than the request.
+    /// See [`Refused`](Self::Refused).
+    #[must_use]
+    pub const fn refuses_the_account(&self) -> bool {
+        matches!(self, Self::Refused { account: true, .. })
     }
 
     /// What this failure says about whether the call reached the provider.
@@ -1537,10 +1565,21 @@ pub struct ToolDeclaration {
     /// Anthropic and Bedrock honour it; drivers whose provider caches without
     /// being asked ignore it, which lets one declaration serve every provider.
     pub cache: Option<CacheTtl>,
+    /// The catalogue tool this offer stands for, when it stands for one.
+    ///
+    /// Not sent and not in the effect key — the provider never sees it. It is
+    /// what lets a skill answer the model's call from the offer the model
+    /// answered ([`StepCtx::call_tool_for`]), so the name a model is shown and
+    /// the tool that runs meet in one place rather than in a second table the
+    /// skill keeps.
+    ///
+    /// [`StepCtx::call_tool_for`]: crate::runtime::StepCtx::call_tool_for
+    pub tool: Option<crate::tools::ToolId>,
 }
 
 impl ToolDeclaration {
-    /// Declare a tool.
+    /// Declare a tool that stands for nothing in a catalogue — one the skill
+    /// answers itself.
     #[must_use]
     pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
         Self {
@@ -1548,7 +1587,37 @@ impl ToolDeclaration {
             description: description.into(),
             parameters,
             cache: None,
+            tool: None,
         }
+    }
+
+    /// Offer a catalogue tool, under its wire name.
+    ///
+    /// The declaration remembers the tool, so a call to it is answered with
+    /// [`StepCtx::call_tool_for`]. Offer it under another name with
+    /// [`named`](Self::named).
+    ///
+    /// [`StepCtx::call_tool_for`]: crate::runtime::StepCtx::call_tool_for
+    #[must_use]
+    pub fn offering(
+        tool: crate::tools::ToolId,
+        description: impl Into<String>,
+        parameters: Value,
+    ) -> Self {
+        Self {
+            name: tool.wire_name(),
+            description: description.into(),
+            parameters,
+            cache: None,
+            tool: Some(tool),
+        }
+    }
+
+    /// The name the model is shown and calls this offer by.
+    #[must_use]
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
     }
 
     /// Mark the end of a cached prefix here. See [`cache`](Self::cache).
@@ -2490,6 +2559,7 @@ impl Effect for ModelCall {
                         EffectError::Refused {
                             detail,
                             code: e.code(),
+                            account: e.refuses_the_account(),
                         }
                     }
                     // A throttle is a wait, and the provider is the only party

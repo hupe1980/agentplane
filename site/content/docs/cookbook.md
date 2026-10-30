@@ -2053,9 +2053,15 @@ reach off the declaration instead of restating it. See
 
 ## 🔁 Drive a tool loop from a skill you wrote {#drive-a-tool-loop-from-a-skill-you-wrote}
 
-Build the prompt once, keep a `Transcript`, and hand it to every turn:
+Build the prompt once, offer each tool by the catalogue entry it stands for,
+keep a `Transcript`, and hand it to every turn:
 
 ```rust
+// Under the wire name, or under a name of your own with `.named(..)`.
+let declared = vec![
+    ToolDeclaration::offering(ToolId::new("fs", "read"), "Read a file.", read_schema)
+        .named("read_file"),
+];
 let mut transcript = Transcript::new(&prompt);
 loop {
     let answer = cx
@@ -2067,7 +2073,7 @@ loop {
     }
     for call in calls {
         let arguments = Tainted::with_label(call.arguments.clone(), answer.label().clone());
-        match cx.call_tool_for(&call, tool_for(&call), arguments).await {
+        match cx.call_tool_for(&call, &declared, arguments).await {
             Ok(output) => transcript.answered(call, &output),
             Err(error) => match cx.relayed(&error) {
                 Some(detail) => transcript.failed(call, detail),
@@ -2085,9 +2091,11 @@ labelled with it — so a field rule that admits only the model's authorship
 refuses arguments a tool's output steered. `/system` keeps its own label
 throughout. `cx.relayed` answers what a failed call may tell the model, labelled
 by whoever wrote it, or `None` for an error the executor must see.
-`call_tool_for` is `call_tool` naming the model's call it answers, so the
-tool's span carries `gen_ai.tool.call.id`; it refuses a call that named
-another tool.
+`call_tool_for` runs the tool behind the offer the call named, exactly as
+`call_tool` would, and the tool's span carries `gen_ai.tool.call.id`. A call
+naming nothing offered, a name two offers share, and an offer declared with
+`ToolDeclaration::new` (no catalogue tool) are refused before anything runs;
+the first reaches the model through `cx.relayed`, so it can correct itself.
 
 **The trap:** fixing the instruction's label by hand. Re-wrapping it —
 `Tainted::trusted(prompt.peek()["system"].clone())` — asserts trust over
@@ -2181,16 +2189,27 @@ A failed run names the effect it ended on, read from its journal:
 let out = rt.start("draft", input).run().await?;
 if let Some(failed) = &out.failed_effect {
     if failed.refuses_the_account() {
-        // Quota, billing, a bad key or a missing permission: pay, rotate or grant.
+        // Credit, quota, billing, a bad or expired key, a missing permission:
+        // pay, sign in again or grant — and stop the batch.
     }
-    tracing::warn!(kind = %failed.kind, code = ?failed.code, permanent = failed.permanent);
+    tracing::warn!(kind = %failed.kind, code = ?failed.code, detail = %failed.detail);
 }
 ```
 
-`code` is the provider's own name for the refusal (`insufficient_quota`,
-`authentication_error`, `PERMISSION_DENIED`), kept in the clear on the
-`EffectFailed` record, so a replay — and `journal::failed_effect` over a run's
-history — answers the same.
+Whether the account was refused is the driver's verdict, recorded in the
+clear on `EffectFailed` ([format](@/docs/format.md)), so a replay — and
+`journal::failed_effect` over a run's history — answers the same. `code` is
+the provider's own name for the refusal; `detail` is the failure's text as
+recorded. A skill handling the failure itself reads the same verdict from
+`EffectError::refuses_the_account()` and `EffectError::code()`, live and on
+replay.
+
+On Bedrock, `AccessDeniedException`, `UnrecognizedClientException`,
+`InvalidSignatureException`, `ExpiredTokenException` and a credential its
+configuration cannot produce (an expired `aws login`, a broken profile) refuse
+the account. A credential failure a retry can fix — an STS outage, an
+unreachable metadata service — is retried; so is an expired SSO session, which
+the AWS SDK reports the same way.
 
 ## 🔌 Call tools on an MCP server you already run {#call-tools-on-an-mcp-server-you-already-run}
 
@@ -2593,6 +2612,12 @@ per append on one laptop disk with redb 4.4 (`ConcurrencyMode::SingleWriter`
 against `ExclusiveWriter`, 500 durable single-row commits). A writer opened
 with `open` holds the file alone, and a reader beside it is refused as
 `StoreError::InUse`, as is a second writer beside either.
+
+**A writer that was killed** — a crash, `SIGKILL`, out of memory — leaves the
+file for the next writer to repair, and a reader cannot repair it: the reader
+is refused as `StoreError::NeedsRepair` until a writer has opened the file
+once. Nothing is lost. Never recreate the file for this; `StoreError::Unreadable`
+is the error for a file that is damaged or another build's.
 
 ## 📤 Emit an event per run, without an outbox table {#emit-an-event-per-run-without-an-outbox-table}
 

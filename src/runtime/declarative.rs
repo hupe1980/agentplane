@@ -443,7 +443,7 @@ impl Declarative {
                             value,
                             egress.as_deref(),
                         )
-                        .and_then(|call| call.answering(&asked))
+                        .and_then(|call| call.answering(&asked, declaration))
                         .map_err(|e| {
                             crate::core::StepError::Effect(crate::core::EffectError::Rejected(
                                 e.to_string(),
@@ -1882,9 +1882,14 @@ fn bounded_parse_schema(declared: &Value) -> Option<Value> {
 }
 
 /// Close an object schema and require every property it names, recursively.
+///
+/// `required` is sorted, not in map order: the schema is in the extraction
+/// call's effect key.
 fn close(node: &mut Value) {
     if let Some(list) = node.get_mut("properties").and_then(Value::as_object_mut) {
-        let names: Vec<Value> = list.keys().map(|k| json!(k)).collect();
+        let mut sorted: Vec<&String> = list.keys().collect();
+        sorted.sort_unstable();
+        let names: Vec<Value> = sorted.into_iter().map(|k| json!(k)).collect();
         for nested in list.values_mut() {
             close(nested);
         }
@@ -2163,7 +2168,7 @@ fn offered_tools<'g>(
             let arguments = declared_arguments(catalog, id, grant)
                 .cloned()
                 .unwrap_or_else(|| json!({ "type": "object" }));
-            crate::model::ToolDeclaration::new(id.wire_name(), description, arguments)
+            crate::model::ToolDeclaration::offering(id.clone(), description, arguments)
         })
         .collect();
     (offered, declared)
@@ -2195,10 +2200,36 @@ mod tests {
     /// A plan format outside the strict-decoding subset makes `planned`
     /// unusable against the provider most people have: the driver refuses the
     /// schema before it is sent, so the crate's `CaMeL` implementation runs
-    /// only against fakes. It did, until this test.
+    /// only against fakes.
     #[test]
     fn the_plan_format_survives_constrained_decoding() {
         assert_eq!(crate::model::strict_schema_problem(&plan_schema(4)), None);
+    }
+
+    /// `required` is sorted, whatever order the planner wrote the properties
+    /// in.
+    #[test]
+    fn a_parse_schemas_required_order_does_not_depend_on_the_build() {
+        let declared = json!({
+            "type": "object",
+            "properties": {
+                "zeta": { "type": "string" },
+                "alpha": {
+                    "type": "object",
+                    "properties": { "y": { "type": "string" }, "b": { "type": "string" } },
+                },
+            },
+        });
+        let bounded = bounded_parse_schema(&declared).expect("an object schema is bounded");
+        assert_eq!(
+            bounded["required"],
+            json!(["alpha", "have_enough_information", "zeta"]),
+            "{bounded}"
+        );
+        assert_eq!(
+            bounded["properties"]["alpha"]["required"],
+            json!(["b", "y"])
+        );
     }
 
     /// The planner writes the parse schema, so it is not a reviewed artefact —

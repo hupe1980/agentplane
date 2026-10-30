@@ -412,6 +412,8 @@ pub struct Label {""",
         "an effect that definitely landed is retried anyway",
         """            Disposition::Landed => {
                 return Some(StepError::Effect(crate::core::EffectError::Final {
+                    account: false,
+                    code: None,
                     detail: format!(
                         "effect {key} took effect and its response could not be used \\
                          ({message}); repeating it would perform it a second time"
@@ -889,8 +891,8 @@ pub struct Label {""",
         "src/model/wire.rs",
         "an_openai_error_event_says_what_the_provider_said",
         "a quota refusal inside a 200 is classed as an outage and retried, though no wait ends it",
-        '        "insufficient_quota",',
-        '        "insufficient_quota_never",',
+        '    const REFUSED: [&str; 8] = [\n        "insufficient_quota",',
+        '    const REFUSED: [&str; 8] = [\n        "insufficient_quota_never",',
     ),
     "ANestedErrorEventIsAnonymous": (
         "src/model/openai_stream.rs",
@@ -5282,6 +5284,7 @@ pub struct Label {""",
         """        408 | 425 => ModelError::Refused {
             model: model.clone(),
             code: None,
+            account: false,
             detail,
         },""",
     ),
@@ -6366,6 +6369,7 @@ pub struct Label {""",
         """        return Err(ModelError::Refused {
             model: model.clone(),
             code: None,
+            account: false,
             detail,
         });
     }""",
@@ -7388,6 +7392,8 @@ pub struct Label {""",
         "reported as one that may have happened, and everything that acts on "
         "doubt acts on a fabrication",
         "            StepError::Effect(crate::core::EffectError::Final {\n"
+        "                account,\n"
+        "                code: code.map(str::to_owned),\n"
         "                detail: format!(\n"
         "                    \"effect {key} failed on attempt {attempt} of {}: {message}\",\n"
         "                    policy.max_attempts\n"
@@ -7395,8 +7401,8 @@ pub struct Label {""",
         "                disposition,\n"
         "            })",
         "            StepError::Effect(crate::core::EffectError::Other(format!(\n"
-        "                \"effect {key} failed on attempt {attempt} of {}: {message}\",\n"
-        "                policy.max_attempts\n"
+        "                \"effect {key} failed on attempt {attempt} of {} ({:?}, {account}): {message}\",\n"
+        "                policy.max_attempts, code\n"
         "            )))",
     ),
     "AReversalCannotAffordItself": (
@@ -15549,14 +15555,14 @@ pub struct WrappedKey {""",
         "src/runtime/declarative.rs",
         "a_tool_span_carries_the_models_call_id",
         "the declarative loop executes the model's call without saying which call it answers",
-        """                        .and_then(|call| call.answering(&asked))""",
+        """                        .and_then(|call| call.answering(&asked, declaration))""",
         """                        .and_then(Ok)""",
     ),
     "AnAnswerClaimsAnotherTool": (
         "src/tools/mod.rs",
-        "answering_another_tools_call_is_refused",
+        "answering_another_offers_call_is_refused",
         "a span says the model asked for the tool that ran when it asked for another",
-        """        if call.name != self.id.wire_name() {""",
+        """        if call.name != offered.name || offered.tool.as_ref() != Some(&self.id) {""",
         """        if false {""",
     ),
     "TheProviderCodeIsDropped": (
@@ -15588,7 +15594,7 @@ pub struct WrappedKey {""",
         """            RecordKind::Swept { .. }""",
     ),
     "TheAccountReadsAsTheRequest": (
-        "src/journal/failure.rs",
+        "src/model/wire.rs",
         "the_account_is_told_apart_from_the_request",
         "an exhausted account or a rejected key reads as an ordinary refusal of the request",
         """    ACCOUNT.iter().any(|name| code.contains(name))""",
@@ -15745,7 +15751,7 @@ pub struct WrappedKey {""",
         "src/runtime/ctx.rs",
         "a_coded_skills_tool_span_carries_the_call_it_answers",
         "a coded skill answering a model's call executes the tool without saying which call it answers",
-        """                Some(asked) => call.and_then(|call| call.answering(asked)),""",
+        """                Some((asked, offered)) => call.and_then(|call| call.answering(asked, offered)),""",
         """                Some(_) => call,""",
     ),
     "AnUnofferedAnswerIsRecorded": (
@@ -15898,6 +15904,122 @@ pub struct WrappedKey {""",
         """        || !user(&messages[prompt_len])""",
         """        || true""",
     ),
+    "NullableRequiredInMapOrder": (
+        "src/tools/schema.rs",
+        "a_typed_tools_required_order_does_not_depend_on_the_build",
+        "a typed tool's nullable fields join `required` in the map's order, so a build with `preserve_order` derives other model-call keys and a recorded journal diverges",
+        """    nullable.sort_unstable();""",
+        """    let _ = &mut nullable;""",
+    ),
+    "ExtractionRequiredInMapOrder": (
+        "src/runtime/declarative.rs",
+        "a_parse_schemas_required_order_does_not_depend_on_the_build",
+        "a parse schema's `required` follows the planner's insertion order under `preserve_order`, so the extraction call's key depends on the build",
+        """        sorted.sort_unstable();""",
+        """        let _ = &mut sorted;""",
+    ),
+    "ContentHitsInMapOrder": (
+        "src/content/mod.rs",
+        "hits_come_in_key_order_whatever_order_the_value_was_built_in",
+        "content hits follow the value's map order, so the pointer recorded on an effect depends on the build",
+        """            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));""",
+        """            let _ = &mut entries;""",
+    ),
+    "StrictProblemsInMapOrder": (
+        "src/model/strict.rs",
+        "the_reasons_a_schema_is_not_strict_come_in_one_order",
+        "the reasons a schema is not strict are recorded in the map's order, which depends on the build",
+        """            walk.problems.sort_unstable();""",
+        """            let _ = &mut walk.problems;""",
+    ),
+    "ADriverSendsSerdeJsonBody": (
+        "src/netguard/mod.rs",
+        "every_driver_sends_its_request_body_in_canonical_form",
+        "request bodies go out through `serde_json`, in insertion order under `preserve_order`, so two builds send one request as two byte strings",
+        """        .body(crate::core::canon::value_bytes(body))""",
+        """        .json(body)""",
+    ),
+    "AnthropicEmptyBalanceIsTheRequests": (
+        "src/model/anthropic.rs",
+        "an_empty_credit_balance_refuses_the_account",
+        "Anthropic's empty credit balance reads as a malformed request, so a batch spends one refusal per case instead of stopping",
+        """        } if said.contains("credit balance is too low") => ModelError::Refused {""",
+        """        } if false && said.contains("credit balance is too low") => ModelError::Refused {""",
+    ),
+    "BedrockCredentialCodeIsTheRequests": (
+        "src/model/bedrock.rs",
+        "a_refused_credential_refuses_the_account",
+        "an expired or unrecognised AWS credential is retried as an outage and never read as the account's",
+        """    let account = code.is_some_and(|code| ACCOUNT_CODES.contains(&code));""",
+        """    let account = code.is_some_and(|_| false);""",
+    ),
+    "AnUnresolvableCredentialIsAnOutage": (
+        "src/model/bedrock.rs",
+        "a_credential_that_cannot_be_resolved_refuses_the_account",
+        "an expired `aws login` or a broken profile is retried as an outage instead of refusing the account before anything is sent",
+        """    if unresolvable_identity(error) {""",
+        """    if unresolvable_identity(error) && false {""",
+    ),
+    "BedrockDetailIsTheSdkDump": (
+        "src/model/bedrock.rs",
+        "a_refused_credential_refuses_the_account",
+        "a Bedrock refusal's detail is the SDK's dump of the raw response, headers and body, repeated in every message a person reads",
+        """        return service(err, service_detail(err));""",
+        """        return service(err, DisplayErrorContext(error).to_string());""",
+    ),
+    "ACredentialStatusIsTheRequests": (
+        "src/model/wire.rs",
+        "a_credential_status_is_the_accounts_without_a_code",
+        "a compatible server's 401, 402 or 403 with no code reads as the request's, so a revoked key never stops a batch",
+        """                account: matches!(status, 401..=403) || code.as_deref().is_some_and(account_code),""",
+        """                account: code.as_deref().is_some_and(account_code),""",
+    ),
+    "TheAccountVerdictIsNotRecorded": (
+        "src/runtime/ctx.rs",
+        "an_empty_balance_is_the_accounts_on_the_record_and_on_replay",
+        "the driver's account verdict never reaches the record, so the outcome and a replay call the empty balance the request's",
+        """                            account: e.refuses_the_account(),""",
+        """                            account: false,""",
+    ),
+    "AFinalRefusalForgetsTheAccount": (
+        "src/runtime/ctx.rs",
+        "an_empty_balance_is_the_accounts_on_the_record_and_on_replay",
+        "a skill handling the final failure sees no account verdict, so it cannot stop on an empty balance",
+        """                if permanent {
+                    return Some(StepError::Effect(crate::core::EffectError::Final {
+                        account,""",
+        """                if permanent {
+                    return Some(StepError::Effect(crate::core::EffectError::Final {
+                        account: false && account,""",
+    ),
+    "AFailedEffectDropsItsWords": (
+        "src/journal/failure.rs",
+        "a_failure_its_step_got_past_is_not_the_runs",
+        "the failure's recorded text is dropped, so a caller parses the run status to say why it failed",
+        """                    detail: error.clone(),""",
+        """                    detail: String::new(),""",
+    ),
+    "ARepairableJournalReadsAsDamage": (
+        "src/store/redb.rs",
+        "a_journal_whose_writer_died_needs_a_writers_repair",
+        "a journal whose writer was killed reads as damage, whose remedy — recreate the file — destroys a journal the next writer would repair",
+        """        redb::DatabaseError::RepairAborted => StoreError::NeedsRepair(""",
+        """        redb::DatabaseError::RepairAborted => StoreError::Unreadable(""",
+    ),
+    "ACallResolvesByWireName": (
+        "src/tools/mod.rs",
+        "a_coded_skills_tool_span_carries_the_call_it_answers",
+        "a call made to an offer the embedder named is refused because it is not the tool's wire name, so a renamed tool cannot be answered",
+        """        if call.name != offered.name || offered.tool.as_ref() != Some(&self.id) {""",
+        """        if call.name != self.id.wire_name() {""",
+    ),
+    "TwoOffersOfOneNameAnswerACall": (
+        "src/runtime/ctx.rs",
+        "a_call_no_single_catalogue_offer_answers_is_refused",
+        "two offers share a name and the first one answers, so which tool ran is an accident of order",
+        """        let offer = match (named.next(), named.next()) {""",
+        """        let offer = match (named.next(), None::<&crate::model::ToolDeclaration>) {""",
+    ),
 }
 
 # Which constitutional invariant each guarantee serves.
@@ -15930,6 +16052,7 @@ INVARIANTS: dict[str, tuple[str, list[str]]] = {
             "AnAttemptDoesNotChangeAnEffectsIdentity",
             "TwoEffectsInAStepCollideOnOneKey",
             "ACanonRuleChangeReadsAsDivergence",
+            "NullableRequiredInMapOrder",
         ],
     ),
     "I4": (

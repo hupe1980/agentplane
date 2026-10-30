@@ -85,6 +85,7 @@ impl crate::model::ModelProvider for Provider {
         request: crate::model::Request<'_>,
     ) -> Result<crate::model::Completion, crate::model::ModelError> {
         Err(crate::model::ModelError::Refused {
+            account: false,
             model: request.model.clone(),
             code: None,
             detail: REFUSAL.to_owned(),

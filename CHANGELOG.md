@@ -16,6 +16,72 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.56.0] — 2026-10-30
+
+### Added
+
+- **`FailedEffect::detail`**, the failure's text as recorded, and
+  `FailedEffect::account`. `EffectError::refuses_the_account()` and
+  `ModelError::refuses_the_account()` answer the same question on an error
+  in hand.
+- **`StoreError::NeedsRepair`**, for a redb journal whose writer stopped
+  without closing it, opened read-only. A writer's open repairs it; nothing is
+  lost.
+- **`ToolDeclaration::offering(tool, ..)` and `.named(..)`**: an offer that
+  remembers the catalogue tool it stands for, under its wire name or a name
+  of the skill's choosing.
+
+### Changed
+
+- **BREAKING: whether a refusal is the account's is the driver's verdict.**
+  `ModelError::Refused` and `EffectError::Refused` gain `account`;
+  `EffectError::Final` gains `code` and `account`, so a skill handling the
+  final failure still sees both; `RecordKind::EffectFailed` gains `account`.
+  `journal::refuses_the_account(code)` is removed:
+  `FailedEffect::refuses_the_account()` reads the recorded verdict. A
+  pre-freeze record change: an older journal reads with `account` false.
+- **BREAKING: `StepCtx::call_tool_for(&call, &offered, arguments)`** takes the
+  declarations the model was offered and runs the tool behind the offer the
+  call named, so a tool offered under the skill's own name can be answered.
+  A call naming nothing offered, a name two offers share and an offer
+  standing for no tool are refused before dispatch. `ToolDeclaration` gains
+  `tool`; `tools::ToolCall::answering` takes the offer.
+- **Every JSON request body is canonical** (sorted keys) on the Anthropic,
+  `OpenAI`, Chat Completions, Gemini and embedding drivers, the A2A peer
+  client and the Vault client — the bytes a default build already sent.
+
+### Fixed
+
+- **An effect key that moved with the build's features.** A typed tool's
+  strict schema and a planner's parse schema listed `required` in map order,
+  which is insertion order once any crate enables `serde_json/preserve_order`,
+  so adding such a dependency made recorded journals diverge at their first
+  model call. Both are sorted, as a default build wrote them, and so are
+  content-rule hits and strict-mode reasons. Re-record a journal a
+  `preserve_order` build wrote.
+- **Anthropic's empty credit balance read as a bad request.** Anthropic
+  answers it HTTP 400 `invalid_request_error`; it is now a refusal of the
+  account, buffered and streamed. A compatible server's 401, 402 or 403 is
+  the account's even when its body names no code.
+- **An expired or unrecognised AWS credential was retried as an outage.**
+  `ExpiredTokenException`, `UnrecognizedClientException`,
+  `InvalidSignatureException` and `AccessDeniedException` refuse the account,
+  and so does a credential the client cannot resolve because of its
+  configuration (an expired `aws login`, a broken profile), before anything
+  is sent.
+- **A Bedrock refusal quoted the SDK's dump of the raw response.** Its detail
+  is AWS's code, message and request id.
+- **`StoreError::Unreadable` told a reader to recreate a journal that only
+  needed its writer's repair.**
+
+### Known
+
+- **Bedrock request bytes vary between processes.** The AWS SDK writes a tool
+  schema from a hash map, so a Bedrock tool-prefix cache can miss across
+  processes. No effect key depends on it.
+- **An expired SSO session on Bedrock is retried before it fails**, without
+  the account verdict: the AWS SDK reports it as it reports an STS outage.
+
 ## [0.55.0] — 2026-10-27
 
 ### Fixed

@@ -24,7 +24,7 @@ mod witness;
 mod witness_http;
 
 pub use atomic::{AtomicJournal, AtomicResource, AtomicTx, AtomicWork, SqlValue};
-pub use failure::{FailedEffect, failed_effect, refuses_the_account};
+pub use failure::{FailedEffect, failed_effect};
 pub use note::{NoteSignature, SignedNote, key_id};
 pub use record::{
     AgentIdentity, Append, BoundSubject, Record, RecordBody, RecordKind, SubjectBinding,

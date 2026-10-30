@@ -472,6 +472,15 @@ pub enum RecordKind {
         /// of the account from a refusal of the request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<String>,
+        /// Whether the peer refused the **account** rather than the request —
+        /// the driver's verdict, made where the wire was read, since a code
+        /// alone cannot always say (Anthropic names an empty credit balance
+        /// as it names a malformed request). Kept in the clear like
+        /// `permanent`: a reader decides on it without opening the payload,
+        /// and a replay answers what the live run answered. Skipped when
+        /// false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        account: bool,
     },
 
     /// A limit refused an operation before it started.

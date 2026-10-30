@@ -192,6 +192,7 @@ async fn an_edit_no_effect_reaches_verifies_with_both_digests_named() {
 async fn a_faithful_replay_of_a_failed_run_is_verified() {
     let provider = FakeProvider::new();
     provider.will_fail(agentplane::model::ModelError::Refused {
+        account: false,
         model: agentplane::model::ModelId::new("fake", "sum-1"),
         code: None,
         detail: "the provider refused".to_owned(),

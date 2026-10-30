@@ -464,8 +464,8 @@ impl A2aClient {
         let mut request = client
             .post(&self.endpoint.url)
             .header("A2A-Version", PROTOCOL_VERSION)
-            .header("A2A-Extensions", EXT_CALLER_CONTEXT)
-            .json(body);
+            .header("A2A-Extensions", EXT_CALLER_CONTEXT);
+        request = crate::netguard::json_body(request, body);
         if let Some(credential) = credential {
             request = request.bearer_auth(credential.expose());
         }

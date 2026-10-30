@@ -73,13 +73,14 @@ dependencies = [
 
 [[package]]
 name = "agentplane"
-version = "0.55.0"
+version = "0.56.0"
 dependencies = [
  "a2a-lf",
  "a2a-server-lf",
  "async-stream",
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-bedrockruntime",
  "aws-smithy-runtime-api",
  "aws-smithy-types",

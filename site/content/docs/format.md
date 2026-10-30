@@ -988,8 +988,12 @@ and strict replay quarantines the run from it without reading the store.
 peer named the refusal — a model provider's error type or code, such as
 `insufficient_quota` or `authentication_error` — holds that identifier, at most
 128 bytes of ASCII letters, digits and `_.:-`. Clear: it quotes nothing of the
-request, and it is what tells a refusal of the account from a refusal of the
-request.
+request. `EffectFailed.account`, `true` only when present, is the driver's
+verdict that the peer refused the **account** — credit, quota, billing, a
+missing, invalid or expired credential — rather than the request. It is a
+field of its own because a code cannot always say: Anthropic names an empty
+credit balance `invalid_request_error`, as it names a malformed request. Clear,
+like `permanent`.
 
 **How long a call took is on its outcome.** `EffectDone.elapsed_ms` and
 `EffectFailed.elapsed_ms` are the wall time this process measured around the

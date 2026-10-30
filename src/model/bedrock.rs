@@ -497,6 +497,7 @@ impl Bedrock {
 
     fn refused(model: &ModelId, detail: impl Into<String>) -> ModelError {
         ModelError::Refused {
+            account: false,
             model: model.clone(),
             code: None,
             detail: detail.into(),
@@ -1305,25 +1306,44 @@ fn tool(
 
 /// Classify a failed SDK call by how far it got.
 ///
-/// The detail is the whole source chain: the SDK's own `Display` says only
-/// "dispatch failure" or "service error", which sends an operator looking for
-/// a cause the message dropped. Only a request the SDK could not build is
-/// known never to have reached AWS; a dispatch failure may have been sent, and
-/// a timeout or an unreadable response certainly was, so each of those is
-/// `Unavailable` — reached, with nothing said about whether it generated.
+/// Only a request the SDK could not build is known never to have reached AWS;
+/// a dispatch failure may have been sent, and a timeout or an unreadable
+/// response certainly was, so each of those is `Unavailable` — reached, with
+/// nothing said about whether it generated. The exception is a credential that
+/// could not be resolved, which is decided before anything is sent: see
+/// [`unresolvable_identity`].
+///
+/// A service error's detail is AWS's own code, message and request id — what
+/// an operator quotes to AWS. Anything else carries the SDK's whole source
+/// chain, because its own `Display` says only "dispatch failure" and the cause
+/// is underneath.
 fn classify_sdk<E, R>(
     model: &ModelId,
     error: &aws_sdk_bedrockruntime::error::SdkError<E, R>,
     service: impl FnOnce(&E, String) -> ModelError,
 ) -> ModelError
 where
-    E: std::error::Error + 'static,
-    R: std::fmt::Debug,
+    E: std::error::Error
+        + aws_sdk_bedrockruntime::error::ProvideErrorMetadata
+        + aws_sdk_bedrockruntime::operation::RequestId
+        + 'static,
+    R: std::fmt::Debug + 'static,
 {
     use aws_sdk_bedrockruntime::error::{DisplayErrorContext, SdkError};
+    if let SdkError::ServiceError(context) = error {
+        let err = context.err();
+        return service(err, service_detail(err));
+    }
     let detail = DisplayErrorContext(error).to_string();
+    if unresolvable_identity(error) {
+        return ModelError::Refused {
+            account: true,
+            model: model.clone(),
+            code: None,
+            detail,
+        };
+    }
     match error {
-        SdkError::ServiceError(context) => service(context.err(), detail),
         SdkError::ConstructionFailure(_) => ModelError::Unreachable {
             model: model.clone(),
             detail,
@@ -1335,15 +1355,69 @@ where
     }
 }
 
+/// `<code>: <message> (request <id>)`, from AWS's error metadata.
+fn service_detail<E>(error: &E) -> String
+where
+    E: std::error::Error
+        + aws_sdk_bedrockruntime::error::ProvideErrorMetadata
+        + aws_sdk_bedrockruntime::operation::RequestId,
+{
+    let code = error.code().unwrap_or("ServiceError");
+    let message = error
+        .message()
+        .map_or_else(|| error.to_string(), str::to_owned);
+    match error.request_id() {
+        Some(id) => format!("{code}: {message} (request {id})"),
+        None => format!("{code}: {message}"),
+    }
+}
+
+/// Whether the call failed resolving credentials its configuration cannot
+/// produce, which refuses the account before anything reached Bedrock.
+///
+/// `InvalidConfiguration`, and `Unhandled`, which is where aws-config puts an
+/// expired `aws login` token and an unreadable token file: a person has to
+/// sign in or fix the profile. Not the rest, which an outage can cause and a
+/// retry can fix: `ProviderTimedOut`, `ProviderError` (an STS 503, a token
+/// refresh that could not connect — and an expired SSO session, which
+/// aws-config reports the same way) and `CredentialsNotLoaded` (which an
+/// unreachable instance metadata service also ends in).
+fn unresolvable_identity(error: &(dyn std::error::Error + 'static)) -> bool {
+    use aws_credential_types::provider::error::CredentialsError;
+    let mut cause = Some(error);
+    while let Some(inner) = cause {
+        if let Some(credentials) = inner.downcast_ref::<CredentialsError>() {
+            return matches!(
+                credentials,
+                CredentialsError::InvalidConfiguration(_) | CredentialsError::Unhandled(_)
+            );
+        }
+        cause = inner.source();
+    }
+    false
+}
+
+/// The service codes that refuse the **account**: the credential is missing a
+/// permission, unknown, expired or signed wrongly. Matched by code rather than
+/// by typed variant, because only `AccessDeniedException` is modelled — the
+/// rest arrive as unmodelled errors that carry nothing but their code.
+const ACCOUNT_CODES: [&str; 4] = [
+    "AccessDeniedException",
+    "UnrecognizedClientException",
+    "InvalidSignatureException",
+    "ExpiredTokenException",
+];
+
 /// Classify a Converse service error, buffered or at stream start.
 ///
 /// A throttle is `RateLimited` with no window: the SDK models it as a typed
 /// error and does not surface the response headers at this seam, and the AWS
 /// client applies its own adaptive retry beneath this call, so a second
-/// schedule stacked on it would multiply rather than add. Access, lookup and
-/// validation failures are refusals. Anything else — a timeout, a model or
-/// service fault — may have generated, and Converse exposes no partial usage
-/// for it, so it is `Unavailable` rather than free or absent.
+/// schedule stacked on it would multiply rather than add. A refused
+/// credential ([`ACCOUNT_CODES`]) refuses the account; lookup and validation
+/// failures refuse the request. Anything else — a timeout, a model or service
+/// fault — may have generated, and Converse exposes no partial usage for it,
+/// so it is `Unavailable` rather than free or absent.
 fn classify_service(
     model: &ModelId,
     detail: String,
@@ -1351,14 +1425,16 @@ fn classify_service(
     throttled: bool,
     refused: bool,
 ) -> ModelError {
+    let account = code.is_some_and(|code| ACCOUNT_CODES.contains(&code));
     if throttled {
         ModelError::RateLimited {
             model: model.clone(),
             detail,
             retry_after: None,
         }
-    } else if refused {
+    } else if refused || account {
         ModelError::Refused {
+            account,
             model: model.clone(),
             code: code.and_then(|code| super::bounded_code(code.to_owned())),
             detail,
@@ -1418,6 +1494,7 @@ fn classify_stream_event(
         aws_sdk_bedrockruntime::types::error::ConverseStreamOutputError::is_validation_exception,
     ) {
         ModelError::Refused {
+            account: false,
             model: model.clone(),
             code: None,
             detail: detail.to_owned(),
@@ -2054,6 +2131,148 @@ mod tests {
             err.contains("region"),
             "the refusal must name the blank region, got: {err}"
         );
+    }
+
+    /// A Bedrock driver whose every answer is `status` with `body`, through
+    /// the real SDK's error parsing, signing with `credentials`.
+    fn answering(
+        status: u16,
+        body: &'static str,
+        credentials: aws_sdk_bedrockruntime::config::SharedCredentialsProvider,
+        buffered: bool,
+    ) -> Bedrock {
+        let config = aws_sdk_bedrockruntime::Config::builder()
+            .region(Region::new("eu-west-1"))
+            .behavior_version_latest()
+            .credentials_provider(credentials)
+            .retry_config(aws_sdk_bedrockruntime::config::retry::RetryConfig::disabled())
+            .http_client(crate::model::canned_http(
+                status,
+                Some("application/json"),
+                body,
+            ))
+            .build();
+        let driver = Bedrock::from_client(Client::from_conf(config)).expect("a region");
+        if buffered { driver.buffered() } else { driver }
+    }
+
+    async fn refusal_of(driver: &Bedrock) -> ModelError {
+        let model = ModelId::new("bedrock", "anthropic.claude-x");
+        let prompt = json!("hello");
+        driver
+            .complete(Request {
+                model: &model,
+                prompt: &prompt,
+                max_output_tokens: 64,
+                reasoning_effort: None,
+                reasoning_summary: false,
+                schema: None,
+                tools: &[],
+                exchanges: &[],
+                told: &[],
+                continuation: None,
+                compaction: None,
+                stream: None,
+            })
+            .await
+            .expect_err("every answer is an error")
+    }
+
+    fn signing() -> aws_sdk_bedrockruntime::config::SharedCredentialsProvider {
+        aws_sdk_bedrockruntime::config::SharedCredentialsProvider::new(
+            aws_sdk_bedrockruntime::config::Credentials::for_tests(),
+        )
+    }
+
+    /// **A refused credential refuses the account, on both paths.** Only
+    /// `AccessDeniedException` is modelled; the others arrive as unmodelled
+    /// errors with nothing but a code, and were `Unavailable` — retried, and
+    /// never the account's. A lookup or validation failure stays the
+    /// request's. The detail is AWS's code, message and request id, not the
+    /// SDK's dump of the raw response.
+    #[tokio::test]
+    async fn a_refused_credential_refuses_the_account() {
+        const EXPIRED: &str = r#"{"__type":"ExpiredTokenException","message":"The security token included in the request is expired"}"#;
+        const UNKNOWN: &str = r#"{"__type":"UnrecognizedClientException","message":"The security token included in the request is invalid."}"#;
+        const DENIED: &str = r#"{"__type":"AccessDeniedException","message":"You don't have access to the model with the specified model ID."}"#;
+        const INVALID: &str = r#"{"__type":"ValidationException","message":"The provided model identifier is invalid."}"#;
+        for buffered in [true, false] {
+            for (status, body, code) in [
+                (403, EXPIRED, "ExpiredTokenException"),
+                (403, UNKNOWN, "UnrecognizedClientException"),
+                (403, DENIED, "AccessDeniedException"),
+            ] {
+                let refused = refusal_of(&answering(status, body, signing(), buffered)).await;
+                assert!(
+                    refused.refuses_the_account(),
+                    "{code} (buffered: {buffered}) is the account's: {refused:?}"
+                );
+                assert_eq!(refused.code().as_deref(), Some(code));
+                let text = refused.to_string();
+                assert!(text.contains(&format!("{code}: ")), "{text}");
+                assert!(!text.contains("raw: Response"), "the SDK's dump: {text}");
+            }
+            let request = refusal_of(&answering(400, INVALID, signing(), buffered)).await;
+            assert!(
+                matches!(request, ModelError::Refused { account: false, .. }),
+                "a validation failure is the request's: {request:?}"
+            );
+        }
+    }
+
+    /// **A credential that cannot be resolved is decided before anything is
+    /// sent.** An expired `aws login` token reaches the client as
+    /// `CredentialsError::Unhandled` and a broken profile as
+    /// `InvalidConfiguration`: the account's, so no retry is spent on them. A
+    /// provider error — an STS 503, a refresh that could not connect — stays
+    /// an outage, retried.
+    #[tokio::test]
+    async fn a_credential_that_cannot_be_resolved_refuses_the_account() {
+        use aws_credential_types::provider::error::CredentialsError;
+        use aws_sdk_bedrockruntime::config::SharedCredentialsProvider;
+        fn failing(error: fn() -> CredentialsError) -> SharedCredentialsProvider {
+            SharedCredentialsProvider::new(
+                aws_credential_types::credential_fn::provide_credentials_fn(move || async move {
+                    Err(error())
+                }),
+            )
+        }
+        for (error, account) in [
+            (
+                (|| CredentialsError::unhandled("the login token has expired"))
+                    as fn() -> CredentialsError,
+                true,
+            ),
+            (
+                || CredentialsError::invalid_configuration("no such profile"),
+                true,
+            ),
+            (
+                || CredentialsError::provider_error("STS answered 503"),
+                false,
+            ),
+            (|| CredentialsError::not_loaded("nothing configured"), false),
+        ] {
+            let refused = refusal_of(&answering(200, "", failing(error), true)).await;
+            if account {
+                assert!(
+                    matches!(
+                        refused,
+                        ModelError::Refused {
+                            account: true,
+                            code: None,
+                            ..
+                        }
+                    ),
+                    "{refused:?}"
+                );
+            } else {
+                assert!(
+                    matches!(refused, ModelError::Unavailable { .. }),
+                    "{refused:?}"
+                );
+            }
+        }
     }
 
     fn stub_driver() -> Bedrock {

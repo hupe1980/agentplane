@@ -333,6 +333,7 @@ impl Gemini {
         let key = std::env::var("GEMINI_API_KEY")
             .or_else(|_| std::env::var("GOOGLE_API_KEY"))
             .map_err(|_| ModelError::Refused {
+                account: false,
                 model: ModelId::new(PROVIDER, "*"),
                 code: None,
                 detail: "neither GEMINI_API_KEY nor GOOGLE_API_KEY is set".to_owned(),
@@ -428,6 +429,7 @@ impl Gemini {
 
     fn refused(model: &ModelId, detail: impl Into<String>) -> ModelError {
         ModelError::Refused {
+            account: false,
             model: model.clone(),
             code: None,
             detail: detail.into(),
@@ -1222,7 +1224,7 @@ impl ModelProvider for Gemini {
         self.check_egress(model)?;
 
         let body = self.body(model, &request)?;
-        let response = self
+        let builder = self
             .http
             .post(self.url(model))
             // The header form rather than a `?key=` query parameter: a URL is
@@ -1230,8 +1232,8 @@ impl ModelProvider for Gemini {
             // a credential that reaches any of those is one that cannot be
             // un-leaked.
             .header("x-goog-api-key", self.key.expose())
-            .timeout(self.timeout)
-            .json(&body)
+            .timeout(self.timeout);
+        let response = crate::netguard::json_body(builder, &body)
             .send()
             .await
             .map_err(|e| classify_transport(model, &e))?;

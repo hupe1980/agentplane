@@ -283,6 +283,8 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             unreproducible: _,
             elapsed_ms: _,
             code: _,
+            // Clear: the driver's verdict, read without the key.
+            account: _,
         } => vec![SealedField::Text(error)],
         // Reasoning recorded beside the effects it explains — model output
         // over the caller's data, and nothing routes on it.
