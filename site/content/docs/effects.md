@@ -684,6 +684,10 @@ in-doubt case the effect protocol exists to avoid. A suspended run has no thread
 to notice anything, so `request_cancel` resumes it itself; a run executing
 elsewhere sees the request at its own next boundary.
 
+A model call its own step stops while it streams is different: it concludes as
+a recorded completion, not mid-effect
+([cookbook](@/docs/cookbook.md#stream-a-model-call-and-stop-it)).
+
 ### The request lives beside the chain, not in it
 
 Every other write to a run requires the fencing lease, because two writers on one

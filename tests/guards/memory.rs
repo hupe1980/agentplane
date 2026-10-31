@@ -1842,6 +1842,7 @@ impl agentplane::model::ModelProvider for Summarises {
         _request: agentplane::model::Request<'_>,
     ) -> Result<agentplane::model::Completion, agentplane::model::ModelError> {
         Ok(agentplane::model::Completion {
+            stopped: false,
             model: None,
             text: "a summary".to_owned(),
             structured: None,

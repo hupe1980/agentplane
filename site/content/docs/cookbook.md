@@ -2199,17 +2199,24 @@ if let Some(failed) = &out.failed_effect {
 Whether the account was refused is the driver's verdict, recorded in the
 clear on `EffectFailed` ([format](@/docs/format.md)), so a replay — and
 `journal::failed_effect` over a run's history — answers the same. `code` is
-the provider's own name for the refusal; `detail` is the failure's text as
-recorded. A skill handling the failure itself reads the same verdict from
-`EffectError::refuses_the_account()` and `EffectError::code()`, live and on
-replay.
+the provider's own name for the refusal; `detail` is the failure in the
+driver's words — `'anthropic/claude-sonnet-5' refused the request: …` — with
+no effect key or attempt count, so it is what a person is shown. A skill
+handling the failure itself reads the same from `EffectError::message()`,
+`refuses_the_account()` and `code()`, live and on replay.
+
+A run stopped by a budget says which: `RunStatus::Exhausted(limit)` answers
+`limit.ceiling()` — `Ceiling::Tokens`, `Ceiling::Money`, … — live and when the
+refusal is read back from the journal, so the setting to raise is a match,
+not a sentence to parse.
 
 On Bedrock, `AccessDeniedException`, `UnrecognizedClientException`,
 `InvalidSignatureException`, `ExpiredTokenException` and a credential its
-configuration cannot produce (an expired `aws login`, a broken profile) refuse
-the account. A credential failure a retry can fix — an STS outage, an
-unreachable metadata service — is retried; so is an expired SSO session, which
-the AWS SDK reports the same way.
+configuration cannot produce refuse the account, before anything is sent: an
+`aws login` or IAM Identity Center (SSO) session that expired or was never
+signed in, a broken profile. The remedy is the person's (`aws login`,
+`aws sso login`). A credential failure a retry can fix — an STS outage, an
+unreachable metadata service — is retried.
 
 ## 🔌 Call tools on an MCP server you already run {#call-tools-on-an-mcp-server-you-already-run}
 
@@ -3562,6 +3569,8 @@ request into the nearest one is a substitution nothing downstream could see.
 Nova models are Bedrock models, so there is no separate Nova driver to reach
 for.
 
+## 🌊 Stream a model call, and stop it {#stream-a-model-call-and-stop-it}
+
 Attach an `Arc<dyn ModelStreamObserver>` with
 `ModelCall::streaming_to(observer)` to expose live visible text while retaining
 one canonical journaled completion. Add `.with_reasoning_summary()` to show the
@@ -3603,6 +3612,26 @@ provider.streaming().will_say("Settlement GB-4471 clears on Thursday.");
 The chunking is whitespace with the separator kept on the preceding chunk, so
 concatenating every delta reproduces `Completion::text` exactly — which is the
 property an observer that appends into a buffer actually depends on.
+
+A person's **Stop** ends a call while it streams. Hand the call a
+`model::Stop` and keep a clone where the button is:
+
+```rust
+let stop = Stop::new();
+let call = ModelCall::new(provider, model, prompt)
+    .streaming_to(view)
+    .stopped_by(stop.clone());
+// where the button is: stop.stop();
+```
+
+The call concludes as an ordinary completion with `Completion::stopped` set:
+`text` is what streamed before the stop, and `usage` is what the provider had
+reported by then — a floor, since most wires report output tokens only at the
+end. It carries no tool calls and no continuation. It is journaled and metered
+like any answer, and replay returns it without the stop. A buffered call, and a
+call that declares a schema, run to their end: a partial answer is not a value
+of the schema. `FakeProvider::streaming()` honours a stop between deltas, so
+the stopped path is testable offline.
 
 OpenAI and Anthropic tool loops preserve reasoning automatically.
 `Completion::continuation` carries opaque OpenAI output items or Anthropic

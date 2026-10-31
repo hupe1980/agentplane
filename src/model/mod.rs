@@ -785,7 +785,7 @@ pub struct ToolCall {
 }
 
 /// What came back.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Completion {
     pub text: String,
     /// The model that actually answered, as the provider reported it.
@@ -896,6 +896,67 @@ pub struct Completion {
     /// of the journal knows the model worked from a summary from here on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacted: Option<Compacted>,
+    /// The call was [stopped](ModelCall::stopped_by) while it streamed.
+    ///
+    /// [`text`](Self::text) is what arrived before the stop, and
+    /// [`usage`](Self::usage) is what the wire had reported by then — a floor,
+    /// since most providers report output tokens only at the end. A half-sent
+    /// tool call is not a request, so [`tool_calls`](Self::tool_calls) is
+    /// empty, and there is no continuation: the turn did not finish.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
+}
+
+impl Completion {
+    /// A streamed call stopped, having been billed `usage` so far. The text
+    /// is the one streamed, which the call keeps.
+    #[must_use]
+    pub fn stopped(usage: Usage) -> Self {
+        Self {
+            usage,
+            truncated: true,
+            stopped: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// A person's signal to end a model call while it streams.
+///
+/// Cloned to whoever may press it; [`stop`](Self::stop) ends every call
+/// [stopped by](ModelCall::stopped_by) it that is still streaming, and a call
+/// started after it stops at once.
+#[derive(Debug, Clone)]
+pub struct Stop(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Default for Stop {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::Sender::new(false)))
+    }
+}
+
+impl Stop {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// End the calls this signal stops.
+    pub fn stop(&self) {
+        self.0.send_replace(true);
+    }
+
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolves once [`stop`](Self::stop) is called.
+    pub async fn stopped(&self) {
+        let mut seen = self.0.subscribe();
+        // The sender lives in `self`, so the channel cannot close here.
+        let _ = seen.wait_for(|stopped| *stopped).await;
+    }
 }
 
 /// A provider code held to an identifier, or nothing: at most 128 bytes of
@@ -992,18 +1053,67 @@ pub enum ModelStreamEvent {
     Usage(Usage),
 }
 
-/// An observer that sees reasoning deltas only when the call asked for them.
+/// What one call's stream reaches: the caller's observer, with reasoning
+/// deltas only when the call asked for them, and — when the call can be
+/// stopped — the text streamed so far, which a stopped completion keeps.
 #[derive(Debug)]
-struct WithoutReasoning<'a> {
-    observer: &'a dyn ModelStreamObserver,
+struct CallObserver<'a> {
+    observer: Option<&'a dyn ModelStreamObserver>,
     asked: bool,
+    streamed: Option<std::sync::Mutex<String>>,
 }
 
-impl ModelStreamObserver for WithoutReasoning<'_> {
-    fn event(&self, event: crate::core::Tainted<ModelStreamEvent>) {
-        if self.asked || !matches!(event.peek(), ModelStreamEvent::ReasoningDelta(_)) {
-            self.observer.event(event);
+impl<'a> CallObserver<'a> {
+    fn of(call: &'a ModelCall) -> Option<Self> {
+        let stoppable = call.stop().is_some();
+        (call.stream.is_some() || stoppable).then(|| Self {
+            observer: call.stream.as_deref(),
+            asked: call.reasoning_summary,
+            streamed: stoppable.then(std::sync::Mutex::default),
+        })
+    }
+
+    /// A stopped completion's text is the text that streamed.
+    fn keep_streamed(&self, completion: &mut Completion) {
+        if completion.stopped
+            && let Some(streamed) = &self.streamed
+        {
+            streamed
+                .lock()
+                .expect("streamed text")
+                .clone_into(&mut completion.text);
         }
+    }
+}
+
+impl ModelStreamObserver for CallObserver<'_> {
+    fn event(&self, event: crate::core::Tainted<ModelStreamEvent>) {
+        if let (Some(streamed), ModelStreamEvent::TextDelta(delta)) = (&self.streamed, event.peek())
+        {
+            streamed.lock().expect("streamed text").push_str(delta);
+        }
+        if let Some(observer) = self.observer
+            && (self.asked || !matches!(event.peek(), ModelStreamEvent::ReasoningDelta(_)))
+        {
+            observer.event(event);
+        }
+    }
+}
+
+/// `next`, unless `stop` is pressed first: `None` then.
+#[cfg(any(feature = "providers", feature = "bedrock"))]
+pub(crate) async fn unless_stopped<F: std::future::Future>(
+    next: F,
+    stop: Option<&Stop>,
+) -> Option<F::Output> {
+    let Some(stop) = stop else {
+        return Some(next.await);
+    };
+    // Resolves at once for a stop pressed before the call began.
+    tokio::select! {
+        biased;
+        () = stop.stopped() => None,
+        item = next => Some(item),
     }
 }
 
@@ -1354,6 +1464,10 @@ pub struct Request<'a> {
     /// Live observer. Not provider-visible and therefore not effect identity.
     /// Strict replay never calls it because replay never performs the provider.
     pub stream: Option<(&'a dyn ModelStreamObserver, &'a crate::core::Label)>,
+    /// A person's stop: a driver that streams checks it between chunks and
+    /// answers [`Completion::stopped`] with the usage reported so far, and the
+    /// call keeps the text it streamed. Not effect identity.
+    pub stop: Option<&'a Stop>,
 }
 
 /// Provider-neutral reasoning depth.
@@ -1853,6 +1967,7 @@ pub struct ModelCall {
     /// The label of the transcript this call continues, when it continues one.
     carried: Option<crate::core::Label>,
     stream: Option<Arc<dyn ModelStreamObserver>>,
+    stop: Option<Stop>,
     max_output_tokens: u32,
     /// What one call may send, when a role declared it. Checked against the
     /// provider's reported usage, since input cannot be bounded before it.
@@ -1904,6 +2019,7 @@ impl ModelCall {
             compaction: None,
             carried: None,
             stream: None,
+            stop: None,
             max_output_tokens: Self::DEFAULT_MAX_OUTPUT_TOKENS,
             max_input_tokens: None,
             reasoning_effort: None,
@@ -2013,6 +2129,46 @@ impl ModelCall {
     pub fn streaming_to(mut self, observer: Arc<dyn ModelStreamObserver>) -> Self {
         self.stream = Some(observer);
         self
+    }
+
+    /// End this call on `stop`, while it streams, as a recorded completion of
+    /// what had arrived ([`Completion::stopped`]).
+    ///
+    /// Stopping ends the bill where the stream is rather than at the answer's
+    /// end. A buffered call, and a call that declares a schema, run to their
+    /// end. The signal is not effect identity; replay returns the recorded
+    /// completion.
+    #[must_use]
+    pub fn stopped_by(mut self, stop: Stop) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    /// The label this call's stream carries, announced with `Started`.
+    fn open_stream(&self) -> crate::core::Label {
+        // The same identity the terminal completion is labelled with, from the
+        // same derivation — `Effect::source` — so the two spellings cannot
+        // drift apart.
+        let mut stream_label = crate::core::Label::untrusted(Effect::source(self));
+        // Raised, never assigned: the untrusted label already carries the
+        // `Internal` floor every model answer has, and the terminal completion
+        // is floored the same way at the effect boundary. A plain `=` here
+        // would *lower* the stream below that — the same bytes leaving the
+        // plane twice, once labelled and once laundered, differing only in
+        // whether the caller read them live.
+        stream_label.sensitivity = stream_label.sensitivity.max(self.declared_output_floor());
+        if let Some(observer) = &self.stream {
+            observer.event(crate::core::Tainted::with_label(
+                ModelStreamEvent::Started,
+                stream_label.clone(),
+            ));
+        }
+        stream_label
+    }
+
+    /// The stop this call honours: none for a call that declares a schema.
+    fn stop(&self) -> Option<&Stop> {
+        self.stop.as_ref().filter(|_| self.schema.is_none())
     }
 
     /// The plane's observer, when it has one and the call has none of its own.
@@ -2469,31 +2625,12 @@ impl Effect for ModelCall {
             .map_err(|error| EffectError::Rejected(error.to_string()))?;
         self.refuse_what_cannot_be_sent()?;
 
-        // The same identity the terminal completion is labelled with, from the
-        // same derivation — `Effect::source` — so the two spellings cannot
-        // drift apart.
-        let mut stream_label = crate::core::Label::untrusted(Effect::source(self));
-        // Raised, never assigned: the untrusted label already carries the
-        // `Internal` floor every model answer has, and the terminal completion
-        // is floored the same way at the effect boundary. A plain `=` here
-        // would *lower* the stream below that — the same bytes leaving the
-        // plane twice, once labelled and once laundered, differing only in
-        // whether the caller read them live.
-        stream_label.sensitivity = stream_label.sensitivity.max(self.declared_output_floor());
-        if let Some(observer) = &self.stream {
-            observer.event(crate::core::Tainted::with_label(
-                ModelStreamEvent::Started,
-                stream_label.clone(),
-            ));
-        }
+        let stream_label = self.open_stream();
         // Asked or not, a provider may volunteer its reasoning — Anthropic's
         // older models summarise by default, and the trait is public. The
         // completion and the stream carry it only when this call asked, so
         // what the journal holds is what the effect key says was requested.
-        let observer = self.stream.as_deref().map(|observer| WithoutReasoning {
-            observer,
-            asked: self.reasoning_summary,
-        });
+        let observer = CallObserver::of(self);
         let answered = self
             .provider
             .complete(Request {
@@ -2511,9 +2648,15 @@ impl Effect for ModelCall {
                 stream: observer
                     .as_ref()
                     .map(|observer| (observer as &dyn ModelStreamObserver, &stream_label)),
+                stop: self.stop(),
             })
             .await
-            .map(|completion| self.only_what_was_asked(completion));
+            .map(|mut completion| {
+                if let Some(observer) = &observer {
+                    observer.keep_streamed(&mut completion);
+                }
+                self.only_what_was_asked(completion)
+            });
 
         // The declared schema is a contract on the *answer*, and the runtime
         // relies on it: `structured` is indexed into rather than re-checked.
@@ -3050,6 +3193,7 @@ mod tests {
         async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
             *self.0.lock().unwrap() = request.stream.map(|(_, label)| label.clone());
             Ok(Completion {
+                stopped: false,
                 text: "ok".to_owned(),
                 model: None,
                 tool_calls: Vec::new(),
@@ -3248,6 +3392,7 @@ mod tests {
         async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
             *self.0.lock().unwrap() = Some(request.prompt.clone());
             Ok(Completion {
+                stopped: false,
                 tool_calls: Vec::new(),
                 text: "described".to_owned(),
                 model: None,

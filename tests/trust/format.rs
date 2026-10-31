@@ -244,6 +244,7 @@ fn effects() -> Vec<RecordKind> {
         RecordKind::BudgetRefused {
             limit: "effects".into(),
             used: "2 of 2".into(),
+            ceiling: Some("effects".into()),
         },
         RecordKind::BudgetReadmitted {
             limit: "effects raised to 5".into(),

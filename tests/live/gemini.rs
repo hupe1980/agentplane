@@ -75,6 +75,7 @@ fn request<'a>(
     schema: Option<&'a Value>,
 ) -> Request<'a> {
     Request {
+        stop: None,
         model,
         prompt,
         max_output_tokens: 2048,

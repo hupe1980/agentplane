@@ -2549,6 +2549,7 @@ fn every_durably_spelled_variant_is_in_its_all() {
         ("src/core/task.rs", "Withheld"),
         ("src/core/id.rs", "Phase"),
         ("src/batch/mod.rs", "ItemOutcome"),
+        ("src/core/budget.rs", "Ceiling"),
     ];
     for (file, name) in vocabularies {
         let src = read(file);

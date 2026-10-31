@@ -1988,7 +1988,7 @@ impl<'a> StepCtx<'a> {
             key,
             attempt,
             policy,
-            &failure.to_string(),
+            &failure.message(),
             permanent_failure(effect, failure),
             (failure.code(), failure.refuses_the_account()),
             effect.mutates(),
@@ -2137,7 +2137,12 @@ impl<'a> StepCtx<'a> {
         refusal: EffectReplay,
         outbound_bytes: u64,
     ) -> Result<(), StepError> {
-        let EffectReplay::Refused { limit, used } = refusal else {
+        let EffectReplay::Refused {
+            limit,
+            used,
+            ceiling,
+        } = refusal
+        else {
             return Err(self.replayed_denial(refusal));
         };
         // Re-askable only at the history frontier, and the condition is
@@ -2147,7 +2152,11 @@ impl<'a> StepCtx<'a> {
         // ledger. A cancelling pass re-admits nothing either — it exists to
         // take work back, not to continue it.
         if !self.writes_enabled() || self.abandoning {
-            return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
+            return Err(recorded_refusal(EffectReplay::Refused {
+                limit,
+                used,
+                ceiling,
+            }));
         }
         // Asked without taking the slot: this is the question "does the
         // ceiling now in force still refuse", and the dispatch that follows a
@@ -2182,6 +2191,7 @@ impl<'a> StepCtx<'a> {
             return Err(StepError::Budget(crate::core::BudgetExceeded::Recorded {
                 limit,
                 used,
+                ceiling,
             }));
         }
         self.append_effect(key, RecordKind::BudgetReadmitted { limit })
@@ -2301,12 +2311,15 @@ impl<'a> StepCtx<'a> {
                     by,
                 }))))
             }
-            Some(EffectReplay::Refused { limit, used }) => {
-                Err(StepError::Budget(crate::core::BudgetExceeded::Recorded {
-                    limit,
-                    used,
-                }))
-            }
+            Some(EffectReplay::Refused {
+                limit,
+                used,
+                ceiling,
+            }) => Err(StepError::Budget(crate::core::BudgetExceeded::Recorded {
+                limit,
+                used,
+                ceiling,
+            })),
             Some(EffectReplay::Denied {
                 reason,
                 action,
@@ -2837,7 +2850,8 @@ impl<'a> StepCtx<'a> {
         self.meter.count(metrics::BUDGET_REFUSALS, refused.as_str());
         let rate_refusal = RecordKind::BudgetRefused {
             limit: refused.to_string(),
-            used: format!("{:?}", self.budget()),
+            used: self.budget().to_string(),
+            ceiling: refused.ceiling().map(|c| c.as_str().to_owned()),
         };
         self.append_effect(key, rate_refusal).await?;
         Err(StepError::Budget(refused))
@@ -3262,7 +3276,8 @@ impl<'a> StepCtx<'a> {
             key,
             RecordKind::BudgetRefused {
                 limit: exceeded.to_string(),
-                used: format!("{:?}", self.budget()),
+                used: self.budget().to_string(),
+                ceiling: exceeded.ceiling().map(|c| c.as_str().to_owned()),
             },
         )
         .await?;
@@ -4905,7 +4920,7 @@ impl<'a> StepCtx<'a> {
                     .append_effect(
                         key,
                         RecordKind::EffectFailed {
-                            error: e.to_string(),
+                            error: e.message(),
                             spend,
                             disposition: e.disposition(),
                             // An answer, not a fault — recorded so the replayed
@@ -5228,9 +5243,15 @@ impl crate::blob::BlobStore for ClassifiedBlobs {
 
 fn recorded_refusal(replay: EffectReplay) -> StepError {
     match replay {
-        EffectReplay::Refused { limit, used } => {
-            StepError::Budget(crate::core::BudgetExceeded::Recorded { limit, used })
-        }
+        EffectReplay::Refused {
+            limit,
+            used,
+            ceiling,
+        } => StepError::Budget(crate::core::BudgetExceeded::Recorded {
+            limit,
+            used,
+            ceiling,
+        }),
         // Which gate refused is recorded in `action`, and rebuilding the right
         // shape from it is what keeps a replay from ending a run the original
         // finished: a sink refusal is one call the model may route around, an

@@ -945,6 +945,7 @@ impl OpenAi {
         let continuation =
             (!emulating).then(|| super::ProviderContinuation::new("openai", parsed.continuation()));
         Ok(Completion {
+            stopped: false,
             reasoning: parsed.reasoning(),
             commentary: parsed.commentary(),
             compacted: parsed.compacted(),
@@ -1002,6 +1003,7 @@ impl OpenAi {
         model: &ModelId,
         schema: Option<&Value>,
         observer: Option<(&dyn super::ModelStreamObserver, &crate::core::Label)>,
+        stop: Option<&super::Stop>,
     ) -> Result<Completion, ModelError> {
         use futures_util::StreamExt;
 
@@ -1015,7 +1017,12 @@ impl OpenAi {
         // the accumulator until the process dies.
         let mut meter = crate::netguard::intake::Meter::new(crate::netguard::intake::ANSWER);
 
-        while let Some(chunk) = body.next().await {
+        loop {
+            // What the wire had billed when a person stopped the call.
+            let Some(next) = super::unless_stopped(body.next(), stop).await else {
+                return Ok(Completion::stopped(Usage::default()));
+            };
+            let Some(chunk) = next else { break };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(e) => {
@@ -1214,6 +1221,7 @@ impl ModelProvider for OpenAi {
             continuation,
             compaction,
             stream,
+            stop,
         } = request;
 
         super::refuse_provider_side_media(prompt, model)?;
@@ -1259,7 +1267,8 @@ impl ModelProvider for OpenAi {
         }
 
         let mut completion = if self.stream {
-            self.read_streamed(response, model, schema, stream).await?
+            self.read_streamed(response, model, schema, stream, stop)
+                .await?
         } else {
             self.read_buffered(response, model, schema).await?
         };
@@ -1870,6 +1879,7 @@ mod continuation_tests {
             json!({"value": 1}),
         );
         let mut completion = Completion {
+            stopped: false,
             text: String::new(),
             tool_calls: vec![ModelToolCall {
                 id: "call_2".to_owned(),

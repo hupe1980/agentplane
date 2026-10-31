@@ -2238,7 +2238,8 @@ pub struct Label {""",
             key,
             RecordKind::BudgetRefused {
                 limit: exceeded.to_string(),
-                used: format!("{:?}", self.budget()),
+                used: self.budget().to_string(),
+                ceiling: exceeded.ceiling().map(|c| c.as_str().to_owned()),
             },
         )
         .await?;""",
@@ -2251,12 +2252,8 @@ pub struct Label {""",
         "instead of being re-asked against the ledger now in force, so a run "
         "exhausted by max_effects stays exhausted under a ceiling that now "
         "admits it — the step-level twin resumes, this tier never does",
-        """        if !self.writes_enabled() || self.abandoning {
-            return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
-        }""",
-        """        if true {
-            return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
-        }""",
+        """        if !self.writes_enabled() || self.abandoning {""",
+        """        if true {""",
     ),
     "AReadmittedRefusalStillStopsAStrictReplay": (
         'src/journal/replay.rs',
@@ -15527,8 +15524,8 @@ pub struct WrappedKey {""",
         "src/model/mod.rs",
         "an_unasked_summary_reaches_neither_the_journal_nor_the_stream",
         "a provider that volunteers reasoning streams it to a call that never asked for it",
-        """        if self.asked || !matches!(event.peek(), ModelStreamEvent::ReasoningDelta(_)) {""",
-        """        if self.asked || matches!(event.peek(), ModelStreamEvent::ReasoningDelta(_)) || true {""",
+        """            && (self.asked || !matches!(event.peek(), ModelStreamEvent::ReasoningDelta(_)))""",
+        """            && (self.asked || matches!(event.peek(), ModelStreamEvent::ReasoningDelta(_)) || true)""",
     ),
     "ATaskCorrelationIsAWorklistWait": (
         "src/core/event.rs",
@@ -15981,6 +15978,116 @@ pub struct WrappedKey {""",
         """    if unresolvable_identity(error) {""",
         """    if unresolvable_identity(error) && false {""",
     ),
+    "AScriptedToolCallIsFree": (
+        "src/model/fake.rs",
+        "an_answer_is_never_free",
+        "a turn scripted with will_call_tool costs nothing, so a token ceiling over a tool loop is never reached in a test",
+        """        let usage = usage_for(&json!({ "name": &name, "arguments": &arguments }));""",
+        """        let usage = Usage::default();""",
+    ),
+    "AnthropicStreamsPastTheStop": (
+        "src/model/anthropic.rs",
+        "a_stopped_call_ends_where_the_person_stopped_it",
+        "a person's stop is not heard while the call streams, so the answer runs to its end and is paid in full",
+        """            let Some(next) = super::unless_stopped(body.next(), stop).await else {""",
+        """            let Some(next) = super::unless_stopped(body.next(), None).await else {""",
+    ),
+    "ResponsesStreamsPastTheStop": (
+        "src/model/openai.rs",
+        "a_stopped_call_ends_where_the_person_stopped_it",
+        "a person's stop is not heard while the call streams, so the answer runs to its end and is paid in full",
+        """            let Some(next) = super::unless_stopped(body.next(), stop).await else {""",
+        """            let Some(next) = super::unless_stopped(body.next(), None).await else {""",
+    ),
+    "ChatCompletionsStreamsPastTheStop": (
+        "src/model/chat_completions.rs",
+        "a_stopped_call_ends_where_the_person_stopped_it",
+        "a person's stop is not heard while the call streams, so the answer runs to its end and is paid in full",
+        """            let Some(next) = super::unless_stopped(body.next(), stop).await else {""",
+        """            let Some(next) = super::unless_stopped(body.next(), None).await else {""",
+    ),
+    "GeminiStreamsPastTheStop": (
+        "src/model/gemini.rs",
+        "a_stopped_call_ends_where_the_person_stopped_it",
+        "a person's stop is not heard while the call streams, so the answer runs to its end and is paid in full",
+        """            let Some(next) = super::unless_stopped(body.next(), stop).await else {""",
+        """            let Some(next) = super::unless_stopped(body.next(), None).await else {""",
+    ),
+    "AStoppedCallKeepsNoText": (
+        "src/model/mod.rs",
+        "a_stopped_call_ends_where_the_person_stopped_it",
+        "a stopped call is recorded without the words the person already saw, so the journal and the screen disagree",
+        """        if completion.stopped""",
+        """        if false && completion.stopped""",
+    ),
+    "TheFakeStreamsPastTheStop": (
+        "src/model/fake.rs",
+        "a_stopped_call_is_recorded_and_replays",
+        "the fake ignores a stop, so no offline test can reach the stopped path an embedder builds on",
+        """                if request.stop.is_some_and(crate::model::Stop::is_stopped) {""",
+        """                if false && request.stop.is_some_and(crate::model::Stop::is_stopped) {""",
+    ),
+    "TheRecordedFailureKeepsItsFrame": (
+        "src/runtime/ctx.rs",
+        "a_failure_is_recorded_in_its_own_words",
+        "the journal records the effect layer's sentence about a failure, so an embedder strips 'effect refused: ' to show a person the driver's words",
+        """                            error: e.message(),""",
+        """                            error: e.to_string(),""",
+    ),
+    "TheLiveReasonKeepsItsFrame": (
+        "src/runtime/ctx.rs",
+        "a_failure_is_recorded_in_its_own_words",
+        "the live run's reason wraps the failure in the effect layer's frame and its replay's does not, so one run reads two ways",
+        """            &failure.message(),""",
+        """            &failure.to_string(),""",
+    ),
+    "ARefusalMessageIsItsDisplay": (
+        "src/core/error.rs",
+        "a_failure_message_keeps_only_the_facts_it_carries",
+        "a refusal's message keeps the 'effect refused: ' frame the record already states in its fields",
+        """            Self::Refused { detail, .. } | Self::Metered { detail, .. } => detail.clone(),""",
+        """            Self::Refused { .. } | Self::Metered { .. } => self.to_string(),""",
+    ),
+    "ARefusalForgetsItsCeiling": (
+        "src/runtime/ctx.rs",
+        "a_token_refusal_names_its_ceiling_on_replay",
+        "a budget refusal is recorded without its ceiling, so a person is told a run was exhausted and not which setting to raise",
+        """                ceiling: exceeded.ceiling().map(|c| c.as_str().to_owned()),""",
+        """                ceiling: None,""",
+    ),
+    "TheUsageIsADebugDump": (
+        "src/runtime/ctx.rs",
+        "a_token_refusal_names_its_ceiling_on_replay",
+        "a budget refusal records the consumption as a Rust Debug struct, which is what a person is shown",
+        """                used: self.budget().to_string(),
+                ceiling: exceeded.ceiling().map(|c| c.as_str().to_owned()),""",
+        """                used: format!("{:?}", self.budget()),
+                ceiling: exceeded.ceiling().map(|c| c.as_str().to_owned()),""",
+    ),
+    "TheReplayDropsTheCeiling": (
+        "src/journal/replay.rs",
+        "a_token_refusal_names_its_ceiling_on_replay",
+        "a refusal read back from the journal names no ceiling though the record does",
+        """            ceiling: ceiling.and_then(crate::core::Ceiling::parse),""",
+        """            ceiling: ceiling.and(None),""",
+    ),
+    "TheOutermostCredentialErrorDecides": (
+        "src/model/bedrock.rs",
+        "a_session_a_person_must_renew_refuses_the_account",
+        "a profile wraps its base provider's error in a ProviderError, so an expired `aws login` behind a real profile is retried as an outage",
+        """        } else if verdict.is_some() && inner.is::<TokenError>() {""",
+        """        } else if verdict.is_some() && inner.is::<TokenError>() {
+        }
+        if verdict.is_some() {
+            break;""",
+    ),
+    "AnSsoTokenThatCannotBeHadIsAnOutage": (
+        "src/model/bedrock.rs",
+        "a_session_a_person_must_renew_refuses_the_account",
+        "an expired or missing SSO session is retried as an outage and then fails as a run failure, with no renewal named",
+        """        } else if verdict.is_some() && inner.is::<TokenError>() {""",
+        """        } else if verdict.is_some() && inner.is::<TokenError>() && false {""",
+    ),
     "BedrockDetailIsTheSdkDump": (
         "src/model/bedrock.rs",
         "a_refused_credential_refuses_the_account",
@@ -16267,7 +16374,8 @@ def check() -> int:
 
 
 
-def _locate(test: str) -> tuple[str | None, set[str] | None] | None:
+@functools.lru_cache(maxsize=None)
+def _locate(test: str) -> tuple[str | None, frozenset[str] | None] | None:
     """Where `test` lives, and which features it needs to build and exist.
 
     Returns `(target, features)`, with `target = None` for a unit test in the
@@ -16304,7 +16412,7 @@ def _locate(test: str) -> tuple[str | None, set[str] | None] | None:
         feats.update(
             re.findall(r'feature\s*=\s*"([a-z0-9-]+)"', src[max(0, at - 400) : at])
         )
-        return target, feats
+        return target, frozenset(feats)
 
 
     # A unit test inside a binary. Named before the library sweep below,
@@ -16330,30 +16438,29 @@ def _locate(test: str) -> tuple[str | None, set[str] | None] | None:
     return None
 
 
-# Seconds one mutation costs, by the test target its check builds, measured warm
-# on one machine. `None` is a library unit test, which runs `--all-features
-# --lib` and therefore pays for the largest build this crate has.
+# Seconds one mutation costs, by the test target its check builds: CI minutes
+# per shard over the rows each ran, on the hosted runners the sweep uses. The
+# first build under a feature set is charged apart, in `_BUILD_SECONDS`, so a
+# row here is the incremental rebuild plus its one test.
 #
-# **These only affect balance.** A stale number makes a shard uneven, which is
-# what an unweighted split guarantees anyway; it can never make a sweep skip a
-# mutation or reach a wrong verdict. Re-measure with
-# `/usr/bin/time -p python3 tools/mutants.py <name> --verify` on one mutation
-# per target, warm.
-#
-# The spread is the reason this table exists at all: an equal *count* of
-# mutations is not an equal amount of work, and splitting ten ways by count put
-# every library unit test in two shards that then ran three times as long as the
-# rest — a matrix finishes when its slowest job does.
+# **These only affect balance.** A stale number makes a shard uneven; it can
+# never make a sweep skip a mutation or reach a wrong verdict. Re-measure from a
+# green run's job durations divided by each shard's rows per target.
 _SECONDS_BY_TARGET: dict[str | None, int] = {
-    None: 160,  # --all-features --lib
-    "bin:agentplane": 160,  # --all-features --bin: the same library build
-    "wire": 54,
-    "guards": 45,
-    "process": 45,
-    "engine": 27,
-    "trust": 19,
+    None: 13,  # --all-features --lib
+    "bin:agentplane": 10,
+    "wire": 19,
+    "guards": 19,
+    "process": 13,
+    "engine": 13,
+    "trust": 17,
     "live": 30,
 }
+
+# What a shard pays to enter a feature set: the dependency graph rebuilt under
+# it. Of the same order as a shard's whole budget, so a shard that enters four
+# sets does four times the building of one that enters one.
+_BUILD_SECONDS = 660
 
 
 @functools.lru_cache(maxsize=None)
@@ -16383,9 +16490,9 @@ def _shard(rows: list, shard: int, total: int) -> list:
     builds under and the point of a slice is to stay inside as few of those
     groups as possible.
 
-    Split by **cost rather than by count**. A mutation checked by a library unit
-    test costs six times one checked in the `trust` binary, so ten equal counts
-    are not ten equal jobs; the slices below are equal in seconds and therefore
+    Split by **cost rather than by count**: each row's own cost, and each
+    first row of a feature set the build that set needs. Ten equal counts are
+    not ten equal jobs; the slices below are equal in seconds and therefore
     unequal in length, which is the right way round when what is being divided
     is time.
 
@@ -16393,7 +16500,11 @@ def _shard(rows: list, shard: int, total: int) -> list:
     mutation would leave it in no shard at all, and a sweep that skipped a
     guarantee prints the same summary as one that checked it.
     """
-    weights = [_cost(row) for row in rows]
+    keys = [_build_key(MUTANTS[row if isinstance(row, str) else row[0]][1]) for row in rows]
+    weights = [
+        _cost(row) + (_BUILD_SECONDS if i == 0 or keys[i - 1] != key else 0)
+        for i, (row, key) in enumerate(zip(rows, keys))
+    ]
     budget = sum(weights)
     lo = hi = acc = 0
     for i, w in enumerate(weights):
@@ -16471,8 +16582,7 @@ def verify(name: str) -> int:
         features = "all"
     else:
         # `redb` and `testkit` are what a test needs to stand up a plane at all.
-        feats |= {"redb", "testkit"}
-        features = ",".join(sorted(feats))
+        features = ",".join(sorted(feats | {"redb", "testkit"}))
         selector = ["--features", features, "--test", target]
 
     # The cost model here is one library rebuild per mutation, and two ambient

@@ -158,6 +158,7 @@ async fn redirect(
 /// One request shape for all four drivers.
 fn request<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::Request<'a> {
     agentplane::model::Request {
+        stop: None,
         model,
         prompt,
         max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -289,6 +290,7 @@ async fn model_drivers_bound_a_provider_that_never_responds() {
     let openai = OpenAi::new("k").unwrap().base(url.clone()).timeout(timeout);
     let openai_error = openai
         .complete(agentplane::model::Request {
+            stop: None,
             model: &openai_model,
             prompt: &prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -312,6 +314,7 @@ async fn model_drivers_bound_a_provider_that_never_responds() {
     let anthropic = Anthropic::new("k").unwrap().base(url).timeout(timeout);
     let anthropic_error = anthropic
         .complete(agentplane::model::Request {
+            stop: None,
             model: &anthropic_model,
             prompt: &prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -349,6 +352,7 @@ async fn reasoning_effort_uses_each_providers_native_request_shape() {
     let id = ModelId::new("openai", "gpt-5.6");
     openai
         .complete(agentplane::model::Request {
+            stop: None,
             model: &id,
             prompt: &prompt,
             max_output_tokens: 4096,
@@ -388,6 +392,7 @@ async fn reasoning_effort_uses_each_providers_native_request_shape() {
     });
     anthropic
         .complete(agentplane::model::Request {
+            stop: None,
             model: &id,
             prompt: &prompt,
             max_output_tokens: 4096,
@@ -1255,6 +1260,7 @@ async fn an_empty_answer_is_unusable_and_billed() {
 /// A request with no schema — the common case in these tests.
 fn ask<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::Request<'a> {
     agentplane::model::Request {
+        stop: None,
         model,
         prompt,
         max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -1500,6 +1506,7 @@ async fn anthropic_refuses_reasoning_with_a_forced_tool_before_dispatch() {
     let sch = json!({ "type": "object" });
     let error = provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &model(),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -1684,6 +1691,7 @@ async fn a_schema_is_sent_as_a_strict_constraint() {
 
     let out = provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &gpt(),
             prompt: &json!("how much"),
             max_output_tokens: 77,
@@ -1731,6 +1739,7 @@ async fn the_anthropic_driver_sends_a_schema_too() {
 
     let out = provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &model(),
             prompt: &json!("how much"),
             max_output_tokens: 88,
@@ -1775,6 +1784,7 @@ async fn an_unparseable_structured_answer_is_billed_and_loud() {
 
     let err = provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &gpt(),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -1856,6 +1866,7 @@ async fn anthropic_can_emulate_a_schema_with_a_forced_tool() {
 
     let out = provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &model(),
             prompt: &json!("how much"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -1916,6 +1927,7 @@ async fn openai_can_emulate_a_schema_with_a_forced_tool() {
 
     let out = provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &gpt(),
             prompt: &json!("how much"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -1970,6 +1982,7 @@ async fn the_schema_mode_is_chosen_per_model() {
     // The overridden model gets the fallback...
     provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &ModelId::new("anthropic", "claude-legacy-1"),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -2009,6 +2022,7 @@ async fn the_schema_mode_is_chosen_per_model() {
         .structured_via_for("claude-legacy-1", SchemaMode::ForcedTool);
     provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &ModelId::new("anthropic", "claude-opus-4-5"),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -2057,6 +2071,7 @@ async fn a_model_that_ignores_the_forced_tool_is_caught() {
 
     let err = provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &model(),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -2123,6 +2138,7 @@ async fn an_ignored_forced_tool_is_caught_even_by_a_schema_that_permits_null() {
 
     let err = provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &model(),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -2184,6 +2200,7 @@ async fn an_incompatible_schema_is_refused_with_the_reason() {
         let provider = OpenAi::new("k").unwrap().base("http://127.0.0.1:1");
         let err = provider
             .complete(agentplane::model::Request {
+                stop: None,
                 model: &gpt(),
                 prompt: &json!("x"),
                 max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -2232,6 +2249,7 @@ async fn a_conformant_schema_is_not_rewritten() {
 
     provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &gpt(),
             prompt: &json!("x"),
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -2924,6 +2942,7 @@ data: {\"type\":\"message_stop\"}
     let sch = json!({"type": "object"});
     let out = provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &model(),
             prompt: &prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -2974,6 +2993,7 @@ data: {\"type\":\"message_stop\"}
     let sch = json!({"type": "object"});
     let err = provider
         .complete(agentplane::model::Request {
+            stop: None,
             model: &model(),
             prompt: &prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -3438,6 +3458,7 @@ fn a_retry_keeps_the_peers_duplicate_detection_key() {
 
 fn cc_request<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::Request<'a> {
     agentplane::model::Request {
+        stop: None,
         model,
         prompt,
         max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -4103,6 +4124,7 @@ fn gemini_request<'a>(
     continuation: Option<&'a ProviderContinuation>,
 ) -> Request<'a> {
     Request {
+        stop: None,
         model,
         prompt,
         max_output_tokens: 1024,
@@ -5749,6 +5771,7 @@ async fn a_schema_and_a_tool_calling_turn_coexist_on_every_driver() {
     let provider = Anthropic::new("k").unwrap().base(url).buffered();
     let tools = [tool()];
     let mut request = Request {
+        stop: None,
         model: &model(),
         prompt: &json!("go"),
         max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -5829,6 +5852,7 @@ async fn a_schema_and_a_tool_calling_turn_coexist_on_the_compatible_wires() {
         .structured_via(SchemaMode::Native);
     let cc_model = ModelId::new("chat-completions", "m");
     let mut request = Request {
+        stop: None,
         model: &cc_model,
         prompt: &json!("go"),
         max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -6050,5 +6074,112 @@ async fn every_driver_sends_its_request_body_in_canonical_form() {
             String::from_utf8(agentplane::core::canon::value_bytes(&parsed)).unwrap(),
             "a body that is not canonical depends on the build's features"
         );
+    }
+}
+
+/// Serves `events` as a 200 event stream to any request, then holds the
+/// connection open: a driver that does not stop waits forever.
+async fn serve_stalling(events: &'static str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = vec![0_u8; 64 * 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{events}"
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Presses the stop on the first text the call streams.
+#[derive(Debug)]
+struct PressesStop(agentplane::model::Stop);
+
+impl agentplane::model::ModelStreamObserver for PressesStop {
+    fn event(&self, event: agentplane::core::Tainted<agentplane::model::ModelStreamEvent>) {
+        if matches!(
+            event.peek(),
+            agentplane::model::ModelStreamEvent::TextDelta(_)
+        ) {
+            self.0.stop();
+        }
+    }
+}
+
+/// **A person's stop ends a streaming call where it is**, on every SSE wire.
+/// Each server sends one text delta and then holds the connection: the call
+/// answers a stopped completion at once, with no tool calls and no
+/// continuation, billed what the wire had reported — Anthropic's
+/// `message_start` and Gemini's per-chunk usage; Responses and Chat
+/// Completions report usage only at the end.
+#[tokio::test]
+async fn a_stopped_call_ends_where_the_person_stopped_it() {
+    use agentplane::core::Effect;
+
+    const ANTHROPIC: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"claude-x\",\"usage\":{\"input_tokens\":12,\"output_tokens\":1}}}\n\n\
+        event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+        event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}\n\n";
+    const RESPONSES: &str = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"Hel\"}\n\n";
+    const CHAT: &str = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+    const GEMINI: &str = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hel\"}]}}],\"usageMetadata\":{\"promptTokenCount\":12,\"candidatesTokenCount\":1}}\n\n";
+
+    let drivers: [(&str, Arc<dyn ModelProvider>, u64); 4] = [
+        (
+            "anthropic",
+            Arc::new(
+                Anthropic::new("k")
+                    .unwrap()
+                    .base(serve_stalling(ANTHROPIC).await),
+            ),
+            12,
+        ),
+        (
+            "openai",
+            Arc::new(
+                OpenAi::new("k")
+                    .unwrap()
+                    .base(serve_stalling(RESPONSES).await),
+            ),
+            0,
+        ),
+        (
+            "chat",
+            Arc::new(ChatCompletions::new(serve_stalling(CHAT).await).unwrap()),
+            0,
+        ),
+        (
+            "gemini",
+            Arc::new(Gemini::new("k").unwrap().base(serve_stalling(GEMINI).await)),
+            12,
+        ),
+    ];
+    for (name, provider, input_tokens) in drivers {
+        let stop = agentplane::model::Stop::new();
+        let call = ModelCall::new(provider, ModelId::new(name, "m"), json!("hello"))
+            .streaming_to(Arc::new(PressesStop(stop.clone())))
+            .stopped_by(stop);
+        let completion = tokio::time::timeout(std::time::Duration::from_secs(5), call.perform())
+            .await
+            .unwrap_or_else(|_| panic!("{name} streamed on past the stop"))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert!(completion.stopped, "{name}: {completion:?}");
+        assert_eq!(
+            completion.text, "Hel",
+            "{name} kept other text than it streamed"
+        );
+        assert!(completion.tool_calls.is_empty() && completion.continuation.is_none());
+        assert_eq!(completion.usage.input_tokens, input_tokens, "{name}");
     }
 }

@@ -603,6 +603,9 @@ pub enum BudgetExceeded {
         #[serde(rename = "recorded_limit")]
         limit: String,
         used: String,
+        /// The ceiling the record names; `None` for one an older build wrote.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ceiling: Option<Ceiling>,
     },
 
     #[error(
@@ -657,6 +660,26 @@ pub enum BudgetExceeded {
     },
 }
 
+/// What a run had consumed, for a person: `3 step(s), 5 effect(s), 1200
+/// token(s), 0 minor unit(s), 4s elapsed`, with refusals and egress when there
+/// were any.
+impl std::fmt::Display for Consumed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} step(s), {} effect(s), {} token(s), {} minor unit(s), {}s elapsed",
+            self.steps, self.effects, self.spend.tokens, self.spend.minor_units, self.elapsed_secs
+        )?;
+        if self.denials > 0 {
+            write!(f, ", {} refusal(s)", self.denials)?;
+        }
+        if self.egress_bytes > 0 {
+            write!(f, ", {} byte(s) sent", self.egress_bytes)?;
+        }
+        Ok(())
+    }
+}
+
 impl BudgetExceeded {
     /// Which limit was hit, for a metric label.
     ///
@@ -666,19 +689,90 @@ impl BudgetExceeded {
     /// `runtime::metrics`.
     #[must_use]
     pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Steps { .. } => "steps",
-            Self::Effects { .. } => "effects",
-            Self::Replans { .. } => "replans",
-            Self::Denials { .. } => "denials",
-            Self::Recorded { .. } => "recorded",
-            Self::Tokens { .. } => "tokens",
-            Self::Money { .. } => "money",
-            Self::Wallclock { .. } => "wallclock",
-            Self::Egress { .. } => "egress_bytes",
-            Self::Rate { .. } => "rate",
+        match self.live_ceiling() {
+            Some(ceiling) => ceiling.as_str(),
+            None => "recorded",
         }
     }
+
+    /// Which ceiling refused — the setting a person raises — whether the
+    /// refusal is live or read back. `None` only for a record an older build
+    /// wrote, which named none.
+    #[must_use]
+    pub const fn ceiling(&self) -> Option<Ceiling> {
+        match self {
+            Self::Recorded { ceiling, .. } => *ceiling,
+            _ => self.live_ceiling(),
+        }
+    }
+
+    const fn live_ceiling(&self) -> Option<Ceiling> {
+        Some(match self {
+            Self::Steps { .. } => Ceiling::Steps,
+            Self::Effects { .. } => Ceiling::Effects,
+            Self::Replans { .. } => Ceiling::Replans,
+            Self::Denials { .. } => Ceiling::Denials,
+            Self::Recorded { .. } => return None,
+            Self::Tokens { .. } => Ceiling::Tokens,
+            Self::Money { .. } => Ceiling::Money,
+            Self::Wallclock { .. } => Ceiling::Wallclock,
+            Self::Egress { .. } => Ceiling::EgressBytes,
+            Self::Rate { .. } => Ceiling::Rate,
+        })
+    }
+}
+
+/// A budget ceiling, as a refusal names it on the record and in its metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Ceiling {
+    Steps,
+    Effects,
+    Replans,
+    Denials,
+    Tokens,
+    Money,
+    Wallclock,
+    EgressBytes,
+    Rate,
+}
+
+impl Ceiling {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Steps => "steps",
+            Self::Effects => "effects",
+            Self::Replans => "replans",
+            Self::Denials => "denials",
+            Self::Tokens => "tokens",
+            Self::Money => "money",
+            Self::Wallclock => "wallclock",
+            Self::EgressBytes => "egress_bytes",
+            Self::Rate => "rate",
+        }
+    }
+
+    /// The inverse of [`as_str`](Self::as_str), written over
+    /// [`ALL`](Self::ALL) for the reason [`CaseStatus::parse`] is.
+    ///
+    /// [`CaseStatus::parse`]: crate::core::CaseStatus::parse
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+
+    pub const ALL: [Self; 9] = [
+        Self::Steps,
+        Self::Effects,
+        Self::Replans,
+        Self::Denials,
+        Self::Tokens,
+        Self::Money,
+        Self::Wallclock,
+        Self::EgressBytes,
+        Self::Rate,
+    ];
 }
 
 /// Tracks a run's consumption against its budget.
@@ -1218,8 +1312,17 @@ mod tests {
                 BudgetExceeded::Recorded {
                     limit: "effect budget exhausted".to_owned(),
                     used: "3 performed".to_owned(),
+                    ceiling: None,
                 },
                 r#"{"limit":"recorded","recorded_limit":"effect budget exhausted","used":"3 performed"}"#,
+            ),
+            (
+                BudgetExceeded::Recorded {
+                    limit: "egress budget exhausted".to_owned(),
+                    used: "3 performed".to_owned(),
+                    ceiling: Some(Ceiling::EgressBytes),
+                },
+                r#"{"limit":"recorded","recorded_limit":"egress budget exhausted","used":"3 performed","ceiling":"egress_bytes"}"#,
             ),
             (
                 BudgetExceeded::Tokens {

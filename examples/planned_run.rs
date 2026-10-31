@@ -132,6 +132,7 @@ fn call(tool: &str, args: &Value) -> Value {
 /// A scripted planner answer: the structured plan, nothing else.
 fn plans(structured: Value) -> Completion {
     Completion {
+        stopped: false,
         model: None,
         text: String::new(),
         structured: Some(structured),

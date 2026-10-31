@@ -2538,6 +2538,7 @@ spec:
 
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(agentplane::model::Completion {
+        stopped: false,
         model: None,
         text: String::new(),
         structured: Some(json!({

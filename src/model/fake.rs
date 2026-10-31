@@ -141,6 +141,11 @@ impl FakeProvider {
     /// Takes `&self` rather than `self` so a test can arrange a provider it has
     /// already handed to a runtime — which is the usual shape, because the
     /// runtime wants an `Arc` at construction.
+    ///
+    /// A turn none of the `will_*` shorthands spells — a tool call beside
+    /// text, commentary or reasoning — is a `Completion { .., ..Completion::default() }`
+    /// naming only what it sets, so a field added later breaks no test. Its
+    /// `usage` is the author's to state.
     pub fn will_answer(&self, completion: Completion) -> &Self {
         self.scripted
             .lock()
@@ -196,17 +201,10 @@ impl FakeProvider {
         let text = text.into();
         let usage = usage_for(&json!(&text));
         self.will_answer(Completion {
-            tool_calls: Vec::new(),
             text,
-            model: None,
             usage,
             stop_reason: Some("end_turn".to_owned()),
-            truncated: false,
-            structured: None,
-            continuation: None,
-            reasoning: None,
-            commentary: None,
-            compacted: None,
+            ..Completion::default()
         })
     }
 
@@ -223,6 +221,7 @@ impl FakeProvider {
         let text = text.into();
         let usage = usage_for(&json!(&text));
         self.will_answer(Completion {
+            stopped: false,
             tool_calls: Vec::new(),
             text,
             model: None,
@@ -250,20 +249,15 @@ impl FakeProvider {
         let usage = usage_for(&value);
         self.will_answer(Completion {
             tool_calls: Vec::new(),
-            text: String::new(),
-            model: None,
             usage,
             stop_reason: Some("end_turn".to_owned()),
-            truncated: false,
             structured: Some(value),
-            continuation: None,
-            reasoning: None,
-            commentary: None,
-            compacted: None,
+            ..Completion::default()
         })
     }
 
-    /// Queue a turn in which the model asks for a tool.
+    /// Queue a turn in which the model asks for a tool, with usage derived
+    /// from the call.
     ///
     /// The id is the one a real provider would issue and the loop must echo
     /// back, so a test exercises the pairing rather than assuming it.
@@ -273,22 +267,17 @@ impl FakeProvider {
         name: impl Into<String>,
         arguments: serde_json::Value,
     ) -> &Self {
+        let name = name.into();
+        let usage = usage_for(&json!({ "name": &name, "arguments": &arguments }));
         self.will_answer(Completion {
             tool_calls: vec![crate::model::ToolCall {
                 id: id.into(),
-                name: name.into(),
+                name,
                 arguments,
             }],
-            text: String::new(),
-            model: None,
-            usage: Usage::default(),
+            usage,
             stop_reason: Some("tool_use".to_owned()),
-            truncated: false,
-            structured: None,
-            continuation: None,
-            reasoning: None,
-            commentary: None,
-            compacted: None,
+            ..Completion::default()
         })
     }
 
@@ -423,6 +412,7 @@ fn echo(request: &Request<'_>) -> Completion {
     // reached, and the run would still succeed.
     if let (Some(tool), []) = (request.tools.first(), request.exchanges) {
         return Completion {
+            stopped: false,
             tool_calls: vec![crate::model::ToolCall {
                 id: "fake-call-1".to_owned(),
                 name: tool.name.clone(),
@@ -449,6 +439,7 @@ fn echo(request: &Request<'_>) -> Completion {
         Some(schema) => {
             let value = sample(schema);
             Completion {
+                stopped: false,
                 tool_calls: Vec::new(),
                 text: value.to_string(),
                 model: None,
@@ -463,6 +454,7 @@ fn echo(request: &Request<'_>) -> Completion {
             }
         }
         None => Completion {
+            stopped: false,
             tool_calls: Vec::new(),
             text: format!("fake answer to {}", request.prompt),
             model: None,
@@ -598,7 +590,17 @@ impl ModelProvider for FakeProvider {
                     label.clone(),
                 ));
             }
+            let mut streamed = String::new();
             for delta in split_for_stream(&completion.text) {
+                // Checked between deltas, where a real driver checks it
+                // between chunks: what streamed is what the call keeps.
+                if request.stop.is_some_and(crate::model::Stop::is_stopped) {
+                    return Ok(Completion::stopped(Usage {
+                        input_tokens: usage_for(request.prompt).input_tokens,
+                        ..usage_for(&json!(streamed))
+                    }));
+                }
+                streamed.push_str(&delta);
                 observer.event(crate::core::Tainted::with_label(
                     ModelStreamEvent::TextDelta(delta),
                     label.clone(),
@@ -734,6 +736,7 @@ mod tests {
         let prompt: &'static Value = Box::leak(Box::new(json!({"q": "what is the balance"})));
         let model: &'static ModelId = Box::leak(Box::new(model()));
         Request {
+            stop: None,
             model,
             prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -831,6 +834,7 @@ mod tests {
             let leaked: &'static Value = Box::leak(Box::new(prompt));
             let model: &'static ModelId = Box::leak(Box::new(model()));
             let request = Request {
+                stop: None,
                 model,
                 prompt: leaked,
                 max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -864,6 +868,7 @@ mod tests {
                          "data": "iVBORw0KGgo="}}]}]})));
         let model: &'static ModelId = Box::leak(Box::new(model()));
         let request = Request {
+            stop: None,
             model,
             prompt: inline,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -899,11 +904,18 @@ mod tests {
     #[tokio::test]
     async fn an_answer_is_never_free() {
         let p = FakeProvider::new();
-        let c = p.complete(ask(None)).await.unwrap();
-        assert!(
-            c.usage.spend().tokens > 0,
-            "a fake reporting zero usage makes every ceiling test vacuous"
-        );
+        let echo = p.complete(ask(None)).await.unwrap();
+        assert!(echo.usage.spend().tokens > 0, "a free echo");
+        p.will_say("scripted")
+            .will_structure(json!({ "ok": true }))
+            .will_call_tool("call-1", "lookup", json!({ "q": "x" }));
+        for answer in ["said answer", "structured answer", "tool call"] {
+            let c = p.complete(ask(None)).await.unwrap();
+            assert!(
+                c.usage.spend().tokens > 0,
+                "a fake reporting zero usage for its {answer} makes every ceiling test vacuous"
+            );
+        }
     }
 
     /// Longer prompt, more tokens — so a test can drive a run *over* a ceiling
@@ -916,6 +928,7 @@ mod tests {
         let m = model();
         let a = p
             .complete(Request {
+                stop: None,
                 model: &m,
                 prompt: short,
                 max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
@@ -933,6 +946,7 @@ mod tests {
             .unwrap();
         let b = p
             .complete(Request {
+                stop: None,
                 model: &m,
                 prompt: long,
                 max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,

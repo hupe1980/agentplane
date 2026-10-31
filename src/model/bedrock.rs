@@ -727,6 +727,7 @@ impl Bedrock {
         reasoning_config: Option<Document>,
         schema: Option<&Value>,
         observer: Option<(&dyn super::ModelStreamObserver, &crate::core::Label)>,
+        stop: Option<&super::Stop>,
     ) -> Result<Completion, ModelError> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let mut operation = self
@@ -773,8 +774,12 @@ impl Bedrock {
         let mut stream = output.stream;
         let mut accumulator = super::bedrock_stream::Accumulator::new();
         loop {
-            let event = tokio::time::timeout_at(deadline, stream.recv())
-                .await
+            let next = tokio::time::timeout_at(deadline, stream.recv());
+            // What the wire had billed when a person stopped the call.
+            let Some(next) = super::unless_stopped(next, stop).await else {
+                return Ok(Completion::stopped(accumulator.usage().unwrap_or_default()));
+            };
+            let event = next
                 .map_err(|_| severed_stream(model, &accumulator, "the request deadline elapsed"))?
                 .map_err(|error| {
                     let detail = error.to_string();
@@ -1004,6 +1009,7 @@ impl Bedrock {
             )
         });
         Ok(Completion {
+            stopped: false,
             text,
             tool_calls: calls,
             // `Converse` names no model on the way back — the request's
@@ -1073,6 +1079,7 @@ impl ModelProvider for Bedrock {
             continuation,
             compaction,
             stream,
+            stop,
         } = request;
         super::refuse_provider_side_media(prompt, model)?;
         super::refuse_in_thread_instructions(prompt, model)?;
@@ -1102,10 +1109,13 @@ impl ModelProvider for Bedrock {
                     reasoning_config,
                     schema,
                     stream,
+                    stop,
                 )
                 .await?;
             let mut completion = streamed;
-            accumulate_continuation(&mut completion, continuation, exchanges, told);
+            if !completion.stopped {
+                accumulate_continuation(&mut completion, continuation, exchanges, told);
+            }
             return Ok(completion);
         }
         let mut operation = self
@@ -1376,25 +1386,33 @@ where
 /// produce, which refuses the account before anything reached Bedrock.
 ///
 /// `InvalidConfiguration`, and `Unhandled`, which is where aws-config puts an
-/// expired `aws login` token and an unreadable token file: a person has to
-/// sign in or fix the profile. Not the rest, which an outage can cause and a
-/// retry can fix: `ProviderTimedOut`, `ProviderError` (an STS 503, a token
-/// refresh that could not connect — and an expired SSO session, which
-/// aws-config reports the same way) and `CredentialsNotLoaded` (which an
-/// unreachable instance metadata service also ends in).
+/// expired or missing `aws login` token: a person has to sign in or fix the
+/// profile. So is an SSO token that could not be had — expired, missing or
+/// unreadable — which arrives as a `TokenError`: the token stage reads only
+/// the local cache and swallows a refresh that could not connect. Not the
+/// rest, which an outage can cause and a retry can fix: `ProviderTimedOut`,
+/// `ProviderError` (an STS 503, a role-credentials call that could not
+/// connect) and `CredentialsNotLoaded` (which an unreachable instance
+/// metadata service also ends in).
+///
+/// The innermost credential error decides: a profile wraps its base
+/// provider's error in a `ProviderError` of its own.
 fn unresolvable_identity(error: &(dyn std::error::Error + 'static)) -> bool {
-    use aws_credential_types::provider::error::CredentialsError;
+    use aws_credential_types::provider::error::{CredentialsError, TokenError};
+    let mut verdict = None;
     let mut cause = Some(error);
     while let Some(inner) = cause {
         if let Some(credentials) = inner.downcast_ref::<CredentialsError>() {
-            return matches!(
+            verdict = Some(matches!(
                 credentials,
                 CredentialsError::InvalidConfiguration(_) | CredentialsError::Unhandled(_)
-            );
+            ));
+        } else if verdict.is_some() && inner.is::<TokenError>() {
+            return true;
         }
         cause = inner.source();
     }
-    false
+    verdict.unwrap_or(false)
 }
 
 /// The service codes that refuse the **account**: the credential is missing a
@@ -2161,6 +2179,7 @@ mod tests {
         let prompt = json!("hello");
         driver
             .complete(Request {
+                stop: None,
                 model: &model,
                 prompt: &prompt,
                 max_output_tokens: 64,
@@ -2273,6 +2292,107 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The profile a child process resolves, and the verdict it must reach.
+    const PROFILE_CASE: &str = "AGENTPLANE_BEDROCK_PROFILE_CASE";
+
+    /// **A session a person must renew refuses the account through a real
+    /// profile.** The providers are aws-config's own, reading files: an SSO
+    /// session whose token expired or was never cached, and an `aws login`
+    /// session with no token, each refuse the account before anything is
+    /// sent. A live SSO token whose role-credentials call cannot connect is
+    /// an outage. Each case resolves in a child process, because aws-config
+    /// finds its files through the environment.
+    #[test]
+    fn a_session_a_person_must_renew_refuses_the_account() {
+        use std::fmt::Write as _;
+        let home =
+            std::env::temp_dir().join(format!("agentplane-aws-{}", crate::core::RunId::generate()));
+        let cache = home.join(".aws/sso/cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let config = home.join(".aws/config");
+        let mut profiles = String::new();
+        for (profile, session) in [
+            ("sso-expired", "ap"),
+            ("sso-missing", "gone"),
+            ("sso-live", "live"),
+        ] {
+            write!(
+                profiles,
+                "[profile {profile}]\nsso_session = {session}\nsso_account_id = 111122223333\n\
+                 sso_role_name = Runner\nregion = eu-west-1\n\n[sso-session {session}]\n\
+                 sso_start_url = https://example.awsapps.com/start\nsso_region = eu-west-1\n\n"
+            )
+            .unwrap();
+        }
+        profiles.push_str(
+            "[profile login-missing]\nlogin_session = arn:aws:iam::111122223333:user/Runner\n\
+             region = eu-west-1\n",
+        );
+        std::fs::write(&config, profiles).unwrap();
+        // aws-config names a cached token by the SHA-1 of its session name.
+        for (digest, expires) in [
+            (
+                "ac78b022715c5b8357b4dca8045e8463b4de2124",
+                "2020-01-01T00:00:00Z",
+            ),
+            (
+                "98aadb37083eddd855c27feccb15dc8c5b127fd0",
+                "2099-01-01T00:00:00Z",
+            ),
+        ] {
+            std::fs::write(
+                cache.join(format!("{digest}.json")),
+                format!(
+                    r#"{{"accessToken":"token","expiresAt":"{expires}","region":"eu-west-1","startUrl":"https://example.awsapps.com/start"}}"#
+                ),
+            )
+            .unwrap();
+        }
+        for (profile, verdict) in [
+            ("sso-expired", "account"),
+            ("sso-missing", "account"),
+            ("login-missing", "account"),
+            ("sso-live", "outage"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "model::bedrock::tests::a_profile_resolved_in_a_child",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(PROFILE_CASE, verdict)
+                .env("HOME", &home)
+                .env("AWS_CONFIG_FILE", &config)
+                .env("AWS_SHARED_CREDENTIALS_FILE", home.join("none"))
+                .env("AWS_PROFILE", profile)
+                .env("AWS_EC2_METADATA_DISABLED", "true")
+                // Nothing listens here: whatever would be sent fails to connect.
+                .env("AWS_ENDPOINT_URL", "http://127.0.0.1:9")
+                .output()
+                .expect("the child process");
+            assert!(
+                output.status.success(),
+                "{profile} did not read as {verdict}:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "the child half of a_session_a_person_must_renew_refuses_the_account"]
+    async fn a_profile_resolved_in_a_child() {
+        let Ok(verdict) = std::env::var(PROFILE_CASE) else {
+            return;
+        };
+        let driver = Bedrock::from_env("eu-west-1").await.expect("a driver");
+        let refused = refusal_of(&driver.buffered()).await;
+        let account = matches!(refused, ModelError::Refused { account: true, .. });
+        assert_eq!(account, verdict == "account", "{refused:?}");
     }
 
     fn stub_driver() -> Bedrock {

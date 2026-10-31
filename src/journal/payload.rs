@@ -356,7 +356,11 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         // What a run waits for: a kind and a correlation key, both of which the
         // buffer is asked questions about.
         | K::RunSuspended { reason: _ }
-        | K::BudgetRefused { limit: _, used: _ }
+        | K::BudgetRefused {
+            limit: _,
+            used: _,
+            ceiling: _,
+        }
         | K::BudgetReadmitted { limit: _ }
         // A subject is an identifier an operator typed into a halt and a reason
         // they wrote for the next person; neither is the run's data. Sealing

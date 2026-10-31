@@ -102,7 +102,11 @@ pub enum EffectReplay {
     ///
     /// Distinct from `Failed`: nothing was attempted, and the run stopped
     /// because it was told to rather than because something broke.
-    Refused { limit: String, used: String },
+    Refused {
+        limit: String,
+        used: String,
+        ceiling: Option<crate::core::Ceiling>,
+    },
     /// Policy refused it before it was attempted.
     ///
     /// Distinct from `Refused`, which is a *limit*. Both stop the run without
@@ -144,6 +148,15 @@ struct Attempted {
 }
 
 impl EffectReplay {
+    /// A budget refusal as its record reads; an unfamiliar ceiling is none.
+    fn refused(limit: &str, used: &str, ceiling: Option<&str>) -> Self {
+        Self::Refused {
+            limit: limit.to_owned(),
+            used: used.to_owned(),
+            ceiling: ceiling.and_then(crate::core::Ceiling::parse),
+        }
+    }
+
     /// What this state says the attempt cost so far.
     ///
     /// Zero for the states that describe an attempt nobody made: a refusal, a
@@ -426,14 +439,14 @@ impl StepCursor {
             // A refusal has no preceding `EffectStarted` — the whole point
             // is that nothing was announced — so it pushes its own entry
             // rather than updating one.
-            RecordKind::BudgetRefused { limit, used } => self.unannounced(
-                key,
-                seq,
-                EffectReplay::Refused {
-                    limit: limit.clone(),
-                    used: used.clone(),
-                },
-            ),
+            RecordKind::BudgetRefused {
+                limit,
+                used,
+                ceiling,
+            } => {
+                let refused = EffectReplay::refused(limit, used, ceiling.as_deref());
+                self.unannounced(key, seq, refused);
+            }
             // A re-admission supersedes the refusal it was journaled beside: a
             // resume asked the ledger then in force and was answered yes, so a
             // later replay must read refusal-then-continuation as a decision on
@@ -1199,6 +1212,7 @@ mod tests {
             RecordKind::BudgetRefused {
                 limit: "spend".into(),
                 used: "1".into(),
+                ceiling: None,
             },
         )]);
         let msg = next_asked(

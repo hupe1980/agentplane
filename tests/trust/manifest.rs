@@ -3369,6 +3369,7 @@ spec:
     .expect("a priced role may carry a money ceiling");
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(agentplane::model::Completion {
+        stopped: false,
         text: String::new(),
         model: None,
         tool_calls: vec![agentplane::model::ToolCall {
@@ -4149,6 +4150,7 @@ spec:
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_say("answer");
     provider.will_answer(agentplane::model::Completion {
+        stopped: false,
         model: None,
         text: r#"{"memories":[{"key":"language","content":"German"}]}"#.to_owned(),
         structured: Some(json!({
@@ -4512,6 +4514,7 @@ spec:
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_say("answer");
     provider.will_answer(agentplane::model::Completion {
+        stopped: false,
         model: None,
         text: r#"{"memories":[{"key":"language","content":"German"}]}"#.to_owned(),
         structured: Some(json!({

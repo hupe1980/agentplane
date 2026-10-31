@@ -88,11 +88,11 @@ jobs:
   # them all on disk too, and that many combinations of this crate's graph is
   # about as much space as a runner has.
   #
-  # The slices are equal in **seconds, not in count**. A mutation checked by a
-  # library unit test builds `--all-features --lib` and costs six times one
-  # checked in an integration binary, so ten equal counts are ten very unequal
-  # jobs — and a matrix finishes when its slowest job does. `tools/mutants.py`
-  # carries the measured per-target costs and cuts the sorted list on them.
+  # The slices are equal in **seconds, not in count**: each row's cost by test
+  # target, plus the build of each feature set a shard enters, which costs as
+  # much as a shard's rows — a matrix finishes when its slowest job does.
+  # `tools/mutants.py` carries the measured costs and cuts the sorted list on
+  # them.
   #
   # Ten rather than six keeps this matrix plus the other jobs inside a
   # twenty-job concurrency budget.

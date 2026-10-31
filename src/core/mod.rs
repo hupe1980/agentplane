@@ -37,7 +37,7 @@ mod task;
 mod tenant;
 pub mod visible;
 
-pub use budget::{Budget, BudgetExceeded, Consumed, Ledger, Spend};
+pub use budget::{Budget, BudgetExceeded, Ceiling, Consumed, Ledger, Spend};
 pub use calendar::{Calendar, CalendarError, WallClock};
 pub use cloudevent::{
     CONTENT_TYPE as CLOUDEVENT_CONTENT_TYPE, CloudEvent, CloudEventError,

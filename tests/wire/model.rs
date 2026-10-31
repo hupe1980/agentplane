@@ -69,6 +69,7 @@ impl ModelProvider for EmitsStream {
             ));
         }
         Ok(Completion {
+            stopped: false,
             model: None,
             text: "hello".to_owned(),
             tool_calls: Vec::new(),
@@ -249,6 +250,76 @@ impl Skill for StreamsFake {
             completion.map(|completion| json!(completion.text)),
         ))
     }
+}
+
+/// Presses its stop on the first text a call streams.
+#[derive(Debug)]
+struct PressesStop(agentplane::model::Stop);
+
+impl ModelStreamObserver for PressesStop {
+    fn event(&self, event: Tainted<ModelStreamEvent>) {
+        if matches!(event.peek(), ModelStreamEvent::TextDelta(_)) {
+            self.0.stop();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Stoppable(Arc<FakeProvider>);
+
+#[async_trait::async_trait]
+impl Skill for Stoppable {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("stoppable").provides("stoppable")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let stop = agentplane::model::Stop::new();
+        let call = ModelCall::new(
+            Arc::clone(&self.0) as Arc<dyn ModelProvider>,
+            model(),
+            input.peek().clone(),
+        )
+        .streaming_to(Arc::new(PressesStop(stop.clone())))
+        .stopped_by(stop);
+        let completion = cx.sink(call, &input).await?;
+        Ok(Outcome::done(completion.map(
+            |completion| json!({ "text": completion.text, "stopped": completion.stopped }),
+        )))
+    }
+}
+
+/// **A stopped call is a recorded, metered completion, and replays as one.**
+/// The step's own signal ends the call on its first delta: the run gets the
+/// words streamed so far, the budget is charged what they cost, and a strict
+/// replay — which never streams and holds no stop — returns the same answer
+/// from the journal.
+#[tokio::test]
+async fn a_stopped_call_is_recorded_and_replays() {
+    let provider = FakeProvider::new();
+    provider
+        .streaming()
+        .will_say("Settlement GB-4471 clears on Thursday, once confirmed.");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Stoppable(Arc::clone(&provider)))
+        .build();
+    let live = runtime
+        .start("stoppable", Tainted::trusted(json!("when?")))
+        .run()
+        .await
+        .unwrap();
+    assert_eq!(
+        live.output.as_ref().unwrap().peek(),
+        &json!({ "text": "Settlement ", "stopped": true })
+    );
+    assert!(live.consumed.spend.tokens > 0, "a stopped call was free");
+    let replay = runtime.replay(live.run_id, Mode::Strict).await.unwrap();
+    assert_eq!(replay.output, live.output);
 }
 
 // ── The meter ───────────────────────────────────────────────────────────────
@@ -496,6 +567,7 @@ async fn a_failed_completion_spends_the_budget_that_stops_the_next_one() {
             detail: "connection reset".into(),
         })
         .will_answer(Completion {
+            stopped: false,
             model: None,
             tool_calls: Vec::new(),
             text: "the second answer".into(),
@@ -786,6 +858,7 @@ fn a_successful_completion_bills_its_usage() {
         json!({}),
     );
     let completion = Completion {
+        stopped: false,
         model: None,
         tool_calls: Vec::new(),
         text: "hi".into(),
@@ -1143,6 +1216,7 @@ impl ModelProvider for IgnoresSchema {
         _request: agentplane::model::Request<'_>,
     ) -> Result<Completion, ModelError> {
         Ok(Completion {
+            stopped: false,
             model: None,
             text: "{}".to_owned(),
             tool_calls: Vec::new(),

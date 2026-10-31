@@ -993,7 +993,16 @@ verdict that the peer refused the **account** — credit, quota, billing, a
 missing, invalid or expired credential — rather than the request. It is a
 field of its own because a code cannot always say: Anthropic names an empty
 credit balance `invalid_request_error`, as it names a malformed request. Clear,
-like `permanent`.
+like `permanent`. `EffectFailed.error` is the failure in the words of the party
+that failed — a model call's reads `'<model>' refused the request: …` — without
+a sentence restating what `permanent`, `spend` and `disposition` already say.
+
+**A budget refusal names its ceiling.** `BudgetRefused.ceiling`, present on
+records this build writes, is the ceiling that refused: `steps`, `effects`,
+`replans`, `denials`, `tokens`, `money`, `wallclock`, `egress_bytes` or `rate`,
+the words the refusal metric counts under. A reader takes an unfamiliar word
+as no ceiling. Clear, like `limit`; `used` is the consumption at the refusal,
+written for a person.
 
 **How long a call took is on its outcome.** `EffectDone.elapsed_ms` and
 `EffectFailed.elapsed_ms` are the wall time this process measured around the

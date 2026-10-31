@@ -500,6 +500,11 @@ pub enum RecordKind {
         /// Where consumption actually reached. "Budget exhausted" alone does
         /// not tell anyone what to raise it to.
         used: String,
+        /// Which ceiling, as [`Ceiling::as_str`](crate::core::Ceiling::as_str)
+        /// spells it: the setting a person raises. Absent on a record an older
+        /// build wrote.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ceiling: Option<String>,
     },
 
     /// A step the recorded run was refused on was admitted again, under the

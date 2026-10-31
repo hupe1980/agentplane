@@ -26,8 +26,10 @@ pub struct FailedEffect {
     /// Whether the peer refused the **account** rather than the request, as
     /// the driver that read the wire decided and the record keeps.
     pub account: bool,
-    /// What the failure said, as recorded — sealed text when the journal is
-    /// read without the key that opens it.
+    /// What the failure said, in the words of the party that failed
+    /// ([`EffectError::message`](crate::core::EffectError::message)) — a model
+    /// call's is `'<model>' refused the request: …` — and sealed text when the
+    /// journal is read without the key that opens it.
     pub detail: String,
 }
 

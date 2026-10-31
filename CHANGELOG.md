@@ -16,7 +16,51 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.56.1] — unreleased
+## [0.57.0] — 2026-10-31
+
+### Added
+
+- **A person can stop a model call while it streams.**
+  `ModelCall::stopped_by(model::Stop)`; `Stop::stop()` ends the call at the
+  next chunk as a journaled, metered completion with `Completion::stopped`:
+  the text streamed so far and the usage reported by then. A buffered call
+  and a schema call run to their end. `FakeProvider::streaming()` honours it.
+- **`BudgetExceeded::ceiling()` and `core::Ceiling`**: which ceiling refused
+  — the setting a person raises — live and when the refusal is read back from
+  the journal (`None` for a refusal an older build recorded).
+- **`EffectError::message()`**: the failure in the words of the party that
+  failed, as the journal now records it.
+- **`Completion` implements `Default`**, so a scripted answer names only the
+  fields it sets: `Completion { tool_calls, text, ..Completion::default() }`.
+
+### Changed
+
+- **BREAKING: `Request` gains `stop`** and `Completion` gains `stopped`. A
+  provider of your own reads `request.stop` if it streams. `stopped` is not
+  written when false, so recorded calls keep their bytes.
+- **BREAKING: a failure is recorded in its own words.** `EffectFailed.error`,
+  and so `FailedEffect::detail`, reads `'<model>' refused the request: …`,
+  without the `effect refused: ` before it. Code matching that prefix should
+  read `FailedEffect` instead. A pre-freeze record change: older journals
+  keep their text.
+- **BREAKING: `RecordKind::BudgetRefused` gains `ceiling`, and
+  `BudgetExceeded::Recorded` gains `ceiling`**; the refusal's `used` reads as
+  words (`3 step(s), 5 effect(s), 120 token(s), …`), not a `Debug` dump. A
+  pre-freeze record change: an older record reads with no ceiling.
+
+### Fixed
+
+- **An expired `aws login` behind a profile was retried as an outage.** The
+  0.56.0 account verdict read the profile's wrapping error rather than the
+  provider's own.
+- **An expired or missing SSO session on Bedrock was retried as an outage.**
+  It refuses the account before anything is sent, buffered and streamed;
+  the remedy is `aws sso login`.
+- **`FakeProvider::will_call_tool` reported zero usage**, so a token ceiling
+  over a scripted tool loop was never reached. Its usage is derived from the
+  call, like `will_say`'s.
+
+## [0.56.1] — 2026-10-30
 
 ### Fixed
 

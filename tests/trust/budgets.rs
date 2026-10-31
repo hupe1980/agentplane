@@ -375,6 +375,36 @@ async fn an_exhausted_run_replays_as_exhausted() {
     );
 }
 
+/// **A refusal names its ceiling, live and read back.** The setting a person
+/// raises is a typed answer on the live refusal and on the one a strict replay
+/// reads from the journal — never a sentence to match — and the consumption
+/// the record keeps reads as words.
+#[tokio::test]
+async fn a_token_refusal_names_its_ceiling_on_replay() {
+    let f = fixture(100, 40, Budget::default().tokens(100));
+    let out =
+        f.rt.start("demo.spend", Tainted::trusted(json!({})))
+            .run()
+            .await
+            .unwrap();
+    let RunStatus::Exhausted(live) = &out.status else {
+        panic!("got {:?}", out.status);
+    };
+    assert_eq!(live.ceiling(), Some(agentplane::core::Ceiling::Tokens));
+    let replayed = f.rt.replay(out.run_id, Mode::Strict).await.unwrap();
+    let RunStatus::Exhausted(read_back) = &replayed.status else {
+        panic!("got {:?}", replayed.status);
+    };
+    assert_eq!(
+        read_back.ceiling(),
+        Some(agentplane::core::Ceiling::Tokens),
+        "{read_back:?}"
+    );
+    let shown = read_back.to_string();
+    assert!(shown.contains("120 token(s)"), "{shown}");
+    assert!(!shown.contains("Consumed {"), "{shown}");
+}
+
 /// A free effect still counts against the operation limit — the blunt
 /// instrument works even when every operation is free.
 #[tokio::test]
@@ -1292,6 +1322,7 @@ impl agentplane::model::ModelProvider for CountingModel {
         self.0.fetch_add(1, Ordering::SeqCst);
         let _ = request;
         Ok(agentplane::model::Completion {
+            stopped: false,
             text: "ok".to_owned(),
             model: None,
             tool_calls: Vec::new(),

@@ -123,6 +123,7 @@ fn ask<'a>(
     stream: Option<(&'a dyn ModelStreamObserver, &'a agentplane::core::Label)>,
 ) -> Request<'a> {
     Request {
+        stop: None,
         model,
         prompt,
         max_output_tokens: 4096,
@@ -534,6 +535,7 @@ impl ModelProvider for Volunteers {
             ));
         }
         Ok(Completion {
+            stopped: false,
             text: "42.".to_owned(),
             model: None,
             tool_calls: Vec::new(),

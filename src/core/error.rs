@@ -729,6 +729,27 @@ impl EffectError {
         }
     }
 
+    /// The failure in the words of the party that failed, as the journal
+    /// records it: the carried words alone where this error's sentence only
+    /// restates what the record keeps in fields — refused, metered, performed,
+    /// never sent — and the whole sentence where it says something nothing
+    /// else records: a rate window, a driver's name, a timeout, a run-level
+    /// verdict.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::Rejected(words) | Self::Performed(words) | Self::Other(words) => words.clone(),
+            Self::Refused { detail, .. } | Self::Metered { detail, .. } => detail.clone(),
+            Self::Unavailable { .. }
+            | Self::RateLimited { .. }
+            | Self::Timeout { .. }
+            | Self::Interrupted { .. }
+            | Self::OutputShape(_)
+            | Self::Final { .. }
+            | Self::Unreproducible { .. } => self.to_string(),
+        }
+    }
+
     /// The peer's own name for a refusal, where it gave one.
     #[must_use]
     pub fn code(&self) -> Option<&str> {
@@ -1788,6 +1809,43 @@ impl RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::{Disposition, LISTED_CAPABILITIES, RuntimeError, SkillError, StepError};
+
+    /// **A failure's message keeps only the facts it carries.** Where the
+    /// error's sentence restates what the record keeps in fields, the message
+    /// is the carried words alone; where it holds a fact of its own — a rate
+    /// window, a driver's name — the message is the sentence.
+    #[test]
+    fn a_failure_message_keeps_only_the_facts_it_carries() {
+        use super::EffectError;
+        let words = "'anthropic/claude-x' refused the request: no";
+        for error in [
+            EffectError::Rejected(words.into()),
+            EffectError::Performed(words.into()),
+            EffectError::Other(words.into()),
+            EffectError::Refused {
+                detail: words.into(),
+                code: None,
+                account: false,
+            },
+            EffectError::Metered {
+                detail: words.into(),
+                spend: crate::core::Spend::default(),
+                disposition: Disposition::Landed,
+            },
+        ] {
+            assert_eq!(error.message(), words, "{error:?}");
+        }
+        let windowed = EffectError::RateLimited {
+            detail: words.into(),
+            retry_after: Some(std::time::Duration::from_millis(40)),
+        };
+        assert_eq!(windowed.message(), windowed.to_string());
+        let named = EffectError::Unavailable {
+            driver: "authority-store".into(),
+            detail: "down".into(),
+        };
+        assert!(named.message().contains("authority-store"));
+    }
 
     /// An embedder-facing predicate the crate itself never calls, so a wrong
     /// `matches!` arm would be invisible without this. It does not claim to

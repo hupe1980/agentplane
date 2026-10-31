@@ -726,6 +726,7 @@ fn interpret(
         )
     });
     Ok(Completion {
+        stopped: false,
         reasoning,
         commentary: None,
         compacted,
@@ -1086,6 +1087,7 @@ impl Anthropic {
         model: &ModelId,
         schema: Option<&Value>,
         observer: Option<(&dyn super::ModelStreamObserver, &crate::core::Label)>,
+        stop: Option<&super::Stop>,
     ) -> Result<Completion, ModelError> {
         use futures_util::StreamExt;
 
@@ -1099,7 +1101,12 @@ impl Anthropic {
         // the accumulator until the process dies.
         let mut meter = crate::netguard::intake::Meter::new(crate::netguard::intake::ANSWER);
 
-        while let Some(chunk) = body.next().await {
+        loop {
+            // What the wire had billed when a person stopped the call.
+            let Some(next) = super::unless_stopped(body.next(), stop).await else {
+                return Ok(Completion::stopped(acc.billed()));
+            };
+            let Some(chunk) = next else { break };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 // The case this file was written for: the connection died with
@@ -1315,6 +1322,7 @@ impl ModelProvider for Anthropic {
             continuation,
             compaction,
             stream,
+            stop,
         } = request;
 
         super::refuse_provider_side_media(prompt, model)?;
@@ -1372,7 +1380,8 @@ impl ModelProvider for Anthropic {
         }
 
         let mut completion = if self.stream {
-            self.read_streamed(response, model, schema, stream).await?
+            self.read_streamed(response, model, schema, stream, stop)
+                .await?
         } else {
             self.read_buffered(response, model, schema).await?
         };
@@ -2053,6 +2062,7 @@ mod continuation_tests {
             json!([{ "role": "assistant", "content": [{"type": "thinking", "signature": "first"}] }]),
         );
         let mut completion = Completion {
+            stopped: false,
             text: String::new(),
             tool_calls: vec![ModelToolCall {
                 id: "toolu_02".to_owned(),

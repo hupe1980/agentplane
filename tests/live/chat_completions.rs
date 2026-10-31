@@ -103,6 +103,7 @@ fn ask<'a>(
     tools: &'a [ToolDeclaration],
 ) -> Request<'a> {
     Request {
+        stop: None,
         model,
         prompt,
         max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,

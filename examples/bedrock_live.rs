@@ -25,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let completion = provider
         .complete(Request {
+            stop: None,
             model: &model,
             prompt: &prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,

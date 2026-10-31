@@ -127,6 +127,38 @@ async fn a_bad_request_is_not_the_accounts() {
     assert!(!failed.refuses_the_account());
 }
 
+/// **A failure is recorded in the words of the party that failed.** The
+/// driver's sentence reaches the embedder as it said it — no effect key, no
+/// attempt count, no effect-layer frame around it — and the run's own reason,
+/// which does add the key and the attempt, reads the same live and replayed.
+#[tokio::test]
+async fn a_failure_is_recorded_in_its_own_words() {
+    let (live, replayed) = fail_with(
+        400,
+        json!({ "type": "error", "error": { "type": "invalid_request_error", "message": "max_tokens: too large" } }),
+    )
+    .await;
+    let failed = live
+        .failed_effect
+        .clone()
+        .expect("the effect the run ended on");
+    assert!(
+        failed
+            .detail
+            .starts_with("'anthropic/claude-x' refused the request: "),
+        "{}",
+        failed.detail
+    );
+    assert_eq!(replayed.failed_effect, live.failed_effect);
+    let reason = live.reason().expect("a failed run says why").into_owned();
+    assert!(!reason.contains("effect refused: "), "{reason}");
+    assert_eq!(
+        replayed.reason().map(std::borrow::Cow::into_owned),
+        Some(reason),
+        "the live and replayed reasons differ"
+    );
+}
+
 /// What a skill sees when it handles the failure itself.
 #[derive(Debug)]
 struct Notices(Arc<dyn ModelProvider>);

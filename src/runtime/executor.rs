@@ -6593,7 +6593,7 @@ impl Runtime {
         ready: &[StepId],
         ledger: &Arc<std::sync::Mutex<Ledger>>,
         mode: Pass,
-        recorded: Option<&(StepId, String, String)>,
+        recorded: Option<&(StepId, String, String, Option<crate::core::Ceiling>)>,
         cursor: &ReplayCursor,
         journal: Journalling<'_>,
     ) -> Result<(Vec<StepId>, Option<crate::core::BudgetExceeded>), RuntimeError> {
@@ -6601,7 +6601,7 @@ impl Runtime {
 
         for &step in ready {
             // ── A recorded step refusal at this step ───────────────────────
-            if let Some((at, limit, used)) = recorded
+            if let Some((at, limit, used, ceiling)) = recorded
                 && *at == step
             {
                 if mode == Pass::Strict {
@@ -6613,6 +6613,7 @@ impl Runtime {
                         Some(crate::core::BudgetExceeded::Recorded {
                             limit: limit.clone(),
                             used: used.clone(),
+                            ceiling: *ceiling,
                         }),
                     ));
                 }
@@ -6670,7 +6671,7 @@ impl Runtime {
             if journal.writing {
                 // The refusal goes in the journal under the step it refused, so
                 // replay reads the verdict rather than recomputing it.
-                let used = format!("{:?}", ledger.lock().expect("budget mutex").consumed());
+                let used = ledger.lock().expect("budget mutex").consumed().to_string();
                 self.store
                     .append(
                         journal.epoch,
@@ -6680,6 +6681,7 @@ impl Runtime {
                                 RecordKind::BudgetRefused {
                                     limit: exceeded.to_string(),
                                     used,
+                                    ceiling: exceeded.ceiling().map(|c| c.as_str().to_owned()),
                                 },
                             )
                             .step(step),
@@ -8186,19 +8188,26 @@ struct StepFrame {
 /// strict replay of the resumed history would stop at the old refusal and
 /// report `Exhausted` about a run whose own later records show it finishing —
 /// the refusal followed by the continuation would read as divergence.
-fn recorded_step_refusal(records: &[Record]) -> Option<(StepId, String, String)> {
-    let mut standing: Option<(StepId, String, String)> = None;
+fn recorded_step_refusal(
+    records: &[Record],
+) -> Option<(StepId, String, String, Option<crate::core::Ceiling>)> {
+    let mut standing: Option<(StepId, String, String, Option<crate::core::Ceiling>)> = None;
     for r in records {
         match r.kind() {
-            RecordKind::BudgetRefused { limit, used } if r.effect_key().is_none() => {
+            RecordKind::BudgetRefused {
+                limit,
+                used,
+                ceiling,
+            } if r.effect_key().is_none() => {
                 if let Some(step) = r.body.step {
-                    standing = Some((step, limit.clone(), used.clone()));
+                    let ceiling = ceiling.as_deref().and_then(crate::core::Ceiling::parse);
+                    standing = Some((step, limit.clone(), used.clone(), ceiling));
                 }
             }
             RecordKind::BudgetReadmitted { .. }
                 if standing
                     .as_ref()
-                    .is_some_and(|(s, _, _)| Some(*s) == r.body.step) =>
+                    .is_some_and(|(s, ..)| Some(*s) == r.body.step) =>
             {
                 standing = None;
             }
@@ -9040,7 +9049,7 @@ fn classify(
 struct Execution<'a> {
     /// Where the recorded run was refused by a step limit, if it was. `None`
     /// for a live run, which has no history to consult.
-    refusal: Option<(StepId, String, String)>,
+    refusal: Option<(StepId, String, String, Option<crate::core::Ceiling>)>,
     /// The subject of a withholding the recorded history left standing. `None`
     /// for a live run, and for a resumed one whose withdrawal was already
     /// lifted and recorded.
