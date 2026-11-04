@@ -118,6 +118,9 @@ pub struct ToolId {
 /// real MCP server in production, which a transport-bearing reference forbids.
 pub const TOOL_SCHEME: &str = "tool://";
 
+/// The effect kind a call to an MCP tool is announced under.
+pub const TOOL_CALL_KIND: &str = "tool.call";
+
 /// The reserved server that names **agents on this plane** rather than a
 /// transport.
 ///
@@ -138,6 +141,22 @@ impl ToolId {
             server: server.into(),
             tool: tool.into(),
         }
+    }
+
+    /// The tool a `tool.call` effect named, read from its descriptor; `None`
+    /// for any other kind, or arguments that name no server and tool.
+    ///
+    /// The reader of the descriptor [`ToolCall`] writes, kept beside the
+    /// writer. The gate's own checks read the same two arguments with an
+    /// empty name for a missing one, so a malformed call is refused as an
+    /// ungranted tool rather than passed over.
+    #[must_use]
+    pub fn called(descriptor: &EffectDescriptor) -> Option<Self> {
+        if descriptor.kind != TOOL_CALL_KIND {
+            return None;
+        }
+        let text = |name: &str| descriptor.args.get(name).and_then(Value::as_str);
+        Some(Self::new(text("server")?, text("tool")?))
     }
 
     /// How a **manifest** names this tool: `tool://server/name`.
@@ -1109,7 +1128,7 @@ impl Effect for ToolCall {
         // same tool name are two different effects and cannot replay into each
         // other.
         EffectDescriptor::new(
-            "tool.call",
+            TOOL_CALL_KIND,
             serde_json::json!({
                 "server": self.id.server,
                 "tool": self.id.tool,

@@ -3594,6 +3594,27 @@ fn the_second_reader_seals_under_the_crates_outcomes() {
     );
 }
 
+/// **The chart deploys this version's image.**
+///
+/// The image tag defaults to the chart's `appVersion`, so a chart left behind a
+/// release installs the older binary under the newer chart without any error.
+#[test]
+fn the_chart_deploys_this_versions_image() {
+    let chart = read("deploy/helm/agentplane/Chart.yaml");
+    let version = env!("CARGO_PKG_VERSION");
+    for key in ["version:", "appVersion:"] {
+        let line = chart
+            .lines()
+            .find(|l| l.starts_with(key))
+            .unwrap_or_else(|| panic!("Chart.yaml has no `{key}` line"));
+        assert_eq!(
+            line[key.len()..].trim().trim_matches('"'),
+            version,
+            "Chart.yaml's `{key}` is not this crate's version"
+        );
+    }
+}
+
 /// **The changelog's newest entry is this version, and a released version is
 /// not still "unreleased".**
 ///

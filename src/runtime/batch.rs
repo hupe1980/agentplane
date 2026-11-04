@@ -314,6 +314,7 @@ fn classify_item(out: RunOutcome) -> (ItemOutcome, Spend) {
         | RunStatus::BrokeGlass { .. }
         | RunStatus::HaltLifted { .. }
         | RunStatus::HoldReleased { .. }
+        | RunStatus::Assessed { .. }
         | RunStatus::Observed => ItemOutcome::Quarantined(
             "this item's run id resolves to one of the plane's own records, or to \
                  a session it only observed, rather than to the item's run — the \

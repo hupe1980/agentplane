@@ -29,6 +29,14 @@ seq | kind              | effect_key | prev_hash | hash
 
 `hash = H(prev_hash ‖ record_bytes)`.
 
+An effect is two records: `EffectStarted` carries what was asked for (the
+descriptor), and `EffectDone`, `EffectFailed` or `EffectReconciled` carries what
+came of it, joined by the effect key (`ek:` above). `journal::calls(&records)`
+performs that join once: one `Call` per announcement, in the order they were
+announced, each with its descriptor, its outcome record and `output()`, and
+`tool()` for a tool call's server and tool. Two calls to one tool stay two
+calls, and an announcement nothing settled is listed with no outcome.
+
 A run that reaches a conclusion appends a `RunConcluded` record, so how a run
 ended is covered by tamper detection and a resumed run reads its own outcome
 from the history it just verified. A side table alone could not answer *is this

@@ -35,6 +35,7 @@ one builder call:
 | **Tool call arguments** | journal — same field, same reason | **no**, verbatim | sealed, per-case scope |
 | Effect outputs — completions, tool results | journal — `EffectDone.output`, and a reconciliation probe's `EffectReconciled.output`, which is the same data | **no**, verbatim | sealed, per-case scope |
 | Failure messages, notes, frozen plans | journal — `EffectFailed.error` (the message only), a compensation's `StepCompensated.outcome` (its error text when it failed), `Note.text`, `PlanFrozen.plan`, which embeds the trusted input the plan was compiled from | **no**, verbatim | sealed, per-case scope |
+| A person's reason for a verdict on a run | journal — `Assessed.rationale`, in a run of its own; the metric, the value and who judged stay clear | **no**, verbatim | sealed under the judged run's case, or under the verdict's own run — which `erase_run` of the judged run destroys with it |
 | Case state writes, status changes, deadline transitions | journal (the effect) **and** the case store | **no** in the journal; the case store's copy is overwritten, not erased | sealed in both, one scope |
 | Inbound event payloads — a counterparty's message body | journal (the awaited effect's output) **and** the event store | **no** | sealed in both; the buffer's copy is its own unit, keyed `(source, id)` |
 | Human task proposals — `Justification.proposed_action`, the exact thing a reviewer is shown, and `evidence`, the trail behind it | journal (the task effect) **and** the task store | **no** | sealed in both; the task's `summary` stays readable so a queue stays usable, and every entry keeps its trust label so a reviewer still knows who wrote a line whose words are gone |
@@ -112,7 +113,7 @@ calendar, and a chain over ciphertext, as every record's hashes are.
 `DeadlineTransition`, `Note`, `AuthorityWithheld`, `AuthorityRestored`,
 `IdentityBound`, `DataSubjectBound`, `GroupOpened`, `GroupSettled`, `QuarantineDecided`,
 `StepCompensated`, `RunCancelled`, `BreakGlass`, `HaltLifted`, `HoldReleased`,
-`Swept` and `Observed` carry no digest.
+`Swept`, `Observed` and `Assessed` carry no digest.
 
 Outside the journal:
 

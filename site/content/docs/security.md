@@ -159,7 +159,10 @@ perfectly within its ceiling and still be posted to a host nobody granted.
 **"A run" is the precise word.** The lattice is about effects the runtime
 dispatches, so the operator API is deliberately *not* filtered by it: `GET
 /runs/{id}/history` returns the journal records to whoever holds
-`api:run.history`, payloads included. That is right for the party whose journal
+`api:run.history`, payloads included — `GET /runs/{id}/output` the run's
+answer to whoever holds `api:run.output`, and `GET /runs/{id}/assessments`
+people's own words about it to whoever holds `api:run.assessments`. That is
+right for the party whose journal
 it is — an auditor who cannot see what was written cannot audit — and the
 control there is the verb, which is why the read verbs are granted explicitly
 rather than folded into a broader one. It stops being right the moment the

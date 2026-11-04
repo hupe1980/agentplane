@@ -300,6 +300,16 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             session: _,
             reported: _,
         } => detail.as_mut().map(SealedField::Text).into_iter().collect(),
+        // A person's words about a run; see `RecordKind::Assessed` for why
+        // the rest stays clear.
+        K::Assessed {
+            rationale,
+            of: _,
+            name: _,
+            value: _,
+            by: _,
+            at: _,
+        } => rationale.as_mut().map(SealedField::Text).into_iter().collect(),
 
         // A data subject identifies a person, and erasing the run's data must
         // take it with it. Where it was read from and whether that was trusted

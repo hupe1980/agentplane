@@ -6020,6 +6020,14 @@ impl JournalStore for CountsReads {
     async fn count_by_outcome(&self, outcome: &str) -> Result<u64, agentplane::core::StoreError> {
         self.inner.count_by_outcome(outcome).await
     }
+
+    async fn assessments_of(
+        &self,
+        run: agentplane::core::RunId,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::RunId>, agentplane::core::StoreError> {
+        self.inner.assessments_of(run, limit).await
+    }
     async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, agentplane::core::StoreError> {
         self.inner.admitted_as(key).await
     }
@@ -6305,4 +6313,87 @@ async fn a_message_with_no_data_subject_is_invalid_params_and_opens_no_case() {
         );
     }
     assert!(f.seen.lock().unwrap().is_empty(), "the agent ran");
+}
+
+/// A completed task's artifacts are cached, and the cache does not outlive an
+/// erasure.
+///
+/// The cache holds sealed runs because their history never changes — but an
+/// erasure leaves the history and destroys the key, so the plaintext a hit
+/// would serve is the one copy the erasure did not reach. Read once, erased,
+/// and listed again: the answer must not come back.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn an_erased_tasks_artifacts_are_not_served_from_the_cache() {
+    use agentplane::keyring::KeyRing;
+
+    let tenant = TenantId::default();
+    let ring = Arc::new(agentplane::testkit::MemoryKeyRing::default()) as Arc<dyn KeyRing>;
+    let raw = Arc::new(RedbStore::open_in_memory().unwrap());
+    let manifest = Manifest::parse_all(ONE_SKILL).unwrap()[0].clone();
+    // The raw store: the builder seals what it is given under the ring.
+    let rt = Runtime::builder(Arc::clone(&raw) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&raw) as Arc<dyn CaseStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .keyring(Arc::clone(&ring))
+        .skill(EchoesInput)
+        .build();
+    let server = A2aServer::new(
+        rt.clone(),
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("the fixture wires a policy engine");
+    let router = server.router();
+
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": {
+                "messageId": "m-erased",
+                "role": "ROLE_USER",
+                "parts": [{ "data": { "claimant": "Ada Lovelace" } }],
+            }}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let run = RunId::parse(sent["result"]["task"]["id"].as_str().expect("a task")).unwrap();
+
+    let list = json!({"includeArtifacts": true});
+    let (_, before) = send(&router, rpc("ListTasks", &list, Some("peer-a"))).await;
+    // The artifacts alone: the task's history quotes the message too, and an
+    // assertion over the whole body would pass on the history going dark.
+    let artifacts = |body: &Value| body["result"]["tasks"][0]["artifacts"].to_string();
+    assert!(
+        artifacts(&before).contains("Ada Lovelace"),
+        "the fixture's answer was not projected before the erasure: {before:#}"
+    );
+
+    // The key the run's payloads are sealed under is destroyed, as an
+    // erasure of its matter does — the matter is the A2A context, still open,
+    // which `erase_case` would refuse for reasons this test is not about.
+    let case = raw
+        .read(run, 1)
+        .await
+        .unwrap()
+        .iter()
+        .find_map(|r| r.body.case)
+        .expect("an A2A task is bound to its context's case");
+    ring.destroy(
+        &agentplane::keyring::scope(&tenant, &case.to_string()),
+        agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).unwrap(),
+        "the subject exercised the right to erasure",
+    )
+    .await
+    .expect("erase");
+
+    let (_, after) = send(&router, rpc("ListTasks", &list, Some("peer-a"))).await;
+    assert!(
+        !artifacts(&after).contains("Ada Lovelace"),
+        "an erased run's answer was served from the artifact cache: {after:#}"
+    );
 }

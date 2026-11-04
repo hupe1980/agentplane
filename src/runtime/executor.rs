@@ -781,6 +781,7 @@ impl std::fmt::Display for RunFailure {
             }
             RunStatus::HaltLifted { actor } => write!(f, "{actor} lifted an emergency stop"),
             RunStatus::HoldReleased { actor } => write!(f, "{actor} released a legal hold"),
+            RunStatus::Assessed { actor } => write!(f, "{actor} assessed a run"),
             RunStatus::Abandoned { actor, reason } => {
                 write!(
                     f,
@@ -890,6 +891,14 @@ pub enum RunStatus {
     HoldReleased {
         actor: crate::core::Operator,
     },
+    /// A person's verdict on another run, recorded as a run of its own.
+    ///
+    /// `actor` is read back from the run's
+    /// [`Assessed`](crate::journal::RecordKind::Assessed) record, which names
+    /// the run judged.
+    Assessed {
+        actor: crate::core::Operator,
+    },
     /// The authority this run acts under was withdrawn while it was running.
     ///
     /// **A pause, not a fault**, for the reason exhaustion is one: the run did
@@ -952,7 +961,8 @@ impl RunStatus {
             | Self::Swept
             | Self::Observed
             | Self::HaltLifted { .. }
-            | Self::HoldReleased { .. } => None,
+            | Self::HoldReleased { .. }
+            | Self::Assessed { .. } => None,
             Self::Failed(reason)
             | Self::Quarantined(reason)
             | Self::Replanning(reason)
@@ -1006,6 +1016,7 @@ impl RunStatus {
             | Self::BrokeGlass { .. }
             | Self::HaltLifted { .. }
             | Self::HoldReleased { .. }
+            | Self::Assessed { .. }
             | Self::Withheld { .. }
             | Self::Succeeded
             | Self::Swept
@@ -1045,6 +1056,7 @@ impl RunStatus {
             Self::BrokeGlass { .. } => BREAK_GLASS_OUTCOME,
             Self::HaltLifted { .. } => HALT_LIFTED_OUTCOME,
             Self::HoldReleased { .. } => HOLD_RELEASED_OUTCOME,
+            Self::Assessed { .. } => ASSESSED_OUTCOME,
             Self::Withheld { .. } => WITHHELD_OUTCOME,
             Self::Observed => OBSERVED_OUTCOME,
         }
@@ -1063,7 +1075,8 @@ impl RunStatus {
             | Self::Abandoned { actor, .. }
             | Self::BrokeGlass { actor, .. }
             | Self::HaltLifted { actor }
-            | Self::HoldReleased { actor } => Some(actor),
+            | Self::HoldReleased { actor }
+            | Self::Assessed { actor } => Some(actor),
             // A withdrawal names a *subject*, not an actor: the operator who
             // threw the halt and the credential it covers are different
             // parties, and answering "who" with the subject would report the
@@ -1126,6 +1139,7 @@ impl RunStatus {
                 | Self::BrokeGlass { .. }
                 | Self::HaltLifted { .. }
                 | Self::HoldReleased { .. }
+                | Self::Assessed { .. }
                 | Self::Observed
         )
     }
@@ -1157,6 +1171,7 @@ pub const SEALED_OUTCOMES: &[&str] = &[
     HALT_LIFTED_OUTCOME,
     HOLD_RELEASED_OUTCOME,
     OBSERVED_OUTCOME,
+    ASSESSED_OUTCOME,
 ];
 
 /// What an offline verb sweeps when the operator names no outcome.
@@ -1184,6 +1199,7 @@ pub const OUTCOMES_OF_RECORD: &[&str] = &[
     HALT_LIFTED_OUTCOME,
     HOLD_RELEASED_OUTCOME,
     OBSERVED_OUTCOME,
+    ASSESSED_OUTCOME,
 ];
 
 /// How a resume came to hold its lease, which decides what a failure does
@@ -2638,6 +2654,140 @@ impl Runtime {
             record: run,
             removed,
         }))
+    }
+
+    /// Record a person's verdict on what a run answered, as a sealed run of
+    /// its own, and return that run.
+    ///
+    /// Never appended to the run judged, which is sealed: the verdict is an act
+    /// about it, written the way a halt lift is, so it carries the chain, the
+    /// signature, inclusion and the witness. Stamped with the judged run's
+    /// case, so the matter's history shows it and erasing the matter takes the
+    /// rationale.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::NotAssessable`] for a run this journal has never heard
+    /// of, one still working, suspended or withheld, and one that is itself an
+    /// operator's act — an assessment, a lift, a release, a crossing, a sweep;
+    /// otherwise if the journal cannot be read or the record written.
+    pub async fn assess(&self, assessment: crate::core::Assessment) -> Result<RunId, RuntimeError> {
+        let of = assessment.of();
+        let records = self
+            .store
+            .read(of, 1)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        let refused = |why: &str| RuntimeError::NotAssessable {
+            run: of.to_string(),
+            why: why.to_owned(),
+        };
+        if records.is_empty() {
+            return Err(RuntimeError::Store(crate::core::StoreError::NotFound(
+                of.to_string(),
+            )));
+        }
+        // Words about an erased run would be sealed under a scope nobody
+        // destroyed — readable after the data they describe is gone. Read
+        // from the admitted input as well as the frozen plan, because a run
+        // need not have been planned to have been admitted.
+        let input_sealed = records.iter().any(
+            |r| matches!(r.kind(), RecordKind::RunAdmitted { input, .. } if sealed_payload(input)),
+        );
+        if input_sealed || payloads_erased(&records) {
+            return Err(refused(
+                "its data was erased, or is sealed to a key ring this plane does not hold",
+            ));
+        }
+        match recorded_ending(&records).as_deref() {
+            None => return Err(refused("it is still working")),
+            Some("suspended") => return Err(refused("it is waiting, and has no answer yet")),
+            Some(WITHHELD_OUTCOME) => {
+                return Err(refused(
+                    "its authority was withdrawn, and it has no answer yet",
+                ));
+            }
+            Some(outcome) if !ASSESSABLE_ACTS.contains(&outcome) && ended_by_an_act(outcome) => {
+                return Err(refused("it records an operator's act, not an answer"));
+            }
+            Some(_) => {}
+        }
+        let case = records.iter().find_map(|r| r.body.case);
+        let (_, name, value, by, at, rationale) = assessment.into_parts();
+        self.seal_operator_record(
+            RecordKind::Assessed {
+                of: of.to_string(),
+                name,
+                value,
+                by,
+                at,
+                rationale,
+            },
+            case,
+            ASSESSED_OUTCOME,
+            None,
+        )
+        .await
+    }
+
+    /// Every verdict recorded on `run`, in the order the store recorded them.
+    ///
+    /// [`Assessments::current`](crate::core::Assessments::current) answers
+    /// which stand; the history keeps the ones a later verdict replaced. All
+    /// of them, never a page: which verdict stands is a fold over every one,
+    /// and a fold over a page answers with a replaced verdict. A rationale
+    /// that cannot be read here reads as `None`, never as its ciphertext.
+    ///
+    /// # Errors
+    ///
+    /// If the journal cannot be read, or an indexed run does not hold an
+    /// assessment of `run` — a history that silently thins is one that reads
+    /// as complete.
+    pub async fn assessments(&self, run: RunId) -> Result<crate::core::Assessments, RuntimeError> {
+        let runs = self
+            .store
+            .assessments_of(run, usize::MAX)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        let mut history = Vec::with_capacity(runs.len());
+        for held in runs {
+            let first = self
+                .store
+                .read_page(held, 1, 1)
+                .await
+                .map_err(RuntimeError::from_store)?
+                .into_iter()
+                .next();
+            let Some(RecordKind::Assessed {
+                of,
+                name,
+                value,
+                by,
+                at,
+                rationale,
+            }) = first.as_ref().map(Record::kind)
+            else {
+                return Err(RuntimeError::Store(crate::core::StoreError::Corrupt {
+                    seq: 1,
+                    detail: format!("run {held} is indexed as an assessment but holds none"),
+                }));
+            };
+            if *of != run.to_string() {
+                return Err(RuntimeError::Store(crate::core::StoreError::Corrupt {
+                    seq: 1,
+                    detail: format!("run {held} is indexed as assessing {run} but assesses {of}"),
+                }));
+            }
+            history.push(crate::core::Assessment::recorded(
+                run,
+                name.clone(),
+                value.clone(),
+                by.clone(),
+                *at,
+                rationale.clone().filter(|text| !sealed_text(text)),
+            ));
+        }
+        Ok(crate::core::Assessments { history })
     }
 
     /// Every recorded halt lift, newest first: the one record of each run.
@@ -4174,6 +4324,14 @@ impl Runtime {
                         None => tokio::time::sleep(lapse).await,
                     }
                 }
+                // A run that concluded between the read above and this resume
+                // is answered as recorded, which carries no value — so a
+                // success is given its answer here, as a rested one is.
+                Ok(resumed)
+                    if resumed.status == RunStatus::Succeeded && resumed.output.is_none() =>
+                {
+                    return self.with_output(resumed).await;
+                }
                 resumed => return resumed,
             }
         }
@@ -4184,7 +4342,10 @@ impl Runtime {
     /// yet, and is returned as recorded.
     async fn with_output(&self, rested: RunOutcome) -> Result<RunOutcome, RuntimeError> {
         if rested.status == RunStatus::Succeeded {
-            self.replay(rested.run_id, Mode::Strict).await
+            Ok(RunOutcome {
+                output: self.succeeded_output(rested.run_id).await?,
+                ..rested
+            })
         } else {
             Ok(rested)
         }
@@ -4248,6 +4409,70 @@ impl Runtime {
             // there is none to hand back here. See `Admission::Replayed`.
             output: None,
         }))
+    }
+
+    /// What a run answered, **with its label** — `None` unless it succeeded.
+    ///
+    /// A run's answer is not stored: it is the value the run's last step
+    /// produced, and a strict replay re-derives it from the journal, performing
+    /// no effect, taking no lease and writing nothing. This is that read under
+    /// its own name, the one the keyed [`settle`](RunRequest::settle), the A2A
+    /// task projection and the MCP task result each perform.
+    ///
+    /// `None` for a run that is still working, is suspended, or ended any way
+    /// but success — and for one this journal has never heard of, which
+    /// [`recorded_outcome`](Self::recorded_outcome) tells apart.
+    ///
+    /// The re-derivation runs here, so it needs what any strict replay needs:
+    /// the run's agent registered on this runtime under the revision it ran,
+    /// and payloads that can still be opened.
+    ///
+    /// # Errors
+    ///
+    /// If the journal cannot be read; [`RuntimeError::PayloadsErased`] if the
+    /// run's data was erased; whatever the strict replay refuses, such as an
+    /// agent this runtime does not register.
+    pub async fn output(&self, run: RunId) -> Result<Option<Tainted<Value>>, RuntimeError> {
+        match self.recorded_outcome(run).await? {
+            Some(rested) if rested.status == RunStatus::Succeeded => {
+                self.succeeded_output(run).await
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// [`output`](Self::output) for a run already known to have succeeded.
+    pub(crate) async fn succeeded_output(
+        &self,
+        run: RunId,
+    ) -> Result<Option<Tainted<Value>>, RuntimeError> {
+        Ok(self.replay(run, Mode::Strict).await?.output)
+    }
+
+    /// Whether a run's payloads can still be opened — false once its data was
+    /// erased.
+    ///
+    /// What a cache of a run's answer asks before it serves one: a sealed
+    /// run's history never changes, but an erasure makes its payloads
+    /// unreadable, and an answer kept in memory past that is the plaintext the
+    /// erasure destroyed. Read from the frozen plan, as
+    /// [`replay`](Self::replay) decides it; a run whose plan is not among its
+    /// first records answers false, so the caller re-derives.
+    ///
+    /// # Errors
+    ///
+    /// If the journal cannot be read.
+    #[cfg(feature = "a2a-server")]
+    pub(crate) async fn payloads_readable(&self, run: RunId) -> Result<bool, RuntimeError> {
+        let head = self
+            .store
+            .read_page(run, 1, ATTRIBUTION_RECORDS)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        let planned = head
+            .iter()
+            .any(|r| matches!(r.kind(), RecordKind::PlanFrozen { .. }));
+        Ok(planned && !payloads_erased(&head))
     }
 
     /// Rebuild a run's case binding **from its history**, never by re-deriving.
@@ -7982,7 +8207,8 @@ fn severity(status: &RunStatus) -> u8 {
         | RunStatus::Observed
         | RunStatus::BrokeGlass { .. }
         | RunStatus::HaltLifted { .. }
-        | RunStatus::HoldReleased { .. } => 0,
+        | RunStatus::HoldReleased { .. }
+        | RunStatus::Assessed { .. } => 0,
     }
 }
 
@@ -9434,6 +9660,10 @@ fn recorded_status(
             || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),
             |actor| RunStatus::HoldReleased { actor },
         ),
+        ASSESSED_OUTCOME => recorded_assessment(records).map_or_else(
+            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),
+            |actor| RunStatus::Assessed { actor },
+        ),
         // Fail closed, as the resume path does: a conclusion this build cannot
         // interpret is not permission to treat the run as ordinary. Every
         // outcome this build *writes* has an arm above, and a guard holds the
@@ -9463,6 +9693,20 @@ fn sealed_payload(value: &serde_json::Value) -> bool {
     }
 }
 
+/// Whether this text is a sealed payload rather than readable words; always
+/// false without `keyring`, as [`sealed_payload`] is.
+fn sealed_text(text: &str) -> bool {
+    #[cfg(feature = "keyring")]
+    {
+        crate::journal::payload::is_sealed_text(text)
+    }
+    #[cfg(not(feature = "keyring"))]
+    {
+        let _ = text;
+        false
+    }
+}
+
 /// How the run's history says it last ended, or that it is waiting.
 ///
 /// The last conclusion or suspension on the record, as the outcome word a
@@ -9476,6 +9720,12 @@ fn recorded_ending(records: &[Record]) -> Option<String> {
         _ => None,
     })
 }
+
+/// The endings that were an act and are still an answer worth judging: a
+/// cancelled or abandoned run stopped short of its goal, and an observed
+/// session is somebody else's agent's work — all three are what a person may
+/// want to say was or was not helpful.
+const ASSESSABLE_ACTS: &[&str] = &["cancelled", "abandoned", OBSERVED_OUTCOME];
 
 /// Whether an ending was an act rather than something the run's steps reached.
 ///
@@ -9491,6 +9741,7 @@ fn ended_by_an_act(outcome: &str) -> bool {
             HOLD_RELEASED_OUTCOME,
             WITHHELD_OUTCOME,
             OBSERVED_OUTCOME,
+            ASSESSED_OUTCOME,
         ]
         .contains(&outcome)
 }
@@ -9595,6 +9846,14 @@ fn recorded_hold_release(records: &[Record]) -> Option<crate::core::Operator> {
     })
 }
 
+/// Who judged the run this run's assessment names, read back from its record.
+fn recorded_assessment(records: &[Record]) -> Option<crate::core::Operator> {
+    records.iter().rev().find_map(|r| match r.kind() {
+        RecordKind::Assessed { by, .. } => Some(by.clone()),
+        _ => None,
+    })
+}
+
 /// Whose authority was withdrawn, and what the operator said when withdrawing
 /// it — read back from the withholding record.
 ///
@@ -9663,6 +9922,9 @@ pub const HALT_LIFTED_OUTCOME: &str = "halt-lifted";
 /// How a run recording an operator releasing a legal hold ends.
 pub const HOLD_RELEASED_OUTCOME: &str = "hold-released";
 
+/// How a run recording a person's verdict on another run ends.
+pub const ASSESSED_OUTCOME: &str = "assessed";
+
 /// How a run ends when the authority it acts under is withdrawn under it.
 ///
 /// Resumable, so it is deliberately absent from both
@@ -9695,6 +9957,7 @@ pub(crate) const LEASE_FREE_OUTCOMES: &[&str] = &[
     HALT_LIFTED_OUTCOME,
     HOLD_RELEASED_OUTCOME,
     OBSERVED_OUTCOME,
+    ASSESSED_OUTCOME,
 ];
 
 /// One governed identity: a declaration and the skills that serve it.
@@ -12243,6 +12506,9 @@ pub(crate) fn every_status() -> Vec<RunStatus> {
         RunStatus::HoldReleased {
             actor: crate::core::Operator::asserted("ops").expect("a name"),
         },
+        RunStatus::Assessed {
+            actor: crate::core::Operator::asserted("ops").expect("a name"),
+        },
         RunStatus::Withheld {
             subject: "alice".into(),
             reason: "credential withdrawn".into(),
@@ -12280,7 +12546,7 @@ mod resume_agreement_tests {
         let statuses = every_status();
         assert_eq!(
             statuses.len(),
-            14,
+            15,
             "a RunStatus variant was added or removed — decide whether it seals \
              and whether a resume may continue from it, then update this list"
         );
@@ -12535,6 +12801,14 @@ mod resume_agreement_tests {
                 at: crate::core::Timestamp::UNIX_EPOCH,
                 placed_by: who(),
                 placed_at: crate::core::Timestamp::UNIX_EPOCH,
+            }],
+            super::ASSESSED_OUTCOME => vec![RecordKind::Assessed {
+                of: crate::core::RunId::generate().to_string(),
+                name: "helpful".into(),
+                value: crate::core::Score::Pass(true),
+                by: who(),
+                at: crate::core::Timestamp::UNIX_EPOCH,
+                rationale: None,
             }],
             super::WITHHELD_OUTCOME => vec![RecordKind::AuthorityWithheld {
                 subject: "alice".into(),

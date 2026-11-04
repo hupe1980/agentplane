@@ -8,6 +8,7 @@
 //! reviewable, lets the whole runtime be swapped under a simulator, and makes an
 //! eventual crate split mechanical rather than archaeological.
 
+mod assessment;
 pub(crate) mod b64;
 mod budget;
 mod calendar;
@@ -57,6 +58,7 @@ pub use egress::{Egress, EgressError};
 mod provenance;
 pub use provenance::{NS as PROVENANCE_NS, Provenance};
 
+pub use assessment::{Assessment, AssessmentError, Assessments, Score};
 pub use case::{
     BreachNote, Case, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineSpec,
     DeadlineState, LegalHold, SweptAction,

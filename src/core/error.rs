@@ -483,6 +483,12 @@ pub enum RuntimeError {
     #[error("run {run} already concluded as '{outcome}'; there is nothing left to stop")]
     AlreadyConcluded { run: String, outcome: String },
 
+    /// A verdict was asked of a run that has no answer to judge: one still
+    /// working, waiting or withheld, one that is itself an operator's act, or
+    /// one this journal has never heard of.
+    #[error("run {run} cannot be assessed: {why}")]
+    NotAssessable { run: String, why: String },
+
     /// An operator's lift or release was recorded, and the control it ended
     /// still stands.
     ///

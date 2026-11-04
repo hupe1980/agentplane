@@ -115,6 +115,12 @@ const RUN_OUTCOME: TableDefinition<(&str, &str), (&str, u64)> = TableDefinition:
 const RUN_ADMISSION: TableDefinition<(&str, &str), (&str, i64)> =
     TableDefinition::new("run_admission");
 
+/// `(tenant, assessed_run, feed_position) -> assessment_run`: the runs
+/// recording a verdict on a run, in commit order — see
+/// [`JournalStore::assessments_of`].
+const RUN_ASSESSMENT: TableDefinition<(&str, &str, u64), &str> =
+    TableDefinition::new("run_assessment");
+
 /// `(tenant, updated_at, run_id) -> ()`, every run by last durable append.
 const RUN_ACTIVITY: TableDefinition<(&str, u64, &str), ()> = TableDefinition::new("run_activity");
 /// `(tenant, run_id) -> updated_at`, for replacing the activity index row.
@@ -1246,6 +1252,19 @@ impl JournalStore for RedbStore {
                             .map_err(|e| be(&e))?;
                     }
 
+                    // The verdict index, likewise: a person's verdict on a
+                    // run is findable from the run in the transaction that
+                    // records it, or not at all.
+                    if let crate::journal::RecordKind::Assessed { of, .. } = record.kind() {
+                        w.open_table(RUN_ASSESSMENT)
+                            .map_err(|e| be(&e))?
+                            .insert(
+                                (tenant.as_str(), of.as_str(), position - 1),
+                                run_id.as_str(),
+                            )
+                            .map_err(|e| be(&e))?;
+                    }
+
                     // The outcome index derives from the chain, here, in the
                     // same transaction as the record it derives from — and the
                     // last conclusion wins. A failed run that is resumed and
@@ -1854,6 +1873,38 @@ impl JournalStore for RedbStore {
             };
             w.commit().map_err(|e| be(&e))?;
             Ok(head_hash)
+        })
+        .await
+    }
+
+    async fn assessments_of(&self, run: RunId, limit: usize) -> Result<Vec<RunId>, StoreError> {
+        let tenant = self.tenant_name();
+        let of = run.to_string();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let index = match r.open_table(RUN_ASSESSMENT) {
+                Ok(t) => t,
+                // Nobody has judged anything on this store yet.
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(e) => return Err(be(&e)),
+            };
+            let from = (tenant.as_str(), of.as_str(), 0);
+            let mut found = Vec::new();
+            for row in index.range(from..).map_err(|e| be(&e))? {
+                let (key, held) = row.map_err(|e| be(&e))?;
+                let (in_tenant, judged, _) = key.value();
+                let assessment = held.value();
+                if in_tenant != tenant || judged != of || found.len() >= limit {
+                    break;
+                }
+                found.push(RunId::parse(assessment).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!(
+                        "run_assessment holds an unparseable run id '{assessment}': {e}"
+                    ),
+                })?);
+            }
+            Ok(found)
         })
         .await
     }

@@ -1312,6 +1312,7 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     a_follower_wakes_once_the_append_is_readable(fresh, &mut r).await;
     the_feed_serves_every_record_once(fresh, &mut r).await;
     a_feed_follower_wakes_on_any_run(fresh, &mut r).await;
+    a_verdict_is_found_from_the_run_it_judges(fresh, &mut r).await;
     r
 }
 
@@ -2143,6 +2144,65 @@ async fn an_unkeyed_admission_claims_nothing(fresh: Factory<'_>, r: &mut Report)
             "admission keys",
             format!("an unkeyed admission was filed under the empty key, held by {held}"),
         );
+    }
+}
+
+/// **A verdict is found from the run it judges**, by the append that writes
+/// it, in the order the store committed them, bounded, and only from that run.
+///
+/// The verdicts' own run ids sort in the *reverse* of the order they are
+/// written, so an index that orders by run id — which is ordered only to the
+/// millisecond — answers the later verdict first and is caught every time,
+/// not only when two land in one millisecond.
+async fn a_verdict_is_found_from_the_run_it_judges(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let judged = RunId::generate();
+    let other = RunId::generate();
+    let mut ids: Vec<RunId> = (0..3).map(|_| RunId::generate()).collect();
+    ids.sort_by_key(|id| std::cmp::Reverse(id.to_string()));
+    let mut written = Vec::new();
+    for (of, run) in [judged, other, judged].into_iter().zip(ids) {
+        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+            return;
+        };
+        let verdict = Append::new(
+            run,
+            RecordKind::Assessed {
+                of: of.to_string(),
+                name: "helpful".into(),
+                value: crate::core::Score::Pass(true),
+                by: crate::core::Operator::asserted("conformance").expect("a name"),
+                at: crate::core::Timestamp::UNIX_EPOCH,
+                rationale: None,
+            },
+        );
+        if let Err(e) = store.append(lease.epoch, vec![verdict]).await {
+            r.record(
+                "assessments",
+                format!("a verdict could not be written: {e}"),
+            );
+            return;
+        }
+        if of == judged {
+            written.push(run);
+        }
+    }
+    match store.assessments_of(judged, 10).await {
+        Ok(found) if found == written => {}
+        Ok(found) => r.record(
+            "assessments",
+            format!("assessments_of must name {written:?} in that order, named {found:?}"),
+        ),
+        Err(e) => r.record("assessments", format!("assessments_of failed: {e}")),
+    }
+    match store.assessments_of(judged, 1).await {
+        Ok(found) if found == written[..1] => {}
+        Ok(found) => r.record(
+            "assessments",
+            format!("a limit of one must answer the oldest verdict, answered {found:?}"),
+        ),
+        Err(e) => r.record("assessments", format!("assessments_of failed: {e}")),
     }
 }
 

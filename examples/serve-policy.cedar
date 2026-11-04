@@ -57,6 +57,7 @@
 // bundle missing them denies during the incident, which is the one time
 // nobody is reading policy files.
 //   api:run.read      api:run.list    api:run.history api:run.live
+//   api:run.output    api:run.assess  api:run.assessments
 //   api:run.waiting   api:run.cancel  api:run.reopen  api:run.abandon
 //   api:attention     api:drill.read  api:effect.reconcile
 //   api:task.list     api:task.read   api:task.claim  api:task.release
@@ -199,6 +200,9 @@ permit(
         Action::"api:run.list",
         Action::"api:run.read",
         Action::"api:run.history",
+        Action::"api:run.output",
+        Action::"api:run.assess",
+        Action::"api:run.assessments",
         Action::"api:task.list",
         Action::"api:task.read",
         Action::"api:task.claim",

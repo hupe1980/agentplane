@@ -769,6 +769,26 @@ pub enum RecordKind {
         reason: String,
     },
 
+    /// A person's verdict on what another run answered — the sole record of a
+    /// sealed run of its own, never appended to the run it judges.
+    ///
+    /// `of` names the run judged. The metric, the value and who judged are
+    /// clear, because they are what a quality reading counts after an
+    /// erasure, and their grammar keeps prose out of them; `rationale` is the
+    /// person's words and is a sealed payload. A later verdict by the same
+    /// actor on the same metric replaces this one in
+    /// [`Assessments::current`](crate::core::Assessments::current), and this
+    /// record stays.
+    Assessed {
+        of: String,
+        name: String,
+        value: crate::core::Score,
+        by: crate::core::Operator,
+        at: crate::core::Timestamp,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rationale: Option<String>,
+    },
+
     /// The run concluded. The digest is the chain head the conclusion was
     /// drawn over, and the stores derive the outcome index from this record —
     /// last conclusion wins.
@@ -1026,6 +1046,7 @@ impl RecordKind {
             Self::Released { .. } => "Released",
             Self::RunCancelled { .. } => "RunCancelled",
             Self::RunConcluded { .. } => "RunConcluded",
+            Self::Assessed { .. } => "Assessed",
             Self::BreakGlass { .. } => "BreakGlass",
             Self::HaltLifted { .. } => "HaltLifted",
             Self::HoldReleased { .. } => "HoldReleased",

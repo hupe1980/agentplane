@@ -239,6 +239,14 @@ impl JournalStore for StagedAtomic {
         self.inner.count_by_outcome(outcome).await
     }
 
+    async fn assessments_of(
+        &self,
+        run: crate::core::RunId,
+        limit: usize,
+    ) -> Result<Vec<crate::core::RunId>, StoreError> {
+        self.inner.assessments_of(run, limit).await
+    }
+
     async fn runs_by_id(
         &self,
         after: Option<RunId>,

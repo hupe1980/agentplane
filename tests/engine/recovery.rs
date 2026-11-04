@@ -1773,6 +1773,9 @@ fn every_conclusion_but_success_carries_a_reason() {
         RunStatus::HoldReleased {
             actor: operator("ops:hupe"),
         },
+        RunStatus::Assessed {
+            actor: operator("ops:hupe"),
+        },
         RunStatus::Withheld {
             subject: "alice".into(),
             reason: "credential withdrawn: laptop lost".into(),
@@ -1795,7 +1798,8 @@ fn every_conclusion_but_success_carries_a_reason() {
             | RunStatus::Swept
             | RunStatus::Observed
             | RunStatus::HaltLifted { .. }
-            | RunStatus::HoldReleased { .. } => assert!(
+            | RunStatus::HoldReleased { .. }
+            | RunStatus::Assessed { .. } => assert!(
                 reason.is_none(),
                 "a success has no reason to give, and inventing one would put a \
                  sentence in a field an embedder renders as a failure note"

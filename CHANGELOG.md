@@ -16,6 +16,57 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.58.0] — 2026-11-04
+
+### Added
+
+- **`Runtime::output(run)`**: what a run that succeeded answered, with its
+  label, re-derived by strict replay; `None` otherwise. Use it instead of
+  `replay(run, Mode::Strict)` and `.output`.
+- **`GET /runs/{run}/output`** under its own action, `api:run.output`:
+  `{ run, output, label }`, or `409` naming why there is none.
+- **`journal::calls(&records)`**: each effect's announcement joined to its
+  outcome, in announcement order — `descriptor()`, `outcome()`, `output()`,
+  and `tool()` for a tool call's server and tool. Two calls to one tool stay
+  two; an unsettled call is listed with no outcome. Use it instead of pairing
+  `EffectStarted` and `EffectDone` by effect key yourself. `ToolId::called`
+  reads a `tool.call` descriptor.
+- **A person's verdict on a run.** `Runtime::assess(Assessment::new(..))`
+  records a token-named metric, a boolean, number or label, the actor and a
+  sealed rationale as a sealed run of its own; `Runtime::assessments(run)`
+  reads them back and `current()` keeps the last per actor and metric. A run
+  without an answer is refused with `RuntimeError::NotAssessable`.
+- **`POST`/`GET /runs/{run}/assessments`** under `api:run.assess` and
+  `api:run.assessments`; the assessor is the authenticated caller.
+
+### Changed
+
+- **BREAKING: `JournalStore::assessments_of(run, limit)`**, with no default,
+  answering in commit order. A store of your own maintains the index from the
+  `Assessed` record inside `append`; a decorator delegates. Postgres gains the
+  `run_assessment` table, read in the feed's order; redb a `run_assessment`
+  table keyed by feed position.
+- **BREAKING: `RecordKind::Assessed` and `RunStatus::Assessed`.** A match over
+  either needs the arm. A pre-freeze record change; the export format lists
+  34 record kinds and `assessed` among the sealing outcomes.
+- **`blob::erase_run` destroys the scopes of the run's verdicts too**, so the
+  words people wrote about an erased run go with it.
+
+### Security
+
+- **`pulldown-cmark` 0.13.6** (RUSTSEC-2026-0433: quadratic parsing of nested
+  image wikilinks), reached through the A2A server's protobuf build.
+
+### Fixed
+
+- **A keyed `settle` could answer a success with no value** when the run
+  concluded between the read of its record and the resume that would have
+  waited for it.
+- **An A2A task's cached answer outlived the erasure of its run**, until 256
+  other tasks evicted it. A hit is served only while the run's payloads open.
+- **The Helm chart deployed the 0.54.0 image.** Its `appVersion` had not moved
+  since; it is held to the crate's version now.
+
 ## [0.57.0] — 2026-10-31
 
 ### Added

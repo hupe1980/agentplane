@@ -451,6 +451,14 @@ impl JournalStore for RefusesAppends {
     async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError> {
         self.inner.count_by_outcome(outcome).await
     }
+
+    async fn assessments_of(
+        &self,
+        run: agentplane::core::RunId,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::RunId>, StoreError> {
+        self.inner.assessments_of(run, limit).await
+    }
     async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
         self.inner.admitted_as(key).await
     }
@@ -709,4 +717,213 @@ async fn a_lift_concluded_but_not_sealed_is_sealed_by_the_next_sweep() {
         .await
         .expect("a sweep");
     assert_eq!(again.seals_finished, 0, "a sealed run is not sealed twice");
+}
+
+/// Answers at once.
+#[derive(Debug)]
+struct Answers;
+
+#[async_trait::async_trait]
+impl agentplane::core::Skill for Answers {
+    fn descriptor(&self) -> agentplane::core::SkillDescriptor {
+        agentplane::core::SkillDescriptor::new("answers").provides("demo.answer")
+    }
+
+    async fn invoke(
+        &self,
+        _cx: &mut agentplane::runtime::StepCtx<'_>,
+        input: agentplane::core::Tainted<serde_json::Value>,
+    ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
+        Ok(agentplane::core::Outcome::done(input))
+    }
+}
+
+fn answering(journal: Arc<dyn JournalStore>) -> Arc<Runtime> {
+    Runtime::builder(journal).skill(Answers).build()
+}
+
+fn verdict(
+    of: RunId,
+    who: &str,
+    name: &str,
+    value: agentplane::core::Score,
+) -> agentplane::core::Assessment {
+    agentplane::core::Assessment::new(
+        of,
+        name,
+        value,
+        agentplane::core::Operator::authenticated(who).expect("a name"),
+        agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
+        Some(format!("{who}'s reason")),
+    )
+    .expect("a well-formed verdict")
+}
+
+/// **A later verdict by the same person on the same metric replaces the earlier
+/// one in the view, and the history keeps both.**
+///
+/// What a person said and then withdrew is a fact a review asks about, so
+/// nothing is overwritten; which verdict stands is derived on every read.
+#[tokio::test]
+async fn a_later_verdict_replaces_an_earlier_one_in_the_view() {
+    use agentplane::core::{Score, Tainted};
+    let store = Arc::new(RedbStore::open_in_memory().expect("a store"));
+    let runtime = answering(Arc::clone(&store) as Arc<dyn JournalStore>);
+    let run = runtime
+        .start(
+            "demo.answer",
+            Tainted::trusted(serde_json::json!({ "a": 1 })),
+        )
+        .run()
+        .await
+        .expect("ran")
+        .run_id;
+
+    let first = runtime
+        .assess(verdict(run, "alice", "helpful", Score::Pass(true)))
+        .await
+        .expect("recorded");
+    runtime
+        .assess(verdict(run, "bob", "helpful", Score::Pass(false)))
+        .await
+        .expect("recorded");
+    runtime
+        .assess(verdict(
+            run,
+            "alice",
+            "action",
+            Score::Label("edited".into()),
+        ))
+        .await
+        .expect("recorded");
+    runtime
+        .assess(verdict(run, "alice", "helpful", Score::Pass(false)))
+        .await
+        .expect("recorded");
+
+    let read = runtime.assessments(run).await.expect("read");
+    assert_eq!(read.history.len(), 4, "a replaced verdict left the history");
+    let current = read.current();
+    assert_eq!(current.len(), 3, "{current:#?}");
+    let alice_helpful = current
+        .iter()
+        .find(|a| a.by().actor() == "alice" && a.name() == "helpful")
+        .expect("alice's verdict on helpful");
+    assert_eq!(
+        alice_helpful.value(),
+        &Score::Pass(false),
+        "the earlier verdict still stands in the view"
+    );
+    assert_eq!(
+        alice_helpful.rationale(),
+        Some("alice's reason"),
+        "the rationale did not read back"
+    );
+
+    // The verdict is its own sealed run, named by who made it.
+    let outcome = runtime
+        .recorded_outcome(first)
+        .await
+        .expect("read")
+        .expect("concluded");
+    assert_eq!(outcome.status.as_str(), "assessed", "{:?}", outcome.status);
+    assert_eq!(
+        outcome
+            .status
+            .actor()
+            .map(agentplane::core::Operator::actor),
+        Some("alice")
+    );
+    assert!(
+        runtime
+            .assessments(first)
+            .await
+            .expect("read")
+            .history
+            .is_empty(),
+        "the index answered for the wrong run"
+    );
+}
+
+/// **Only an answer is judged.** A run still working, one nobody has heard of,
+/// and a verdict itself are refused, and nothing is written for them.
+#[tokio::test]
+async fn only_a_concluded_run_is_assessed() {
+    use agentplane::core::{RuntimeError, Score, Tainted};
+    use agentplane::journal::RecordKind;
+    let store = Arc::new(RedbStore::open_in_memory().expect("a store"));
+    let runtime = answering(Arc::clone(&store) as Arc<dyn JournalStore>);
+
+    // Admitted and never concluded: still working, as far as the journal says.
+    let working = RunId::generate();
+    let lease = store
+        .acquire(working, "test", Duration::from_mins(1))
+        .await
+        .expect("lease");
+    store
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                working,
+                RecordKind::RunAdmitted {
+                    capability: "demo.answer".into(),
+                    governed_by: None,
+                    input_label: agentplane::core::Label::trusted(),
+                    input_field_labels: std::collections::BTreeMap::new(),
+                    input: serde_json::json!({}),
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
+                    plane_chain: false,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+
+    for (run, what) in [
+        (working, "a run still working"),
+        (RunId::generate(), "an unknown run"),
+    ] {
+        let refused = runtime
+            .assess(verdict(run, "alice", "helpful", Score::Pass(true)))
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(RuntimeError::NotAssessable { .. }
+                    | RuntimeError::Store(StoreError::NotFound(_)))
+            ),
+            "{what} was assessed: {refused:?}"
+        );
+        assert!(
+            runtime
+                .assessments(run)
+                .await
+                .expect("read")
+                .history
+                .is_empty(),
+            "{what} gained a verdict"
+        );
+    }
+
+    let done = runtime
+        .start("demo.answer", Tainted::trusted(serde_json::json!({})))
+        .run()
+        .await
+        .expect("ran")
+        .run_id;
+    let assessment = runtime
+        .assess(verdict(done, "alice", "helpful", Score::Pass(true)))
+        .await
+        .expect("an answer is assessed");
+    let refused = runtime
+        .assess(verdict(assessment, "bob", "helpful", Score::Pass(false)))
+        .await;
+    assert!(
+        matches!(refused, Err(RuntimeError::NotAssessable { .. })),
+        "a verdict was assessed as if it were an answer: {refused:?}"
+    );
 }

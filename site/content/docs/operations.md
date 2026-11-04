@@ -964,6 +964,47 @@ U+0000–U+001F, so DEL, the C1 controls and the bidirectional and invisible
 characters print as they are — read the text form on a terminal. A run the
 store does not hold exits `1`, whatever `--from` names.
 
+### A run's answer {#a-runs-answer}
+
+A run's answer is not stored: a **strict replay** re-derives it from the
+journal, performing nothing and writing nothing. `Runtime::output(run)` is that
+read, and `GET /runs/{run}/output` serves it with the value's label — trust,
+sensitivity and every source that shaped it.
+
+There is no answer (`None`, a `409` naming why) for a run that has not
+succeeded, one whose data was erased, and one sealed to a key ring this plane
+does not hold. The read needs the run's agent registered on this plane under
+the revision it ran. The A2A surface caches completed tasks' answers and drops
+an entry once the run's payloads no longer open.
+
+### Verdicts on a run {#verdicts}
+
+What a person thought of an answer — *helpful*, *not helpful*; a proposed
+action *sent*, *edited*, *dismissed* — is a record of its own:
+`Runtime::assess(Assessment)` writes an `Assessed` record as the sole record of
+a sealed run, stamped with the judged run's case. The judged run is untouched.
+
+| | |
+|---|---|
+| `name` | What was judged: 1–64 of `a-z`, `0-9`, `.`, `_`, `-` |
+| `value` | `true`/`false`, a finite number, or a label in the `name` grammar |
+| `by` | The actor and what established it — over the API, the authenticated caller, never a name in the body |
+| `rationale` | Their words, up to 4 KiB: a **sealed** payload, erased with the judged run's data |
+
+The metric, the value and who judged stay clear, so a quality reading still
+counts them after an erasure; the grammar keeps prose out of them.
+
+**Nothing is overwritten.** `Runtime::assessments(run)` answers every verdict in
+commit order, and `current()` the last by each actor on each metric; a replaced
+verdict stays in the history. `GET /runs/{run}/assessments` computes `current`
+over every verdict and pages `history`, newest kept.
+
+Refused with `RuntimeError::NotAssessable` (a `409`): a run still working,
+waiting or withheld, one whose data was erased, and an operator's act. An
+unknown run is a `404`. `erase_run` takes a case-less run's verdicts'
+rationales with it; a case-bound run's go with the matter's key. An unreadable
+rationale reads as `None`. `GET /runs?outcome=assessed` lists verdicts.
+
 ### The command line's exit statuses {#exit-statuses}
 
 One table for every verb, printed at the foot of `agentplane --help`, because a
@@ -2020,6 +2061,9 @@ Copy the file; it calls operator routes and runs no agent code.
 | `GET /runs/waiting` | What is this plane **waiting on**, and until when? Soonest due first, so what should have moved already sorts to the front → [the recovery runbook](#recovery-drill) |
 | `GET /runs/{run}` | What is this run doing — **why is it not finishing**, or why did it end, and on whose decision? |
 | `GET /runs/{run}/history` | What did it actually *do*? The journal, record by record, from `?from=<seq>` |
+| `GET /runs/{run}/output` | What did it *answer*? The value a run that succeeded produced, with its label — re-derived by strict replay, so its own verb (`api:run.output`) and its own route → [a run's answer](#a-runs-answer) |
+| `GET /runs/{run}/assessments` | What did people say about that answer? The verdicts standing and every one recorded → [verdicts](#verdicts) |
+| `POST /runs/{run}/assessments` | Record my verdict on it, as myself — `201` with the run that holds it |
 | `GET /tasks` | What is waiting for me? |
 | `GET /tasks/{task}` | What is this proposal, and may I decide it? |
 | `POST /tasks/{task}/claim` | This one is mine — don't let a colleague duplicate it |

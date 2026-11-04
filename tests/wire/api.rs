@@ -39,6 +39,28 @@ use tower::ServiceExt as _;
 #[derive(Debug)]
 struct ProposesRefund;
 
+/// Answers at once, with a value a tool wrote.
+#[derive(Debug)]
+struct Answers;
+
+#[async_trait::async_trait]
+impl Skill for Answers {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("answers").provides("demo.answer")
+    }
+
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        Ok(Outcome::done(Tainted::from_source(
+            json!({ "verdict": "refund" }),
+            agentplane::core::SourceId::new("tool://crm/lookup"),
+        )))
+    }
+}
+
 #[async_trait::async_trait]
 impl Skill for ProposesRefund {
     fn descriptor(&self) -> SkillDescriptor {
@@ -183,7 +205,8 @@ fn fixture_with(policy: &Arc<Recording>) -> Fixture {
         .events(store.clone() as Arc<dyn EventStore>)
         .tasks(store.clone() as Arc<dyn TaskStore>)
         .policy(policy.clone() as Arc<dyn PolicyEngine>)
-        .skill(ProposesRefund);
+        .skill(ProposesRefund)
+        .skill(Answers);
     #[cfg(feature = "push")]
     let rt = rt.push(store.clone() as Arc<dyn agentplane::push::PushStore>);
     let rt = rt.build();
@@ -1067,6 +1090,15 @@ fn every_declared_route() -> Vec<axum::http::Request<axum::body::Body>> {
         // a run are its inputs and every argument it sent, which is not what a
         // deployment granted when it granted the status view.
         get("/runs/not-an-id/history", Some("bob")),
+        // Its own verb too: the answer is the caller's data, which a grant of
+        // the status view did not hand out.
+        get("/runs/not-an-id/output", Some("bob")),
+        get("/runs/not-an-id/assessments", Some("bob")),
+        post(
+            "/runs/not-an-id/assessments",
+            Some("bob"),
+            &json!({ "name": "helpful", "value": true }),
+        ),
         post(
             "/runs/not-an-id/cancel",
             Some("bob"),
@@ -1240,6 +1272,7 @@ fn example_body(operation: &str) -> Value {
     let case = "case_01ARZ3NDEKTSV4RRFFQ69G5FAV";
     match operation {
         "cancel_run" => json!({ "reason": "stop" }),
+        "assess_run" => json!({ "name": "helpful", "value": true }),
         "reopen_run" | "abandon_run" => json!({ "reason": "checked the provider" }),
         "reconcile_effect" => json!({
             "effect": "0".repeat(64),
@@ -1801,6 +1834,169 @@ async fn an_exhausted_runs_view_carries_the_typed_ceiling() {
     assert_eq!(body["exhaustion"]["allowed"], 3, "{body}");
     assert_eq!(body["exhaustion"]["used"], 3, "{body}");
     assert_eq!(body["sealed"], false, "{body}");
+}
+
+/// **A run's answer is readable, labelled, under its own verb.**
+///
+/// A status view says a run succeeded; this says what it answered and who
+/// wrote it. A run that has not succeeded is a conflict naming its status, an
+/// unknown one is not found, and a grant of the status view does not reach
+/// the answer.
+#[tokio::test]
+async fn a_runs_answer_is_served_with_its_label_under_its_own_verb() {
+    let f = fixture();
+    let router = f.router();
+    let done =
+        f.rt.start("demo.answer", Tainted::trusted(json!({})))
+            .run()
+            .await
+            .unwrap();
+    assert_eq!(done.status, agentplane::runtime::RunStatus::Succeeded);
+    let run = done.run_id;
+
+    let (status, body) = send(&router, get(&format!("/runs/{run}/output"), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["output"], json!({ "verdict": "refund" }), "{body}");
+    assert_eq!(body["label"]["trust"], "untrusted", "{body}");
+    assert_eq!(
+        body["label"]["provenance"],
+        json!(["tool://crm/lookup"]),
+        "{body}"
+    );
+
+    let task = f.pending_task().await;
+    let waiting = (f.store.clone() as Arc<dyn TaskStore>)
+        .task(agentplane::core::TaskId::parse(&task).expect("a task id"))
+        .await
+        .unwrap()
+        .expect("the task")
+        .run;
+    let (status, body) = send(
+        &router,
+        get(&format!("/runs/{waiting}/output"), Some("bob")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("suspended")),
+        "a refusal that does not name the status sends the caller to read it: {body}"
+    );
+
+    let (status, _) = send(
+        &router,
+        get("/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/output", Some("bob")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let reader = Api::new(
+        Runtime::builder(f.store.clone() as Arc<dyn JournalStore>)
+            .policy(Arc::new(OnlyAllows("api:run.read")) as Arc<dyn PolicyEngine>)
+            .build(),
+        Arc::new(HeaderAuth),
+    )
+    .expect("a policy engine")
+    .router();
+    let (status, body) = send(&reader, get(&format!("/runs/{run}/output"), Some("bob"))).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a grant of the status view handed out the answer: {body}"
+    );
+}
+
+/// **A verdict is recorded as the authenticated caller, and read back as the
+/// one standing.**
+///
+/// The body names what was judged and how; who judged comes from the
+/// credential, and a body that tries to say otherwise is refused rather than
+/// ignored.
+#[tokio::test]
+async fn an_assessment_is_recorded_as_the_authenticated_caller() {
+    let f = fixture();
+    let router = f.router();
+    let run =
+        f.rt.start("demo.answer", Tainted::trusted(json!({})))
+            .run()
+            .await
+            .unwrap()
+            .run_id;
+    let path = format!("/runs/{run}/assessments");
+
+    for value in [json!(true), json!(false)] {
+        let (status, body) = send(
+            &router,
+            post(
+                &path,
+                Some("bob"),
+                &json!({ "name": "helpful", "value": value, "rationale": "cited the wrong invoice" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(
+            body["record"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("run_")),
+            "{body}"
+        );
+    }
+
+    let (status, body) = send(&router, get(&path, Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["history"].as_array().map(Vec::len), Some(2), "{body}");
+    let current = body["current"].as_array().expect("current");
+    assert_eq!(current.len(), 1, "{body}");
+    assert_eq!(
+        current[0]["value"], false,
+        "the earlier verdict stands: {body}"
+    );
+    assert_eq!(current[0]["by"]["actor"], "bob", "{body}");
+    assert_eq!(current[0]["by"]["basis"], "authenticated", "{body}");
+    assert_eq!(current[0]["rationale"], "cited the wrong invoice", "{body}");
+
+    let (status, body) = send(
+        &router,
+        post(
+            &path,
+            Some("bob"),
+            &json!({ "name": "helpful", "value": true, "by": "alice" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a body naming its own assessor was not refused: {body}"
+    );
+
+    let (status, body) = send(
+        &router,
+        post(
+            &path,
+            Some("bob"),
+            &json!({ "name": "Not Helpful", "value": true }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "prose as a metric name: {body}"
+    );
+
+    let (status, _) = send(
+        &router,
+        post(
+            "/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/assessments",
+            Some("bob"),
+            &json!({ "name": "helpful", "value": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 /// **A run's journal is readable from the surface that answers about runs.**

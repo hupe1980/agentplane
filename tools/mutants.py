@@ -10514,6 +10514,9 @@ pub struct Label {""",
         "backlog that exists so a quarantine reaches somebody",
         """        RUN_READ,
         RUN_HISTORY,
+        RUN_OUTPUT,
+        RUN_ASSESS,
+        RUN_ASSESSMENTS,
         RUN_LIST,
         RUN_LIVE,
         RUN_WAITING,
@@ -10522,6 +10525,9 @@ pub struct Label {""",
         RUN_CANCEL,""",
         """        RUN_READ,
         RUN_HISTORY,
+        RUN_OUTPUT,
+        RUN_ASSESS,
+        RUN_ASSESSMENTS,
         RUN_LIVE,
         RUN_WAITING,
         ATTENTION,
@@ -10972,6 +10978,7 @@ pub struct Label {""",
                 | Self::BrokeGlass { .. }
                 | Self::HaltLifted { .. }
                 | Self::HoldReleased { .. }
+                | Self::Assessed { .. }
                 | Self::Observed
         )""",
         """        matches!(
@@ -11217,9 +11224,9 @@ pub struct Label {""",
         "an operator deciding what to seal cannot tell whether it leaves a "
         "digest of erased content in the clear",
         """`HoldReleased`,
-`Swept` and `Observed` carry""",
+`Swept`, `Observed` and `Assessed` carry""",
         """`HoldReleased`,
-`Observed` carry""",
+`Observed` and `Assessed` carry""",
     ),
     "TheErasureStatementOmitsAStore": (
         "site/content/docs/erasure.md",
@@ -16141,6 +16148,113 @@ pub struct WrappedKey {""",
         """        if call.name != offered.name || offered.tool.as_ref() != Some(&self.id) {""",
         """        if call.name != self.id.wire_name() {""",
     ),
+    "AnOutcomeJoinsByPosition": (
+        "src/journal/calls.rs",
+        "two_calls_to_one_tool_stay_two_calls",
+        "an effect's outcome is joined to the latest announcement rather than to its own key, so two calls in flight at once each read the other's answer",
+        """                if let Some(&i) = at.get(&key) {""",
+        """                if let Some(i) = found.len().checked_sub(1) {""",
+    ),
+    "AnUnsettledCallIsDropped": (
+        "src/journal/calls.rs",
+        "an_unsettled_call_is_listed_without_an_outcome",
+        "an announced effect nothing settled is left out of the run's calls, so the call a crash left in doubt is the one a reader cannot see",
+        """    found
+}""",
+        """    found.retain(|c| c.outcome.is_some());
+    found
+}""",
+    ),
+    "ANamedReadAnswersNothing": (
+        "src/runtime/executor.rs",
+        "a_concluded_runs_answer_is_read_by_its_id",
+        "the named read of a run's answer answers nothing for a run that succeeded, so a caller is told there is no answer to a question the journal can answer",
+        """                self.succeeded_output(run).await""",
+        """                Ok(None)""",
+    ),
+    "TheAnswerIsGrantedWithTheStatus": (
+        "src/api/mod.rs",
+        "a_runs_answer_is_served_with_its_label_under_its_own_verb",
+        "the answer route asks the status view's verb, so a rota granted to see that a run failed is handed what every run said",
+        """    let s = api.gate(&headers, action::RUN_OUTPUT, &run).await?;""",
+        """    let s = api.gate(&headers, action::RUN_READ, &run).await?;""",
+    ),
+    "AnErasedAnswerIsServedFromTheCache": (
+        "src/api/a2a.rs",
+        "an_erased_tasks_artifacts_are_not_served_from_the_cache",
+        "a cached task projection is served after the run's data was erased, so the plaintext the erasure destroyed is still handed to the peer",
+        """    if runtime.payloads_readable(run).await? {""",
+        """    if true {""",
+    ),
+    "TheEarlierVerdictStands": (
+        "src/core/assessment.rs",
+        "a_later_verdict_replaces_an_earlier_one_in_the_view",
+        "a person's later verdict on a metric does not replace their earlier one in the view, so a withdrawn judgement is the one a quality reading counts",
+        """                *held = assessment;""",
+        """                let _ = held;""",
+    ),
+    "ARunStillWorkingIsAssessed": (
+        "src/runtime/executor.rs",
+        "only_a_concluded_run_is_assessed",
+        "a verdict is recorded on a run still working, so a person judges an answer that does not exist yet",
+        """            None => return Err(refused("it is still working")),""",
+        """            None => {}""",
+    ),
+    "TheAssessmentIndexIsNotWritten": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "the store writes a verdict without indexing it under the run it judges, so the run reads as nobody having judged it",
+        """                    if let crate::journal::RecordKind::Assessed { of, .. } = record.kind() {""",
+        """                    if let Some(of) = None::<&String> {""",
+    ),
+    "TheAssessorNamesThemself": (
+        "src/api/mod.rs",
+        "an_assessment_is_recorded_as_the_authenticated_caller",
+        "a verdict posted over the API is recorded under a name the body chose rather than the authenticated caller's",
+        """    let by = crate::core::Operator::authenticated(s.caller.actor.clone())
+        .map_err(|e| unusable_caller(&e))?;
+    let assessment = crate::core::Assessment::new(""",
+        """    let by = crate::core::Operator::asserted(body.name.clone())
+        .map_err(|e| unusable_caller(&e))?;
+    let assessment = crate::core::Assessment::new(""",
+    ),
+    "AVerdictOutlivesTheRunsErasure": (
+        "src/blob/mod.rs",
+        "erasing_a_run_takes_the_rationale_of_every_verdict_on_it",
+        "erasing a run leaves the words people wrote about it readable, sealed under the verdicts' own scopes",
+        """    for scope in std::iter::once(run).chain(assessments) {""",
+        """    for scope in std::iter::once(run).chain(assessments.into_iter().take(0)) {""",
+    ),
+    "AnErasedReasonIsServedAsCiphertext": (
+        "src/runtime/executor.rs",
+        "erasing_a_run_takes_the_rationale_of_every_verdict_on_it",
+        "a verdict whose words were erased is read back with its ciphertext as the reason, so a reader is shown sealed bytes as what a person said",
+        """                rationale.clone().filter(|text| !sealed_text(text)),""",
+        """                rationale.clone(),""",
+    ),
+    "AnErasedRunIsAssessed": (
+        "src/runtime/executor.rs",
+        "erasing_a_run_takes_the_rationale_of_every_verdict_on_it",
+        "a verdict is written about a run whose data was erased, sealing new words about it under a scope nobody destroyed",
+        """        if input_sealed || payloads_erased(&records) {""",
+        """        if false && (input_sealed || payloads_erased(&records)) {""",
+    ),
+    "ARunThatDidNotSucceedAnswersOk": (
+        "src/api/mod.rs",
+        "a_runs_answer_is_served_with_its_label_under_its_own_verb",
+        "the answer route serves a run that did not succeed as a success, so a caller polling for an answer reads a refusal body as one",
+        """                StatusCode::CONFLICT,
+                format!("run {id} has not succeeded: it is {status}"),""",
+        """                StatusCode::OK,
+                format!("run {id} has not succeeded: it is {status}"),""",
+    ),
+    "TheSharedBackendForgetsAVerdict": (
+        "src/store/postgres.rs",
+        "postgres_satisfies_the_journal_store_contract",
+        "the shared backend writes a verdict without indexing it under the run it judges — the redb mutation cannot reach this copy",
+        """                crate::journal::RecordKind::Assessed { of, .. } => assessed.push(of.clone()),""",
+        """                crate::journal::RecordKind::Assessed { of, .. } => drop(of),""",
+    ),
     "TwoOffersOfOneNameAnswerACall": (
         "src/runtime/ctx.rs",
         "a_call_no_single_catalogue_offer_answers_is_refused",
@@ -16336,7 +16450,7 @@ def check() -> int:
     # falsifiable. Checked here because this answers in milliseconds and the
     # sweep that would notice runs for hours.
     names = list(MUTANTS)
-    for total in (1, 2, 6, 10, 16, len(names)):
+    for total in (1, 2, 6, 10, 14, 16, len(names)):
         seen = [n for k in range(1, total + 1) for n in _shard(names, k, total)]
         if sorted(seen) != sorted(names):
             missing = [n for n in names if n not in set(seen)]
@@ -16449,18 +16563,17 @@ def _locate(test: str) -> tuple[str | None, frozenset[str] | None] | None:
 _SECONDS_BY_TARGET: dict[str | None, int] = {
     None: 13,  # --all-features --lib
     "bin:agentplane": 10,
-    "wire": 19,
-    "guards": 19,
+    "wire": 30,
+    "guards": 16,
     "process": 13,
     "engine": 13,
-    "trust": 17,
+    "trust": 13,
     "live": 30,
 }
 
-# What a shard pays to enter a feature set: the dependency graph rebuilt under
-# it. Of the same order as a shard's whole budget, so a shard that enters four
-# sets does four times the building of one that enters one.
-_BUILD_SECONDS = 660
+# What a shard pays to enter a feature set: the crate and whatever of its
+# dependency graph the shard's own cache does not already hold.
+_BUILD_SECONDS = 180
 
 
 @functools.lru_cache(maxsize=None)

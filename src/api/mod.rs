@@ -336,6 +336,21 @@ pub struct CancelRequest {
     pub reason: String,
 }
 
+/// A verdict on what a run answered. Who judged is the authenticated caller;
+/// there is no field for it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssessRequest {
+    /// What is judged — `helpful`, `action` — 1 to 64 of a-z, 0-9, `.`, `_`
+    /// or `-`.
+    pub name: String,
+    /// A boolean, a finite number, or a label in the same grammar as `name`.
+    pub value: crate::core::Score,
+    /// Why, in the caller's words; sealed with the judged run's data.
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
 /// Naming one webhook registration.
 ///
 /// The pair is the registration's identity: `run` is the task it follows and
@@ -867,6 +882,86 @@ struct HistoryPage {
     records: Vec<crate::journal::view::RecordView>,
     truncated: bool,
     next_from: Option<crate::core::Seq>,
+}
+
+/// What a run answered, with what it may be believed and how far it may go.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct RunOutput {
+    run: String,
+    #[schemars(extend("x-agentplane-holds" = "The value the run's last step produced, as the run's own output schema shapes it."))]
+    output: Value,
+    label: LabelView,
+}
+
+/// A value's label, as a reader outside the plane is shown it.
+///
+/// Served beside every value this surface hands out, because a caller acting
+/// on an answer needs to know whether a model, a peer or a person wrote it.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct LabelView {
+    /// `trusted` or `untrusted`.
+    trust: crate::core::Trust,
+    sensitivity: crate::core::Sensitivity,
+    /// Every source that influenced the value.
+    provenance: Vec<String>,
+}
+
+impl From<&crate::core::Label> for LabelView {
+    fn from(label: &crate::core::Label) -> Self {
+        Self {
+            trust: label.trust,
+            sensitivity: label.sensitivity,
+            provenance: label.provenance.iter().map(ToString::to_string).collect(),
+        }
+    }
+}
+
+/// The run a verdict was recorded in.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct AssessAnswer {
+    record: String,
+}
+
+/// One verdict, as a reader outside the plane is shown it.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct AssessmentView {
+    name: String,
+    value: crate::core::Score,
+    by: ActorView,
+    at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rationale: Option<String>,
+}
+
+impl From<&crate::core::Assessment> for AssessmentView {
+    fn from(a: &crate::core::Assessment) -> Self {
+        Self {
+            name: a.name().to_owned(),
+            value: a.value().clone(),
+            by: ActorView::from(a.by()),
+            at: a.at().to_string(),
+            rationale: a.rationale().map(str::to_owned),
+        }
+    }
+}
+
+/// The verdicts on one run: those standing, and every one recorded.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct AssessmentsView {
+    run: String,
+    /// The last verdict by each person on each metric.
+    current: Vec<AssessmentView>,
+    /// Every verdict, in the order recorded — one a later verdict replaced
+    /// included; the newest when there are more than one page holds.
+    history: Vec<AssessmentView>,
+    /// Whether older verdicts were left out of `history`. `current` is always
+    /// over every one.
+    truncated: bool,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -1560,6 +1655,21 @@ pub mod action {
     /// argument it sent. A deployment that grants an on-call rota the first has
     /// said nothing about the second.
     pub const RUN_HISTORY: &str = "api:run.history";
+    /// Reading what a run answered.
+    ///
+    /// Its own verb for the reason [`RUN_HISTORY`] is: the status view says
+    /// *how* a run ended, and this hands over *what it said* — the caller's
+    /// data, labelled. A rota that may see a run failed has not been granted
+    /// its answer.
+    pub const RUN_OUTPUT: &str = "api:run.output";
+    /// Recording a verdict on what a run answered.
+    pub const RUN_ASSESS: &str = "api:run.assess";
+    /// Reading the verdicts recorded on a run.
+    ///
+    /// Apart from [`RUN_ASSESS`] for the reason a hold's placement is apart
+    /// from its listing: who may judge and who may read the judgements are two
+    /// grants, and a quality review reads far more than it writes.
+    pub const RUN_ASSESSMENTS: &str = "api:run.assessments";
     pub const RUN_LIST: &str = "api:run.list";
     /// Reading which runs are executing **right now**.
     ///
@@ -1708,6 +1818,9 @@ pub mod action {
     pub const ALL: &[&str] = &[
         RUN_READ,
         RUN_HISTORY,
+        RUN_OUTPUT,
+        RUN_ASSESS,
+        RUN_ASSESSMENTS,
         RUN_LIST,
         RUN_LIVE,
         RUN_WAITING,
@@ -1896,6 +2009,143 @@ async fn run_history(
         // Only where there is more to ask for. A cursor handed back on a
         // complete page is one a caller loops on forever.
         next_from: truncated.then_some(next_from).flatten(),
+    }))
+}
+
+/// What a run answered.
+///
+/// A run's answer is re-derived by strict replay rather than stored, so this
+/// is the costliest read on the run routes, and the reason it is a route of its
+/// own rather than a field on the run view, which is read in a loop.
+///
+/// `404` for a run nobody has heard of; `409` for one that has not succeeded,
+/// naming its status, for one whose data was erased, and for one whose
+/// payloads are sealed to a key ring this plane does not hold.
+async fn run_output(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Uniform(Path(run)): Uniform<Path<String>>,
+) -> Result<Json<RunOutput>, ApiError> {
+    let s = api.gate(&headers, action::RUN_OUTPUT, &run).await?;
+    let id = RunId::parse(&run).map_err(|_| bad("run"))?;
+    let records = s
+        .plane
+        .journal()
+        .read_page(id, 1, 1)
+        .await
+        .map_err(|_| store_failed())?;
+    if records.is_empty() {
+        return Err(not_found("run"));
+    }
+    let status = s
+        .plane
+        .recorded_outcome(id)
+        .await
+        .map_err(|_| store_failed())?
+        .map_or_else(|| "running".to_owned(), |o| o.status.as_str().to_owned());
+    let output = match s.plane.output(id).await {
+        Ok(Some(output)) => output,
+        Ok(None) => {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!("run {id} has not succeeded: it is {status}"),
+            ));
+        }
+        Err(
+            e @ (crate::core::RuntimeError::PayloadsErased { .. }
+            | crate::core::RuntimeError::PayloadsSealed { .. }),
+        ) => {
+            return Err(ApiError(StatusCode::CONFLICT, e.to_string()));
+        }
+        Err(e) => {
+            tracing::error!(target: "agentplane::api", run = %id, error = %e, "re-deriving a run's answer failed");
+            return Err(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the run's answer could not be re-derived".to_owned(),
+            ));
+        }
+    };
+    Ok(Json(RunOutput {
+        run: id.to_string(),
+        label: LabelView::from(output.label()),
+        output: output.peek().clone(),
+    }))
+}
+
+/// Record a verdict on what a run answered.
+///
+/// `201` with the run the verdict was recorded in. The actor is the
+/// authenticated caller, never a name in the body. `400` for a name, label or
+/// number outside the grammar; `404` for a run nobody has heard of; `409` for
+/// one with no answer to judge.
+async fn assess_run(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Uniform(Path(run)): Uniform<Path<String>>,
+    Uniform(Json(body)): Uniform<Json<AssessRequest>>,
+) -> Result<(StatusCode, Json<AssessAnswer>), ApiError> {
+    let s = api.gate(&headers, action::RUN_ASSESS, &run).await?;
+    let id = RunId::parse(&run).map_err(|_| bad("run"))?;
+    let by = crate::core::Operator::authenticated(s.caller.actor.clone())
+        .map_err(|e| unusable_caller(&e))?;
+    let assessment = crate::core::Assessment::new(
+        id,
+        body.name,
+        body.value,
+        by,
+        now_for_account(),
+        body.rationale,
+    )
+    .map_err(|e| invalid(&e.to_string()))?;
+    let record = s.plane.assess(assessment).await.map_err(|e| match e {
+        crate::core::RuntimeError::Store(crate::core::StoreError::NotFound(_)) => not_found("run"),
+        crate::core::RuntimeError::NotAssessable { .. } => {
+            ApiError(StatusCode::CONFLICT, e.to_string())
+        }
+        _ => store_failed(),
+    })?;
+    tracing::info!(target: "agentplane::api", actor = %s.caller.actor, run = %id, record = %record, "run assessed");
+    Ok((
+        StatusCode::CREATED,
+        Json(AssessAnswer {
+            record: record.to_string(),
+        }),
+    ))
+}
+
+/// The verdicts recorded on a run, those standing and every one.
+async fn run_assessments(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Uniform(Path(run)): Uniform<Path<String>>,
+) -> Result<Json<AssessmentsView>, ApiError> {
+    let s = api.gate(&headers, action::RUN_ASSESSMENTS, &run).await?;
+    let id = RunId::parse(&run).map_err(|_| bad("run"))?;
+    // A mistyped id is not a run nobody judged.
+    let known = s
+        .plane
+        .journal()
+        .read_page(id, 1, 1)
+        .await
+        .map_err(|_| store_failed())?;
+    if known.is_empty() {
+        return Err(not_found("run"));
+    }
+    let read = s.plane.assessments(id).await.map_err(|_| store_failed())?;
+    let current = read
+        .current()
+        .into_iter()
+        .map(AssessmentView::from)
+        .collect();
+    let skip = read.history.len().saturating_sub(api.history);
+    Ok(Json(AssessmentsView {
+        run: id.to_string(),
+        current,
+        history: read.history[skip..]
+            .iter()
+            .map(AssessmentView::from)
+            .collect(),
+        truncated: skip > 0,
     }))
 }
 

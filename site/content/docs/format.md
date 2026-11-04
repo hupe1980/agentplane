@@ -937,7 +937,7 @@ re-addressing, because a record names the digest it always named and that run's
 
 ## Vocabulary {#vocabulary}
 
-There are 33 record kinds. A verifier does not interpret them; a reader that
+There are 34 record kinds. A verifier does not interpret them; a reader that
 does must refuse one it has never heard of, for the reason
 [the record body](#record-body) gives.
 
@@ -948,7 +948,7 @@ does must refuse one it has never heard of, for the reason
 `IdentityBound`, `DataSubjectBound`, `PolicyDenied`, `RunSuspended`,
 `CaseBound`, `DeadlineRegistered`, `DeadlineTransition`, `Released`,
 `RunCancelled`, `RunConcluded`, `BreakGlass`, `HaltLifted`, `HoldReleased`,
-`Swept`, `Observed`.
+`Swept`, `Observed`, `Assessed`.
 
 **One of them is not this plane's own work, and a reader must not treat it as
 such.** `Observed` records what an agent this plane does **not** execute

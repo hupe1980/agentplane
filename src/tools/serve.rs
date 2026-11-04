@@ -777,11 +777,16 @@ impl ServerHandler for McpServer {
             // happened, not the value, so a success is re-derived by strict
             // replay — no effect is performed — and the retry gets the answer
             // the first call got rather than an empty success.
-            Admission::Replayed(outcome) if matches!(outcome.status, RunStatus::Succeeded) => self
-                .runtime
-                .replay(outcome.run_id, crate::runtime::Mode::Strict)
-                .await
-                .map_err(|e| internal("replaying a retried call", &e))?,
+            Admission::Replayed(outcome) if matches!(outcome.status, RunStatus::Succeeded) => {
+                crate::runtime::RunOutcome {
+                    output: self
+                        .runtime
+                        .succeeded_output(outcome.run_id)
+                        .await
+                        .map_err(|e| internal("replaying a retried call", &e))?,
+                    ..outcome
+                }
+            }
             Admission::Fresh(outcome) | Admission::Replayed(outcome) => outcome,
             // The same call is executing right now, here or on another
             // instance: a task the host can poll, never a failure it retries.
@@ -962,13 +967,13 @@ impl ServerHandler for McpServer {
             // answer the host suspended for. Recovered by strict replay — the
             // output is a projection of the journal, and nothing is re-run.
             Some(RunStatus::Succeeded) => {
-                let outcome = self
+                let output = self
                     .runtime
-                    .replay(run, crate::runtime::Mode::Strict)
+                    .succeeded_output(run)
                     .await
                     .map_err(|e| internal("replaying a completed task", &e))?;
                 let result =
-                    serde_json::to_value(finished(run, &outcome.status, outcome.output.as_ref()))
+                    serde_json::to_value(finished(run, &RunStatus::Succeeded, output.as_ref()))
                         .map_err(|e| internal("encoding a task's result", &e))?;
                 TaskPayload::Completed {
                     result: result.as_object().cloned().unwrap_or_default(),

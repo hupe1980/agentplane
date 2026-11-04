@@ -467,6 +467,14 @@ impl JournalStore for Faulty {
         self.inner.count_by_outcome(outcome).await
     }
 
+    async fn assessments_of(
+        &self,
+        run: crate::core::RunId,
+        limit: usize,
+    ) -> Result<Vec<crate::core::RunId>, StoreError> {
+        self.inner.assessments_of(run, limit).await
+    }
+
     async fn runs_by_id(
         &self,
         after: Option<RunId>,
@@ -682,6 +690,14 @@ mod tests {
             unreachable!("the test reads capabilities only")
         }
         async fn count_by_outcome(&self, _: &str) -> Result<u64, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+
+        async fn assessments_of(
+            &self,
+            _: crate::core::RunId,
+            _: usize,
+        ) -> Result<Vec<crate::core::RunId>, StoreError> {
             unreachable!("the test reads capabilities only")
         }
         async fn admitted_as(&self, _: &str) -> Result<Option<RunId>, StoreError> {

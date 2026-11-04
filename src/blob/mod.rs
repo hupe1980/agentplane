@@ -589,6 +589,11 @@ async fn copies_of(
 /// happened — remain readable and verifiable, which is the whole design: the
 /// chain committed to ciphertext.
 ///
+/// **A person's verdicts on the run go with it.** Each is a run of its own,
+/// sealed under its own scope because it has no case either, and its
+/// rationale is words about this run's data; those scopes are destroyed in the
+/// same call, after the run's own.
+///
 /// Idempotent as [`KeyRing::destroy`](crate::keyring::KeyRing::destroy) is:
 /// the first destruction stands, so a retry cannot rewrite when or why the
 /// data went.
@@ -632,10 +637,17 @@ pub async fn erase_run(
         });
     }
     let copies = copies_of(disclosures, &[], &[run]).await?;
-    keyring
-        .destroy(&crate::keyring::scope(tenant, &run.to_string()), at, reason)
-        .await
-        .map_err(|e| EraseError::Blob(BlobError::Backend(e.to_string())))?;
+    let assessments = journal.assessments_of(run, usize::MAX).await?;
+    for scope in std::iter::once(run).chain(assessments) {
+        keyring
+            .destroy(
+                &crate::keyring::scope(tenant, &scope.to_string()),
+                at,
+                reason,
+            )
+            .await
+            .map_err(|e| EraseError::Blob(BlobError::Backend(e.to_string())))?;
+    }
     Ok(copies)
 }
 

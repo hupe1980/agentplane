@@ -342,6 +342,14 @@ fn endings() -> Vec<RecordKind> {
             placed_by: operator("bob"),
             placed_at: at(),
         },
+        RecordKind::Assessed {
+            of: "run_01M6KEZ1EM1QGMRMEB4RBWBB3Y".into(),
+            name: "helpful".into(),
+            value: agentplane::core::Score::Number(0.1),
+            by: operator("dana"),
+            at: at(),
+            rationale: Some("cited the wrong invoice".into()),
+        },
         RecordKind::Swept {
             subject: "respond".into(),
             action: SweptAction::DeadlineBreached,
@@ -672,6 +680,7 @@ fn a_member_nobody_knows_is_refused_inside_the_payload() {
         ("HaltLifted", "/thrown_by"),
         ("HoldReleased", "/by"),
         ("HoldReleased", "/placed_by"),
+        ("Assessed", "/by"),
         ("Observed", "/reported"),
         ("Observed", "/reported/outcome"),
     ];

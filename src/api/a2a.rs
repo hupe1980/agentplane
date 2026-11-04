@@ -419,6 +419,7 @@ fn state_of(status: &crate::runtime::RunStatus) -> TaskState {
         | RunStatus::BrokeGlass { .. }
         | RunStatus::HaltLifted { .. }
         | RunStatus::HoldReleased { .. }
+        | RunStatus::Assessed { .. }
         | RunStatus::Observed => TaskState::Rejected,
     }
 }
@@ -1199,12 +1200,12 @@ impl Drop for StreamSlot {
 ///
 /// A completed task's artifacts exist only as a projection of its journal, so
 /// every read recovers them by **strict replay** — the most expensive read
-/// this surface performs. The cache is sound because it holds only sealed
-/// runs: a seal is the last record a run ever gets, so the projection is a
-/// pure function of an immutable history and can never go stale. Bounded and
-/// evicting oldest-first, because an unbounded cache is a leak with a
-/// performance story; insertion order is enough where every entry is equally
-/// immutable.
+/// this surface performs. It holds only sealed runs, whose history never
+/// changes, and **a hit is served only while the run's payloads still open**:
+/// an erasure leaves the history in place and makes the plaintext unreadable,
+/// so a projection kept past it would be the one copy the erasure missed.
+/// Bounded and evicting oldest-first, because an unbounded cache is a leak
+/// with a performance story.
 #[derive(Debug, Default)]
 pub(super) struct ArtifactCache {
     map: std::collections::HashMap<RunId, Option<Vec<A2aArtifact>>>,
@@ -1228,6 +1229,12 @@ impl ArtifactCache {
         self.map
             .get(&run)
             .map(|artifacts| ArtifactRead::Artifacts(artifacts.clone()))
+    }
+
+    fn forget(&mut self, run: RunId) {
+        if self.map.remove(&run).is_some() {
+            self.order.retain(|held| *held != run);
+        }
     }
 
     fn insert(&mut self, run: RunId, artifacts: Option<Vec<A2aArtifact>>) {
@@ -1654,7 +1661,7 @@ impl A2aServer {
         if state != TaskState::Completed {
             return Ok(ArtifactRead::Artifacts(None));
         }
-        if let Some(cached) = crate::core::poison::recover(&self.artifact_cache).get(run) {
+        if let Some(cached) = fresh_hit(&self.runtime, &self.artifact_cache, run).await? {
             return Ok(cached);
         }
         if let Some(budget) = &budget
@@ -2942,34 +2949,40 @@ async fn task_context(server: &A2aServer, run: RunId) -> Result<Option<String>, 
 }
 
 pub(super) fn task_of_outcome(outcome: &crate::runtime::RunOutcome) -> A2aTask {
+    task_of_answer(outcome.run_id, &outcome.status, outcome.output.as_ref())
+}
+
+/// A task from what a run ended as and what it answered.
+fn task_of_answer(
+    run: RunId,
+    status: &crate::runtime::RunStatus,
+    output: Option<&crate::core::Tainted<Value>>,
+) -> A2aTask {
     // A declared reply carries its own parts; otherwise the default projection
     // stands — a string is a text part, anything else a data part.
-    let artifacts_parts: Vec<Vec<Part>> =
-        match outcome.output.as_ref().and_then(A2aReply::of_output) {
-            Some(reply) => reply.artifact_parts(),
-            None => vec![vec![match outcome
-                .output
-                .as_ref()
-                .map_or(Value::Null, |o| o.peek().clone())
-            {
+    let artifacts_parts: Vec<Vec<Part>> = match output.and_then(A2aReply::of_output) {
+        Some(reply) => reply.artifact_parts(),
+        None => vec![vec![
+            match output.map_or(Value::Null, |o| o.peek().clone()) {
                 Value::String(text) => Part::text(text),
                 data => Part::data(data),
-            }]],
-        };
+            },
+        ]],
+    };
     A2aTask {
-        id: outcome.run_id.to_string(),
+        id: run.to_string(),
         context_id: None,
         status: TaskStatus {
-            state: state_of(&outcome.status),
+            state: state_of(status),
             message: None,
             timestamp: None,
         },
-        artifacts: matches!(outcome.status, crate::runtime::RunStatus::Succeeded).then(|| {
+        artifacts: matches!(status, crate::runtime::RunStatus::Succeeded).then(|| {
             artifacts_parts
                 .into_iter()
                 .enumerate()
                 .map(|(i, parts)| A2aArtifact {
-                    artifact_id: format!("{}-result-{i}", outcome.run_id),
+                    artifact_id: format!("{run}-result-{i}"),
                     name: None,
                     description: None,
                     parts,
@@ -3445,10 +3458,8 @@ pub(super) async fn task_artifacts(
     if state != TaskState::Completed {
         return Ok(None);
     }
-    runtime
-        .replay(run, crate::runtime::Mode::Strict)
-        .await
-        .map(|outcome| task_of_outcome(&outcome).artifacts)
+    let output = runtime.succeeded_output(run).await?;
+    Ok(task_of_answer(run, &crate::runtime::RunStatus::Succeeded, output.as_ref()).artifacts)
 }
 
 /// A task's artifacts through the sealed-run cache, unmetered.
@@ -3465,12 +3476,30 @@ pub(super) async fn cached_artifacts(
     if state != TaskState::Completed {
         return Ok(None);
     }
-    if let Some(ArtifactRead::Artifacts(artifacts)) = crate::core::poison::recover(cache).get(run) {
+    if let Some(ArtifactRead::Artifacts(artifacts)) = fresh_hit(runtime, cache, run).await? {
         return Ok(artifacts);
     }
     let artifacts = task_artifacts(runtime, run, state).await?;
     crate::core::poison::recover(cache).insert(run, artifacts.clone());
     Ok(artifacts)
+}
+
+/// A cached projection, served only while the run's payloads still open; one
+/// whose run was erased since is dropped, and the caller re-derives — which
+/// then fails the way an uncached read of an erased run does.
+async fn fresh_hit(
+    runtime: &Runtime,
+    cache: &std::sync::Mutex<ArtifactCache>,
+    run: RunId,
+) -> Result<Option<ArtifactRead>, crate::core::RuntimeError> {
+    let Some(cached) = crate::core::poison::recover(cache).get(run) else {
+        return Ok(None);
+    };
+    if runtime.payloads_readable(run).await? {
+        return Ok(Some(cached));
+    }
+    crate::core::poison::recover(cache).forget(run);
+    Ok(None)
 }
 
 /// A sealed run's outcome word, as an A2A state.
@@ -3503,6 +3532,7 @@ pub(super) fn sealed_state(outcome: &str) -> TaskState {
         | "broke-glass"
         | crate::runtime::HALT_LIFTED_OUTCOME
         | crate::runtime::HOLD_RELEASED_OUTCOME
+        | crate::runtime::ASSESSED_OUTCOME
         | crate::runtime::OBSERVED_OUTCOME => TaskState::Rejected,
         _ => TaskState::Failed,
     }
@@ -3953,7 +3983,7 @@ mod state_agreement_tests {
         let statuses = crate::runtime::every_status();
         assert_eq!(
             statuses.len(),
-            14,
+            15,
             "a RunStatus variant was added or removed — decide which A2A state it \
              surfaces as, in `state_of` and in `sealed_state` both"
         );

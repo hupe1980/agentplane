@@ -7,6 +7,7 @@
 //! compliance always rots; this cannot.
 
 mod atomic;
+mod calls;
 mod failure;
 mod note;
 // Unconditional: a build with no key ring still reads an export a sealed
@@ -24,6 +25,7 @@ mod witness;
 mod witness_http;
 
 pub use atomic::{AtomicJournal, AtomicResource, AtomicTx, AtomicWork, SqlValue};
+pub use calls::{Call, calls};
 pub use failure::{FailedEffect, failed_effect};
 pub use note::{NoteSignature, SignedNote, key_id};
 pub use record::{

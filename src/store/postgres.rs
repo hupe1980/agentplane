@@ -281,6 +281,17 @@ CREATE TABLE IF NOT EXISTS run_admission (
     PRIMARY KEY (tenant, key)
 );
 
+-- The runs recording a person's verdict on a run. **Derived**, not
+-- authoritative: fed by the `Assessed` record inside `append`, in the same
+-- transaction, so the verdict's home stays the chain. Read in the feed's
+-- order, which is commit order (see `JournalStore::assessments_of`).
+CREATE TABLE IF NOT EXISTS run_assessment (
+    tenant TEXT NOT NULL,
+    of_run TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    PRIMARY KEY (tenant, of_run, run_id)
+);
+
 -- An operator's stop request. Beside the chain rather than in it, and
 -- deliberately not fenced: whoever wants a run stopped is not its owner, holds
 -- no epoch, and is usually asking because the owner is busy. The primary key
@@ -978,6 +989,7 @@ impl PostgresStore {
     }
 
     /// Seal and insert a batch inside a transaction the caller owns.
+    #[allow(clippy::too_many_lines)]
     async fn append_within(
         &self,
         tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
@@ -1039,14 +1051,13 @@ impl PostgresStore {
         let mut conclusion: Option<String> = None;
         let mut claimed: Option<String> = None;
         let mut waiting: Option<crate::core::SuspendReason> = None;
+        let mut assessed: Vec<String> = Vec::new();
         for append in batch {
             seq += 1;
             let (body, written) = append.into_parts(seq, epoch, self.upcaster.as_ref())?;
-            // One pass over the kind for all three derived indexes. `waiting`
-            // is cleared first rather than only assigned on a suspension: that
-            // is what makes it track the run's *last* record instead of
-            // accumulating, so a run that suspends and then makes any progress
-            // has stopped waiting.
+            // One pass over the kind for every derived index. `waiting` is
+            // cleared on every record so it tracks the run's *last* one: a run
+            // that suspends and then makes any progress has stopped waiting.
             waiting = None;
             match &body.kind {
                 crate::journal::RecordKind::RunConcluded { outcome, .. } => {
@@ -1059,6 +1070,7 @@ impl PostgresStore {
                 crate::journal::RecordKind::RunSuspended { reason } => {
                     waiting = Some(reason.clone());
                 }
+                crate::journal::RecordKind::Assessed { of, .. } => assessed.push(of.clone()),
                 _ => {}
             }
             let record = Record::seal_at(body, written, prev, self.signer.as_deref())?;
@@ -1096,7 +1108,7 @@ impl PostgresStore {
 
         let source = claimed.as_deref().and_then(crate::core::origin_source);
         self.touch_activity(tx, run, source).await?;
-        self.derive_indexes(tx, run, claimed, conclusion, waiting)
+        self.derive_indexes(tx, run, claimed, conclusion, waiting, &assessed)
             .await?;
 
         // Inside the transaction, so the database delivers it only if the
@@ -1145,7 +1157,7 @@ impl PostgresStore {
         Ok(())
     }
 
-    /// The two indexes that derive from a record in this batch.
+    /// The indexes that derive from a record in this batch.
     ///
     /// Written inside the caller's transaction, which is the point: an index
     /// committing separately from the record it describes can outlive it,
@@ -1157,7 +1169,20 @@ impl PostgresStore {
         claimed: Option<String>,
         conclusion: Option<String>,
         waiting: Option<crate::core::SuspendReason>,
+        assessed: &[String],
     ) -> Result<(), StoreError> {
+        // A person's verdict, findable from the run it judges in the
+        // transaction that records it.
+        for of in assessed {
+            tx.execute(
+                "INSERT INTO run_assessment (tenant, of_run, run_id) VALUES ($1, $2, $3)
+                 ON CONFLICT DO NOTHING",
+                &[&self.tenant_name(), of, &run.to_string()],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        }
+
         // Claimed in the same transaction as the record that carries it, so
         // the claim and the run are one event. Never an upsert: the conflict
         // *is* the answer.
@@ -1437,6 +1462,30 @@ impl JournalStore for PostgresStore {
             )?);
         }
         Ok(out)
+    }
+
+    async fn assessments_of(&self, run: RunId, limit: usize) -> Result<Vec<RunId>, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = client
+            .query(
+                "SELECT a.run_id FROM run_assessment a
+                 JOIN journal j ON j.tenant = a.tenant AND j.run_id = a.run_id AND j.seq = 1
+                 WHERE a.tenant = $1 AND a.of_run = $2
+                 ORDER BY j.tx, j.pos LIMIT $3",
+                &[&self.tenant_name(), &run.to_string(), &limit],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.iter()
+            .map(|row| {
+                let id: String = row.get(0);
+                RunId::parse(&id).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("run_assessment holds an unparseable run id '{id}': {e}"),
+                })
+            })
+            .collect()
     }
 
     async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {

@@ -77,6 +77,101 @@
         ],
         "type": "object"
       },
+      "AssessAnswer": {
+        "additionalProperties": false,
+        "properties": {
+          "record": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "record"
+        ],
+        "type": "object"
+      },
+      "AssessRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "rationale": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "$ref": "#/components/schemas/Score"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
+      "AssessmentView": {
+        "additionalProperties": false,
+        "properties": {
+          "at": {
+            "type": "string"
+          },
+          "by": {
+            "$ref": "#/components/schemas/ActorView"
+          },
+          "name": {
+            "type": "string"
+          },
+          "rationale": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "$ref": "#/components/schemas/Score"
+          }
+        },
+        "required": [
+          "name",
+          "value",
+          "by",
+          "at"
+        ],
+        "type": "object"
+      },
+      "AssessmentsView": {
+        "additionalProperties": false,
+        "properties": {
+          "current": {
+            "items": {
+              "$ref": "#/components/schemas/AssessmentView"
+            },
+            "type": "array"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/AssessmentView"
+            },
+            "type": "array"
+          },
+          "run": {
+            "type": "string"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "run",
+          "current",
+          "history",
+          "truncated"
+        ],
+        "type": "object"
+      },
       "AttentionView": {
         "additionalProperties": false,
         "properties": {
@@ -1218,6 +1313,29 @@
         ],
         "type": "object"
       },
+      "LabelView": {
+        "additionalProperties": false,
+        "properties": {
+          "provenance": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "sensitivity": {
+            "$ref": "#/components/schemas/Sensitivity"
+          },
+          "trust": {
+            "$ref": "#/components/schemas/Trust"
+          }
+        },
+        "required": [
+          "trust",
+          "sensitivity",
+          "provenance"
+        ],
+        "type": "object"
+      },
       "LiftHaltAnswer": {
         "additionalProperties": false,
         "properties": {
@@ -1820,6 +1938,26 @@
         ],
         "type": "object"
       },
+      "RunOutput": {
+        "additionalProperties": false,
+        "properties": {
+          "label": {
+            "$ref": "#/components/schemas/LabelView"
+          },
+          "output": {
+            "description": "The value the run's last step produced, as the run's own output schema shapes it."
+          },
+          "run": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run",
+          "output",
+          "label"
+        ],
+        "type": "object"
+      },
       "RunView": {
         "additionalProperties": false,
         "properties": {
@@ -1900,6 +2038,29 @@
           "records"
         ],
         "type": "object"
+      },
+      "Score": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "format": "double",
+            "type": "number"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "Sensitivity": {
+        "enum": [
+          "public",
+          "internal",
+          "confidential",
+          "secret"
+        ],
+        "type": "string"
       },
       "StepId": {
         "format": "uint32",
@@ -2068,6 +2229,18 @@
         ],
         "type": "object"
       },
+      "Trust": {
+        "oneOf": [
+          {
+            "const": "trusted",
+            "type": "string"
+          },
+          {
+            "const": "untrusted",
+            "type": "string"
+          }
+        ]
+      },
       "Undecided": {
         "additionalProperties": false,
         "properties": {
@@ -2182,7 +2355,7 @@
   "info": {
     "description": "The operator API of an agentplane plane: the routes a person or their tooling uses to see what a plane is doing and to intervene — runs, tasks, cases, obligations, holds, halts, events and dead letters.\n\n**Scope.** This document describes the operator API only. The A2A surface is described by its own protocol and the Agent Card it serves; the MCP server by the tool listing MCP defines. Neither is here.\n\n**Tenant.** The tenant a request reaches comes from its credential, never from a path, query or body member; no operation takes one.\n\n**Refusals.** Every non-success answer is `{\"error\": \"<sentence>\"}`.\n\n**Compatibility.** This document is outside the project's compatibility promise, like the Rust API: an operation, a member or a status can change in any release. Pin the version your client was generated from.",
     "title": "agentplane operator API",
-    "version": "0.57.0"
+    "version": "0.58.0"
   },
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "openapi": "3.1.0",
@@ -4052,6 +4225,212 @@
         "x-agentplane-action": "api:run.abandon"
       }
     },
+    "/runs/{run}/assessments": {
+      "get": {
+        "operationId": "run_assessments",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssessmentsView"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An identifier does not parse, the request's content is wrong, or the body is not JSON."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No credential, or one the authenticator refused."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The policy refused, or the caller's tenant has no plane here."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The named thing does not exist."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The store failed, or the policy set could not be evaluated."
+          }
+        },
+        "summary": "The verdicts recorded on a run: those standing, and every one.",
+        "x-agentplane-action": "api:run.assessments"
+      },
+      "post": {
+        "operationId": "assess_run",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssessAnswer"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An identifier does not parse, the request's content is wrong, or the body is not JSON."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No credential, or one the authenticator refused."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The policy refused, or the caller's tenant has no plane here."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The named thing does not exist."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The named thing's state refuses the request."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is larger than this surface reads."
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body was not sent as application/json."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is JSON but not this operation's shape, or the plane cannot act on it."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The store failed, or the policy set could not be evaluated."
+          }
+        },
+        "summary": "Record the caller's verdict on what a run answered.",
+        "x-agentplane-action": "api:run.assess"
+      }
+    },
     "/runs/{run}/cancel": {
       "post": {
         "operationId": "cancel_run",
@@ -4271,6 +4650,95 @@
         },
         "summary": "One run's journal, a page at a time from a sequence.",
         "x-agentplane-action": "api:run.history"
+      }
+    },
+    "/runs/{run}/output": {
+      "get": {
+        "operationId": "run_output",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunOutput"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An identifier does not parse, the request's content is wrong, or the body is not JSON."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No credential, or one the authenticator refused."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The policy refused, or the caller's tenant has no plane here."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The named thing does not exist."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The named thing's state refuses the request."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The store failed, or the policy set could not be evaluated."
+          }
+        },
+        "summary": "What a run that succeeded answered, with its label.",
+        "x-agentplane-action": "api:run.output"
       }
     },
     "/runs/{run}/reconcile": {

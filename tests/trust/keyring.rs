@@ -3269,3 +3269,260 @@ async fn an_erased_binding_names_nobody_and_leaves_no_subject_in_the_clear() {
     assert_eq!(after.bound, []);
     assert!(met(&after, Class::ErasedBinding), "{:#?}", after.coverage);
 }
+
+/// A run admitted with a claimant's name and concluded, bound to no case, so
+/// its own run is its erasure unit.
+#[cfg(feature = "redb")]
+async fn concluded_case_less_run(
+    journal: &dyn agentplane::journal::JournalStore,
+) -> agentplane::core::RunId {
+    use agentplane::core::{Label, RunId};
+    use agentplane::journal::{Append, RecordKind};
+    let run = RunId::generate();
+    let lease = journal
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    journal
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "one-shot.report".into(),
+                    governed_by: None,
+                    input_label: Label::trusted(),
+                    input_field_labels: std::collections::BTreeMap::new(),
+                    input: serde_json::json!({ "claimant": "Ada Lovelace" }),
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
+                    plane_chain: false,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+    let head = journal.head(run).await.expect("head");
+    journal
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunConcluded {
+                    outcome: "succeeded".to_owned(),
+                    chain_head: head.hash,
+                    reason: None,
+                    exhaustion: None,
+                    live_spend: agentplane::core::Spend::default(),
+                },
+            )],
+        )
+        .await
+        .expect("conclude");
+    run
+}
+
+/// **A person's words about a run go with the run.** A verdict's rationale is
+/// sealed under the verdict's own scope, and erasing the case-less run it
+/// judged destroys that scope too — while the verdict itself, and who made it,
+/// still read.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn erasing_a_run_takes_the_rationale_of_every_verdict_on_it() {
+    use agentplane::core::{Assessment, Digest, Operator, Score, TenantId, Timestamp};
+    use agentplane::journal::{JournalStore, Record, RecordKind, payload};
+    use agentplane::keyring::SealedJournal;
+
+    let tenant = TenantId::default();
+    let ring = Arc::new(MemoryKeyRing::default()) as Arc<dyn agentplane::keyring::KeyRing>;
+    let raw = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let journal = SealedJournal::wrap(
+        Arc::clone(&raw) as Arc<dyn JournalStore>,
+        Arc::clone(&ring),
+        tenant.clone(),
+    );
+    let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
+
+    let run = concluded_case_less_run(journal.as_ref()).await;
+
+    // The raw store: the builder seals what it is given under the ring.
+    let runtime = agentplane::runtime::Runtime::builder(Arc::clone(&raw) as Arc<dyn JournalStore>)
+        .keyring(Arc::clone(&ring))
+        .build();
+    let verdict = runtime
+        .assess(
+            Assessment::new(
+                run,
+                "helpful",
+                Score::Pass(false),
+                Operator::authenticated("dana").expect("a name"),
+                at,
+                Some("Ada Lovelace's claim was misread".into()),
+            )
+            .expect("a verdict"),
+        )
+        .await
+        .expect("recorded");
+    let rationale = |records: Vec<Record>| match records[0].kind() {
+        RecordKind::Assessed { rationale, by, .. } => (rationale.clone(), by.actor().to_owned()),
+        other => panic!("unexpected record: {other:?}"),
+    };
+    let (before, _) = rationale(journal.read(verdict, 1).await.expect("read"));
+    assert_eq!(before.as_deref(), Some("Ada Lovelace's claim was misread"));
+
+    agentplane::blob::erase_run(
+        ring.as_ref(),
+        journal.as_ref(),
+        None,
+        &tenant,
+        run,
+        at,
+        "subject exercised the right to erasure",
+    )
+    .await
+    .expect("erase");
+
+    let (after, by) = rationale(journal.read(verdict, 1).await.expect("read"));
+    assert!(
+        after.as_deref().is_some_and(payload::is_sealed_text),
+        "a verdict's words about an erased run survived its erasure: {after:?}"
+    );
+    assert_eq!(by, "dana", "the verdict itself stopped reading");
+    let stored = raw.read(verdict, 1).await.expect("raw");
+    Record::verify_chain(&stored, Digest::ZERO).expect("the verdict's chain");
+
+    // Read back, the words are gone rather than served as ciphertext, and the
+    // verdict still counts.
+    let read = runtime.assessments(run).await.expect("read");
+    let standing = read.current();
+    assert_eq!(standing.len(), 1);
+    assert_eq!(
+        standing[0].rationale(),
+        None,
+        "ciphertext served as a reason"
+    );
+    assert_eq!(standing[0].value(), &Score::Pass(false));
+
+    // And nobody writes new words about data that is gone.
+    let refused = runtime
+        .assess(
+            Assessment::new(
+                run,
+                "helpful",
+                Score::Pass(true),
+                Operator::authenticated("erin").expect("a name"),
+                at,
+                Some("Ada Lovelace again".into()),
+            )
+            .expect("a verdict"),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(agentplane::core::RuntimeError::NotAssessable { .. })
+        ),
+        "an erased run was assessed: {refused:?}"
+    );
+}
+
+/// Answers with its input.
+#[cfg(feature = "redb")]
+#[derive(Debug)]
+struct Answers;
+
+#[cfg(feature = "redb")]
+#[async_trait::async_trait]
+impl agentplane::core::Skill for Answers {
+    fn descriptor(&self) -> agentplane::core::SkillDescriptor {
+        agentplane::core::SkillDescriptor::new("answers").provides("demo.answer")
+    }
+
+    async fn invoke(
+        &self,
+        _cx: &mut agentplane::runtime::StepCtx<'_>,
+        input: agentplane::core::Tainted<serde_json::Value>,
+    ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
+        Ok(agentplane::core::Outcome::done(input))
+    }
+}
+
+/// **A verdict on a run bound to a matter is sealed under the matter**, so
+/// the act that erases the matter takes the words; and the run's answer is
+/// gone with it, refused rather than answered empty.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn erasing_a_matter_takes_its_runs_answer_and_the_words_about_it() {
+    use agentplane::core::{
+        Assessment, CorrelationKey, Operator, RuntimeError, Score, Tainted, TenantId, Timestamp,
+    };
+    use agentplane::journal::JournalStore;
+    use agentplane::keyring::KeyRing;
+    use agentplane::runtime::{RunTerms, Runtime};
+
+    let tenant = TenantId::default();
+    let ring = Arc::new(MemoryKeyRing::default()) as Arc<dyn KeyRing>;
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>)
+        .keyring(Arc::clone(&ring))
+        .skill(Answers)
+        .build();
+    let run = runtime
+        .start(
+            "demo.answer",
+            Tainted::trusted(serde_json::json!({ "claimant": "Ada" })),
+        )
+        .terms(RunTerms::default().correlated("claim", &[CorrelationKey::new("claim", "CLM-9")]))
+        .run()
+        .await
+        .expect("ran")
+        .run_id;
+    assert!(runtime.output(run).await.expect("read").is_some());
+    let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
+    runtime
+        .assess(
+            Assessment::new(
+                run,
+                "helpful",
+                Score::Number(0.5),
+                Operator::authenticated("dana").expect("a name"),
+                at,
+                Some("half right about Ada".into()),
+            )
+            .expect("a verdict"),
+        )
+        .await
+        .expect("recorded");
+
+    let case = store
+        .read(run, 1)
+        .await
+        .expect("read")
+        .iter()
+        .find_map(|r| r.body.case)
+        .expect("a correlated run is bound to its matter");
+    ring.destroy(
+        &agentplane::keyring::scope(&tenant, &case.to_string()),
+        at,
+        "art-17",
+    )
+    .await
+    .expect("erase the matter's key");
+
+    let standing = runtime.assessments(run).await.expect("read");
+    assert_eq!(
+        standing.current()[0].rationale(),
+        None,
+        "the words outlived the matter"
+    );
+    assert_eq!(standing.current()[0].value(), &Score::Number(0.5));
+    let answer = runtime.output(run).await;
+    assert!(
+        matches!(answer, Err(RuntimeError::PayloadsErased { .. })),
+        "an erased run's answer was not refused: {answer:?}"
+    );
+}

@@ -263,6 +263,14 @@ impl JournalStore for NoExactlyOnce {
         self.inner.count_by_outcome(outcome).await
     }
 
+    async fn assessments_of(
+        &self,
+        run: agentplane::core::RunId,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::RunId>, agentplane::core::StoreError> {
+        self.inner.assessments_of(run, limit).await
+    }
+
     async fn abandoned_runs(
         &self,
         limit: usize,

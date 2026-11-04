@@ -237,6 +237,14 @@ impl JournalStore for SealedJournal {
         self.inner.count_by_outcome(outcome).await
     }
 
+    async fn assessments_of(
+        &self,
+        run: crate::core::RunId,
+        limit: usize,
+    ) -> Result<Vec<crate::core::RunId>, StoreError> {
+        self.inner.assessments_of(run, limit).await
+    }
+
     /// Delegated, and the key is **not** sealed on the way through: it is the
     /// counterparty's message identity rather than content, and the index has to
     /// be searchable by a value the caller holds in the clear.

@@ -290,7 +290,7 @@ caught by the *specific* invariant or liveness property written for it.
 normative prose, and `tools/verify_export.py` is written from it and reads none
 of this crate's Rust — enforced by a guard, because a verifier that consulted
 `src/` would agree with the implementation by construction. `just verify-golden`
-runs it: it **re-derives** all 33 record vectors from their parsed values with
+runs it: it **re-derives** all 34 record vectors from their parsed values with
 its own canonicalizer and chain digest, verifies the sealed export end to end,
 and then damages that export and asserts every damage is reported.
 
@@ -351,7 +351,7 @@ compiles. That is what `--verify` is for.
 | Replace a deterministic protocol engine | Keep it; agentplane sits *beside* it, never inside it |
 | Require Kubernetes | One static binary |
 | Train, fine-tune, or serve models | Permanently out of scope |
-| Grade output quality | It emits replayable traces; grade them elsewhere, and `agentplane bind` ties the verdict to the records it judged |
+| Grade output quality | It emits replayable traces; grade them elsewhere, and `agentplane bind` ties the verdict to the records it judged. A person's verdict is recorded in the plane (`Runtime::assess`) |
 | Interpret payload contents | Payloads are opaque, and labeled |
 | Claim regulatory compliance | It provides technical means; compliance is the deployer's |
 

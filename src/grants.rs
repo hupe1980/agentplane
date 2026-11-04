@@ -326,7 +326,7 @@ impl<'a> Grants<'a> {
                         let RecordKind::EffectStarted { descriptor, .. } = kind else {
                             unreachable!("opening keeps the record's kind");
                         };
-                        if let Some(called) = called(&descriptor.kind, &descriptor.args) {
+                        if let Some(called) = called(&descriptor) {
                             group
                                 .calls
                                 .entry(called.clone())
@@ -379,11 +379,13 @@ impl<'a> Grants<'a> {
 }
 
 /// The grant a readable call's arguments name.
-fn called(kind: &str, args: &Value) -> Option<ToolId> {
-    let text = |name: &str| args.get(name).and_then(Value::as_str);
-    match kind {
-        TOOL_CALL => Some(ToolId::new(text("server")?, text("tool")?)),
-        COMMISSION => Some(ToolId::new("agent", text("capability")?)),
+fn called(descriptor: &crate::core::EffectDescriptor) -> Option<ToolId> {
+    match descriptor.kind.as_str() {
+        TOOL_CALL => ToolId::called(descriptor),
+        COMMISSION => Some(ToolId::new(
+            "agent",
+            descriptor.args.get("capability").and_then(Value::as_str)?,
+        )),
         _ => None,
     }
 }

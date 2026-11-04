@@ -1564,6 +1564,14 @@ impl JournalStore for Doctored {
     async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError> {
         self.inner.count_by_outcome(outcome).await
     }
+
+    async fn assessments_of(
+        &self,
+        run: agentplane::core::RunId,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::RunId>, StoreError> {
+        self.inner.assessments_of(run, limit).await
+    }
     async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
         self.inner.admitted_as(key).await
     }

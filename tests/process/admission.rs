@@ -761,6 +761,14 @@ impl JournalStore for BlindToKeys {
     async fn count_by_outcome(&self, outcome: &str) -> Result<u64, agentplane::core::StoreError> {
         self.0.count_by_outcome(outcome).await
     }
+
+    async fn assessments_of(
+        &self,
+        run: agentplane::core::RunId,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::RunId>, agentplane::core::StoreError> {
+        self.0.assessments_of(run, limit).await
+    }
     async fn runs_by_id(
         &self,
         after: Option<agentplane::RunId>,
@@ -1191,6 +1199,57 @@ async fn settling_a_rested_key_answers_with_its_value() {
         f.store.read(first.run_id(), 1).await.unwrap().len(),
         recorded,
         "settling a rested run wrote to its history"
+    );
+}
+
+/// **A run's answer is read by its id**, with its label, writing nothing — and
+/// a run that did not succeed, or that nobody has heard of, has none.
+#[tokio::test]
+async fn a_concluded_runs_answer_is_read_by_its_id() {
+    let f = fixture();
+    let done =
+        f.rt.start("demo.counts", Tainted::trusted(json!({ "n": 7 })))
+            .run()
+            .await
+            .expect("ran");
+    let recorded = f.store.read(done.run_id, 1).await.unwrap().len();
+
+    let answer =
+        f.rt.output(done.run_id)
+            .await
+            .expect("read")
+            .expect("a succeeded run has an answer");
+    assert_eq!(answer.peek(), &json!({ "n": 7 }));
+    assert!(!answer.label().is_untrusted(), "the label was not carried");
+    assert_eq!(
+        f.store.read(done.run_id, 1).await.unwrap().len(),
+        recorded,
+        "reading a run's answer wrote to its history"
+    );
+
+    let failed =
+        f.rt.start("demo.fails", Tainted::trusted(json!({})))
+            .run()
+            .await
+            .expect("ran");
+    assert_ne!(failed.status, RunStatus::Succeeded);
+    assert!(f.rt.output(failed.run_id).await.expect("read").is_none());
+    assert!(
+        f.rt.output(agentplane::core::RunId::generate())
+            .await
+            .expect("read")
+            .is_none()
+    );
+
+    // A plane that does not register the run's agent cannot re-derive its
+    // answer, and says so rather than answering nothing.
+    let stranger = agentplane::runtime::Runtime::builder(
+        f.store.clone() as Arc<dyn agentplane::journal::JournalStore>
+    )
+    .build();
+    assert!(
+        stranger.output(done.run_id).await.is_err(),
+        "an answer this plane cannot re-derive read as none"
     );
 }
 

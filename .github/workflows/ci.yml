@@ -41,12 +41,14 @@ jobs:
   # Each seam with *only* its own features on — the configuration an embedder
   # who wants that seam and nothing else actually builds. The `--all-features`
   # run above would hide a seam that quietly depends on another being present.
+  # `just ci` runs every other seam in the job above; postgres needs a
+  # container, so it runs here.
   seams:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        seam: [postgres, mcp, http, attestation, drivers, embed]
+        seam: [postgres]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -94,8 +96,8 @@ jobs:
   # `tools/mutants.py` carries the measured costs and cuts the sorted list on
   # them.
   #
-  # Ten rather than six keeps this matrix plus the other jobs inside a
-  # twenty-job concurrency budget.
+  # Fourteen keeps this matrix plus the other jobs inside a twenty-job
+  # concurrency budget.
   #
   # Each shard is its own checkout, which is what makes this safe — the sweep
   # rewrites source in place and refuses to run twice against one tree.
@@ -104,16 +106,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    name: mutants (${{ matrix.shard }}/10)
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    name: mutants (${{ matrix.shard }}/14)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Keyed per shard: a shard builds its own feature sets, and one key for
+      # the matrix restores whichever shard saved first.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants-${{ matrix.shard }}
       - uses: extractions/setup-just@v2
       - run: just mutants
         env:
-          MUTANTS_SHARD: ${{ matrix.shard }}/10
+          MUTANTS_SHARD: ${{ matrix.shard }}/14
 
   # Every framework quickstart walked against the `:full` image built from this
   # commit, through the published commands, and the Helm chart rendered.

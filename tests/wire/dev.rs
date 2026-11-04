@@ -117,6 +117,7 @@ fn operator_body(operation: &str) -> Value {
     let case = "case_01ARZ3NDEKTSV4RRFFQ69G5FAV";
     match operation {
         "cancel_run" => json!({ "reason": "stop" }),
+        "assess_run" => json!({ "name": "helpful", "value": true }),
         "reopen_run" | "abandon_run" => json!({ "reason": "checked" }),
         "reconcile_effect" => json!({
             "effect": "0".repeat(64),

@@ -1450,8 +1450,9 @@ message admitted directly, so `SweepReport::needs_attention()` is permanently
 true and that signal is spent buying deduplication.
 
 A `Replayed` outcome carries the original's status and reason but no `output`: a
-step's result is reconstructed by replay rather than stored. Re-derive it with
-`rt.replay(run, Mode::Strict)`, which performs no external effect. And note that
+step's result is reconstructed by replay rather than stored. Read it with
+`rt.output(run)`, which re-derives it by strict replay and performs no external
+effect. And note that
 a **suspended** run is a resting point — a redelivery of a message whose run is
 parked on a four-eyes decision is told *this is already waiting for you*, rather
 than opening a second identical approval.

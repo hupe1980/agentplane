@@ -39,7 +39,19 @@ impl fmt::Display for SourceId {
 /// Whether a value may influence control flow.
 ///
 /// Ordered so that `max` is the correct join: `Untrusted > Trusted`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Trust {
     /// From the operator, the manifest, or the run's own trusted input.

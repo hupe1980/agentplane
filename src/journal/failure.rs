@@ -103,12 +103,10 @@ pub fn failed_effect(records: &[Record]) -> Option<FailedEffect> {
 
 /// The kind the effect under `key` was announced as.
 fn started_kind(records: &[Record], key: EffectKey) -> Option<String> {
-    records.iter().find_map(|r| match &r.body.kind {
-        RecordKind::EffectStarted { descriptor, .. } if r.body.effect_key == Some(key) => {
-            Some(descriptor.kind.clone())
-        }
-        _ => None,
-    })
+    super::calls(records)
+        .into_iter()
+        .find(|call| call.key() == key)
+        .map(|call| call.descriptor().kind.clone())
 }
 
 #[cfg(test)]

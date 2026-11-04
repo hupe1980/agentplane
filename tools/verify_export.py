@@ -61,7 +61,7 @@ FRAMING = {HEADER_KIND, PACKAGE_KIND, RUN_KIND, CASE_KIND, TRAILER_KIND}
 # The conclusions that seal a run into the log (the specification's sealing
 # outcomes). A package places every sealed run it carries, so a run whose last
 # conclusion is one of these and whose block carries no leaf had it removed.
-SEALED_OUTCOMES = {"succeeded", "cancelled", "abandoned", "swept", "broke-glass", "halt-lifted", "hold-released", "observed"}
+SEALED_OUTCOMES = {"succeeded", "cancelled", "abandoned", "swept", "broke-glass", "halt-lifted", "hold-released", "observed", "assessed"}
 
 # The members each framing line is specified to carry. A later writer may add
 # one; this reader passes over it and says so, because a verdict is only as wide
@@ -98,7 +98,7 @@ RECORD_KINDS = frozenset(
         "IdentityBound", "DataSubjectBound", "PolicyDenied", "RunSuspended",
         "CaseBound", "DeadlineRegistered", "DeadlineTransition", "Released",
         "RunCancelled", "RunConcluded", "BreakGlass", "HaltLifted", "HoldReleased",
-        "Swept", "Observed",
+        "Swept", "Observed", "Assessed",
     }
 )
 

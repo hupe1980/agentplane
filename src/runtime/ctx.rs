@@ -2641,14 +2641,9 @@ impl<'a> StepCtx<'a> {
     /// failure the binding rule exists to prevent.
     #[cfg(feature = "manifest")]
     fn tool_grant_for(&self, descriptor: &EffectDescriptor) -> Option<&crate::manifest::ToolGrant> {
-        if descriptor.kind != "tool.call" {
-            return None;
-        }
-        let server = descriptor.args["server"].as_str()?;
-        let tool = descriptor.args["tool"].as_str()?;
         self.manifest
             .as_ref()?
-            .tool_grant(&crate::tools::ToolId::new(server, tool).reference())
+            .tool_grant(&crate::tools::ToolId::called(descriptor)?.reference())
     }
 
     /// Everything that can refuse an attempt before it is dispatched.

@@ -505,6 +505,28 @@ pub trait JournalStore: Send + Sync + Debug {
     /// the same refusal as the listing, for the same reason.
     async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError>;
 
+    /// The runs that record a person's verdict on `run`, in the order the
+    /// store committed them, at most `limit` from the first.
+    ///
+    /// **Commit order, never run-id order.** Which verdict stands is decided by
+    /// which came last, and a run id is ordered only to the millisecond.
+    ///
+    /// A **derived** index, as [`admitted_as`](Self::admitted_as)'s is: the
+    /// verdict's home is the [`Assessed`](crate::journal::RecordKind::Assessed)
+    /// record, and the store maintains this from that record inside
+    /// [`append`](Self::append), in the same transaction, so the index can
+    /// neither outlive nor precede the record it points at and rebuilds from
+    /// the journal.
+    ///
+    /// **No default**: a store that forgot this would answer that nobody has
+    /// judged a run somebody judged, and a quality reading built on it would
+    /// read silence as approval.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable, or the index holds a row it cannot read.
+    async fn assessments_of(&self, run: RunId, limit: usize) -> Result<Vec<RunId>, StoreError>;
+
     /// The run that holds this admission key, if one does.
     ///
     /// A **derived** index, as `runs_by_outcome` is: the key's home is the

@@ -703,6 +703,14 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
         async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError> {
             self.0.count_by_outcome(outcome).await
         }
+
+        async fn assessments_of(
+            &self,
+            run: agentplane::core::RunId,
+            limit: usize,
+        ) -> Result<Vec<agentplane::core::RunId>, StoreError> {
+            self.0.assessments_of(run, limit).await
+        }
         async fn runs_by_id(
             &self,
             after: Option<RunId>,
@@ -1834,6 +1842,14 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
 
         async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError> {
             self.inner.count_by_outcome(outcome).await
+        }
+
+        async fn assessments_of(
+            &self,
+            run: agentplane::core::RunId,
+            limit: usize,
+        ) -> Result<Vec<agentplane::core::RunId>, StoreError> {
+            self.inner.assessments_of(run, limit).await
         }
         async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
             self.inner.abandoned_runs(limit).await
