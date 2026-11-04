@@ -409,6 +409,7 @@ discovering one call at a time.
 | | |
 |---|---|
 | `now()`, `rng()`, `note(text)` | the clock, the per-step RNG, and a line in the chain — all reproduced on replay |
+| `replaying()` | whether an earlier pass already reached this point — show progress only when it is `false` |
 | `effect(e)` | any effect with no labelled value to bind |
 | `sink_with(&value, build)` | an outbound effect **with** its labelled arguments, built from them in one motion — the primary dispatch shape, and the only path that can carry protected fields |
 | `sink(e, &value)` | the same gate, for an effect built elsewhere or one that binds its outbound value internally |

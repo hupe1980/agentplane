@@ -4034,3 +4034,94 @@ async fn an_approval_task_takes_no_answer() {
         "{refused:?}"
     );
 }
+
+// ── Telling a re-run from a live step ───────────────────────────────────────
+
+/// Writes down, at each point, whether an earlier pass already reached it.
+#[derive(Debug)]
+struct ReportsProgress(Arc<std::sync::Mutex<Vec<(&'static str, bool)>>>);
+
+impl ReportsProgress {
+    fn seen(&self, at: &'static str, cx: &StepCtx<'_>) {
+        self.0.lock().unwrap().push((at, cx.replaying()));
+    }
+}
+
+#[async_trait::async_trait]
+impl Skill for ReportsProgress {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("reports-progress").provides("demo.progress")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        self.seen("start", cx);
+        cx.deadline("approval", &DeadlineSpec::days(2), None)
+            .await?;
+        cx.now().await?;
+        self.seen("after a call", cx);
+        let spec = TaskSpec::new(
+            "go-ahead",
+            Justification::new(Tainted::trusted("continue?".to_owned()), json!({})),
+            "approval",
+        )
+        .role("compliance-officer");
+        cx.task(&spec).await?;
+        self.seen("after the decision", cx);
+        cx.now().await?;
+        self.seen("after a new call", cx);
+        Ok(Outcome::done(Tainted::trusted(json!({}))))
+    }
+}
+
+/// **What a resumed skill has already shown, it is told.** After a decision
+/// the skill runs again from the top: everything before the decision answers
+/// from the journal and reads as replaying, everything after it does not. The
+/// mode alone cannot say this — a resume reads history and then runs live.
+#[tokio::test]
+async fn a_resumed_skill_is_told_which_points_it_already_reached() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .skill(ReportsProgress(Arc::clone(&seen)))
+        .build();
+    let take = || std::mem::take(&mut *seen.lock().unwrap());
+
+    let out = rt
+        .start("demo.progress", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("dispute", &[key("PROG-1")]))
+        .run()
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "{:?}", out.status);
+    assert_eq!(take(), [("start", false), ("after a call", false)]);
+
+    let task = store.queue(&officer(), 10).await.unwrap()[0].id;
+    rt.decide_task(task, &Decision::approve(by("alice"), "go"), &officer())
+        .await
+        .unwrap();
+    assert_eq!(
+        take(),
+        [
+            ("start", true),
+            ("after a call", true),
+            ("after the decision", false),
+            ("after a new call", false),
+        ],
+        "the resume showed again what the first pass showed, or hid what it had not"
+    );
+
+    rt.replay(out.run_id, agentplane::runtime::Mode::Strict)
+        .await
+        .unwrap();
+    assert!(
+        take().iter().all(|(_, replaying)| *replaying),
+        "a strict replay reached nothing new"
+    );
+}

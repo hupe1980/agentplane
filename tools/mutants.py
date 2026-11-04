@@ -4055,7 +4055,7 @@ pub struct Label {""",
         "a replay expects a record at every atomic member's key, so a group "
         "whose second member was refused — the first gated, never committed, "
         "nothing recorded — reads as divergent and a faithful run quarantines",
-        """            if self.replaying()
+        """            if self.pass_reads_history()
                 && !self.cursor_peek_is(key)""",
         """            if false
                 && !self.cursor_peek_is(key)""",
@@ -7578,7 +7578,7 @@ pub struct Label {""",
         "a_replayed_atomic_member_is_not_applied_again",
         "a replayed run applies the transaction again, so replaying a committed "
         "group posts to the ledger twice — reliably, because it is transactional",
-        "            if self.replaying() {",
+        "            if self.pass_reads_history() {",
         "            if false {",
     ),
     "AnAbsentTransactionIsDiscoveredAtTheFrontier": (
@@ -16261,6 +16261,13 @@ pub struct WrappedKey {""",
         "two offers share a name and the first one answers, so which tool ran is an accident of order",
         """        let offer = match (named.next(), named.next()) {""",
         """        let offer = match (named.next(), None::<&crate::model::ToolDeclaration>) {""",
+    ),
+    "AResumeReadsAsReplayingThroughItsLiveTail": (
+        "src/runtime/ctx.rs",
+        "a_resumed_skill_is_told_which_points_it_already_reached",
+        "a resumed skill reads as replaying after the decision too, so a progress view hides every step the person has not seen",
+        """        !self.writes_enabled()""",
+        """        self.pass_reads_history()""",
     ),
 }
 

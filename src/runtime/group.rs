@@ -938,7 +938,7 @@ impl StepCtx<'_> {
         // here for that refusal's answer on this pass.
         let mut pending: Vec<(EffectKey, crate::core::EffectDescriptor, AtomicMember)> = Vec::new();
         for (i, (key, descriptor, member)) in prepared.into_iter().enumerate() {
-            if self.replaying()
+            if self.pass_reads_history()
                 && !self.cursor_peek_is(key)
                 && keys[i + 1..]
                     .iter()
@@ -947,7 +947,7 @@ impl StepCtx<'_> {
                 pending.push((key, descriptor, member));
                 continue;
             }
-            if self.replaying() {
+            if self.pass_reads_history() {
                 // Consume the recorded pair. The output is discarded rather
                 // than returned: an atomic member's result is not handed back
                 // to the caller in the first place, because it cannot be seen

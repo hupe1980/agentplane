@@ -673,8 +673,38 @@ impl<'a> StepCtx<'a> {
         )
     }
 
-    pub(crate) fn replaying(&self) -> bool {
+    /// Whether this pass reads history at all — true for the whole of a resume,
+    /// its live tail included. Matching against the cursor wants this; whether
+    /// *this point* already ran is [`replaying`](Self::replaying).
+    pub(crate) fn pass_reads_history(&self) -> bool {
         self.mode.is_replaying()
+    }
+
+    /// Whether an earlier pass already reached this point of the step.
+    ///
+    /// A resumed run — after a decision, an awaited event or a crash — runs
+    /// its skill again from the top, and each effect the step already
+    /// performed answers from the journal. This is `true` while that history
+    /// lasts and `false` from the first point no earlier pass reached; a strict
+    /// replay reads `true` throughout. Show output the journal does not hold
+    /// only when it is `false`:
+    ///
+    /// ```ignore
+    /// let output = cx.call_tool(tool, arguments).await?;
+    /// if !cx.replaying() {
+    ///     progress.tool_call(&output);
+    /// }
+    /// ```
+    ///
+    /// A wait is history: code between the last replayed call and the decision
+    /// it waited for reads `true`. After a crash, the gap before the crash
+    /// point reads `false`, so output there may show twice and is never lost.
+    ///
+    /// Steer only output with it: an effect made on one value and not the
+    /// other is one the record does not have, and the resume is refused at it.
+    #[must_use]
+    pub fn replaying(&self) -> bool {
+        !self.writes_enabled()
     }
 
     pub(crate) const fn is_strict(&self) -> bool {

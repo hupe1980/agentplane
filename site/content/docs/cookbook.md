@@ -2106,6 +2106,28 @@ whole prompt taints it, and the next turn is refused for untrusted data in
 `examples/coded_tool_loop.rs` runs a three-turn loop, including an
 argument-less mutating tool granted by its one call.
 
+## 📺 Show progress once across a resume {#show-progress-once-across-a-resume}
+
+A resumed run — after a decision, an awaited event or a crash — runs the skill
+again from the top, and every call it already made answers from the journal.
+Show what the journal does not hold only when `replaying()` is `false`:
+
+```rust
+let output = cx.call_tool_for(&call, &declared, arguments).await?;
+if !cx.replaying() {
+    progress.tool_call(&call, &output);
+}
+```
+
+It turns `false` at the first point no earlier pass reached: the calls before
+a decision stay hidden and the ones after it show. Output between the last
+recorded call and a crash may show twice; nothing is lost.
+
+**The trap:** branching an effect on it. A call made on one value and not the
+other is a call the record does not have, and the resume is refused at it. To
+follow a run from outside, read its records instead:
+[Follow a run as it happens](#follow-a-run-as-it-happens).
+
 ## 💬 Hold a conversation in one run {#hold-a-conversation-in-one-run}
 
 A conversation is one run: each message a person sends is an event the run

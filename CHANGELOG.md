@@ -16,6 +16,15 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.59.0] — 2026-11-05
+
+### Added
+
+- **`StepCtx::replaying()`**: whether an earlier pass already reached this
+  point of the step. Show progress and other output the journal does not hold
+  only when it is `false`, so a run resumed after a decision does not show its
+  calls again.
+
 ## [0.58.0] — 2026-11-04
 
 ### Added
