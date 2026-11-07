@@ -58,6 +58,7 @@
 // nobody is reading policy files.
 //   api:run.read      api:run.list    api:run.history api:run.live
 //   api:run.output    api:run.assess  api:run.assessments
+//   api:capability.track
 //   api:run.waiting   api:run.cancel  api:run.reopen  api:run.abandon
 //   api:attention     api:drill.read  api:effect.reconcile
 //   api:task.list     api:task.read   api:task.claim  api:task.release
@@ -203,6 +204,7 @@ permit(
         Action::"api:run.output",
         Action::"api:run.assess",
         Action::"api:run.assessments",
+        Action::"api:capability.track",
         Action::"api:task.list",
         Action::"api:task.read",
         Action::"api:task.claim",

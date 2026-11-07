@@ -57,6 +57,26 @@
         ],
         "type": "object"
       },
+      "AgentRevisionView": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "version",
+          "digest"
+        ],
+        "type": "object"
+      },
       "AgentView": {
         "additionalProperties": false,
         "properties": {
@@ -1442,6 +1462,57 @@
         ],
         "type": "object"
       },
+      "MetricView": {
+        "additionalProperties": false,
+        "properties": {
+          "failed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "labels": {
+            "additionalProperties": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "object"
+          },
+          "numbers": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NumberView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "passed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "runs": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "verdicts": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "runs",
+          "verdicts",
+          "passed",
+          "failed",
+          "labels"
+        ],
+        "type": "object"
+      },
       "MixedScript": {
         "additionalProperties": false,
         "properties": {
@@ -1462,6 +1533,40 @@
           "at",
           "word",
           "scripts"
+        ],
+        "type": "object"
+      },
+      "NumberView": {
+        "additionalProperties": false,
+        "properties": {
+          "count": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max": {
+            "format": "double",
+            "type": "number"
+          },
+          "mean": {
+            "format": "double",
+            "type": "number"
+          },
+          "min": {
+            "format": "double",
+            "type": "number"
+          },
+          "sum": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "count",
+          "sum",
+          "min",
+          "max",
+          "mean"
         ],
         "type": "object"
       },
@@ -1914,6 +2019,28 @@
         ],
         "type": "object"
       },
+      "RevisionView": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentRevisionView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "track": {
+            "$ref": "#/components/schemas/TrackView"
+          }
+        },
+        "required": [
+          "track"
+        ],
+        "type": "object"
+      },
       "RunList": {
         "additionalProperties": false,
         "properties": {
@@ -2229,6 +2356,73 @@
         ],
         "type": "object"
       },
+      "TrackRecordView": {
+        "additionalProperties": false,
+        "properties": {
+          "capability": {
+            "type": "string"
+          },
+          "revisions": {
+            "items": {
+              "$ref": "#/components/schemas/RevisionView"
+            },
+            "type": "array"
+          },
+          "since": {
+            "type": "string"
+          },
+          "total": {
+            "$ref": "#/components/schemas/TrackView"
+          },
+          "until": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "capability",
+          "since",
+          "until",
+          "total",
+          "revisions"
+        ],
+        "type": "object"
+      },
+      "TrackView": {
+        "additionalProperties": false,
+        "properties": {
+          "admitted": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "metrics": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/MetricView"
+            },
+            "type": "object"
+          },
+          "open": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "outcomes": {
+            "additionalProperties": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "admitted",
+          "open",
+          "outcomes",
+          "metrics"
+        ],
+        "type": "object"
+      },
       "Trust": {
         "oneOf": [
           {
@@ -2355,7 +2549,7 @@
   "info": {
     "description": "The operator API of an agentplane plane: the routes a person or their tooling uses to see what a plane is doing and to intervene — runs, tasks, cases, obligations, holds, halts, events and dead letters.\n\n**Scope.** This document describes the operator API only. The A2A surface is described by its own protocol and the Agent Card it serves; the MCP server by the tool listing MCP defines. Neither is here.\n\n**Tenant.** The tenant a request reaches comes from its credential, never from a path, query or body member; no operation takes one.\n\n**Refusals.** Every non-success answer is `{\"error\": \"<sentence>\"}`.\n\n**Compatibility.** This document is outside the project's compatibility promise, like the Rust API: an operation, a member or a status can change in any release. Pin the version your client was generated from.",
     "title": "agentplane operator API",
-    "version": "0.59.0"
+    "version": "0.60.0"
   },
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "openapi": "3.1.0",
@@ -2407,6 +2601,97 @@
         },
         "summary": "Every condition on this plane that needs a person, by name.",
         "x-agentplane-action": "api:attention"
+      }
+    },
+    "/capabilities/{capability}/track-record": {
+      "get": {
+        "operationId": "capability_track_record",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "capability",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TrackRecordView"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "An identifier does not parse, the request's content is wrong, or the body is not JSON."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No credential, or one the authenticator refused."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The policy refused, or the caller's tenant has no plane here."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The store failed, or the policy set could not be evaluated."
+          }
+        },
+        "summary": "What a capability's runs admitted in a window came to: outcomes and standing verdicts.",
+        "x-agentplane-action": "api:capability.track"
       }
     },
     "/cases": {

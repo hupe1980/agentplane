@@ -9,4 +9,10 @@ ignore = [
     # served path computes with it. Remove when aws-config depends on a p256
     # built on crypto-bigint 0.7.6 or later.
     "RUSTSEC-2026-0387",
+    # RUSTSEC-2026-0440: astral-tokio-tar is unmaintained (no vulnerability).
+    # It reaches this crate only as a dev-dependency, through testcontainers,
+    # which the Postgres and Vault test batteries use to start containers;
+    # nothing shipped links it. testcontainers 0.28.0 (read 2026-11-07) still
+    # requires it. Remove when testcontainers moves to a maintained tar crate.
+    "RUSTSEC-2026-0440",
 ]

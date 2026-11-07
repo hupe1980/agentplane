@@ -1116,9 +1116,11 @@ Details worth stating:
 * **A schema strict mode cannot accept is refused before it is sent.** Each
   provider accepts its own subset of JSON Schema and answers the rest with a
   400. `StrictSubset` holds each as an allow-list — OpenAI's as probed against
-  its API, Anthropic's as documented, with its per-request budget of twenty
-  strict tools — and names the keyword and path it refuses. A response schema
-  outside the subset is refused; a tool is sent non-strict, on Bedrock too,
+  its API, Anthropic's as documented, with its per-request budget of 20
+  strict tools, 24 optional parameters and 16 union parameters (a parameter
+  whose `$ref` names a union counts as one) — and names the keyword and path
+  it refuses. A response schema outside the subset is refused; a tool is sent
+  non-strict, on Bedrock too,
   which holds Converse tools to Anthropic's subset and budget. A caller's
   schema is never rewritten, since the effect key would record one shape and
   the wire carry another; a typed tool's generated schema is made strict-ready

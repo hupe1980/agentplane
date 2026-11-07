@@ -77,7 +77,7 @@ impl AnthropicBudget {
             return Err(problem);
         }
         let mut cost = StrictCost::default();
-        count_cost(schema, &mut cost);
+        count_cost(schema, schema, &mut cost);
         let optional = self.spent.optional + cost.optional;
         let unions = self.spent.unions + cost.unions;
         if optional > ANTHROPIC_OPTIONAL || unions > ANTHROPIC_UNIONS {
@@ -530,18 +530,48 @@ fn recursive_ref(schema: &Value) -> Option<String> {
         on_path.pop();
         found
     }
-    let definition = |target: &str| -> Option<&Value> {
-        let (table, name) = target.strip_prefix("#/")?.split_once('/')?;
-        schema.get(table)?.get(name)
-    };
+    let definition = |target: &str| local_target(schema, target);
     let mut root = Vec::new();
     refs(schema, &mut root);
     root.into_iter()
         .find(|start| cycles(start, &mut Vec::new(), &definition))
 }
 
+/// What a local `$ref` names within `root`: a JSON Pointer after the `#`,
+/// escapes and nesting included. `None` for a reference outside the document.
+fn local_target<'a>(root: &'a Value, target: &str) -> Option<&'a Value> {
+    root.pointer(target.strip_prefix('#')?)
+}
+
+/// Whether a parameter's schema is a union: an `anyOf` or a type array.
 #[cfg(any(feature = "providers", feature = "bedrock"))]
-fn count_cost(node: &Value, cost: &mut StrictCost) {
+fn is_union(schema: &Value) -> bool {
+    schema.get("anyOf").is_some() || schema.get("type").is_some_and(Value::is_array)
+}
+
+/// What a property stands for: its local `$ref`'s target, followed until it
+/// names no other, or the property itself. A parameter that points at a union
+/// is a union parameter, and Anthropic charges it as one.
+#[cfg(any(feature = "providers", feature = "bedrock"))]
+fn referent<'a>(property: &'a Value, root: &'a Value) -> &'a Value {
+    // Bounded although `problem` has refused a cycle by now: this walk must
+    // not depend on running second.
+    const HOPS: usize = 32;
+    let mut at = property;
+    for _ in 0..HOPS {
+        let Some(target) = at.get("$ref").and_then(Value::as_str) else {
+            return at;
+        };
+        match local_target(root, target) {
+            Some(next) => at = next,
+            None => return at,
+        }
+    }
+    at
+}
+
+#[cfg(any(feature = "providers", feature = "bedrock"))]
+fn count_cost(node: &Value, root: &Value, cost: &mut StrictCost) {
     let Some(obj) = node.as_object() else { return };
     if let Some(properties) = obj.get("properties").and_then(Value::as_object) {
         let required: Vec<&str> = obj
@@ -553,28 +583,63 @@ fn count_cost(node: &Value, cost: &mut StrictCost) {
             if !required.contains(&name.as_str()) {
                 cost.optional += 1;
             }
-            if property.get("anyOf").is_some() || property.get("type").is_some_and(Value::is_array)
-            {
+            if is_union(referent(property, root)) {
                 cost.unions += 1;
             }
-            count_cost(property, cost);
+            count_cost(property, root, cost);
         }
     }
     if let Some(items) = obj.get("items") {
-        count_cost(items, cost);
+        count_cost(items, root, cost);
     }
     for key in ["anyOf", "allOf"] {
         if let Some(Value::Array(branches)) = obj.get(key) {
             for branch in branches {
-                count_cost(branch, cost);
+                count_cost(branch, root, cost);
             }
         }
     }
     for key in ["$defs", "definitions"] {
         if let Some(Value::Object(table)) = obj.get(key) {
             for definition in table.values() {
-                count_cost(definition, cost);
+                count_cost(definition, root, cost);
             }
         }
+    }
+}
+
+#[cfg(all(test, any(feature = "providers", feature = "bedrock")))]
+mod budget_tests {
+    use super::{ANTHROPIC_UNIONS, AnthropicBudget};
+    use serde_json::{Map, Value, json};
+
+    /// A tool whose `count` parameters each point at a union definition.
+    fn referencing(count: usize) -> Value {
+        let properties: Map<String, Value> = (0..count)
+            .map(|i| (format!("p{i}"), json!({ "$ref": "#/$defs/Either" })))
+            .collect();
+        let required: Vec<String> = properties.keys().cloned().collect();
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false,
+            "$defs": { "Either": { "anyOf": [{ "type": "string" }, { "type": "integer" }] } },
+        })
+    }
+
+    /// **A parameter that points at a union is charged as one.** Counted only
+    /// where `anyOf` stands on the property, a request of untagged enums passed
+    /// this budget and was refused by the provider.
+    #[test]
+    fn a_property_referencing_a_union_is_charged_to_the_budget() {
+        let mut budget = AnthropicBudget::default();
+        assert!(budget.admit(&referencing(ANTHROPIC_UNIONS)).is_ok());
+        let mut budget = AnthropicBudget::default();
+        let refused = budget.admit(&referencing(ANTHROPIC_UNIONS + 1));
+        assert!(
+            refused.as_ref().is_err_and(|why| why.contains("union")),
+            "{refused:?}"
+        );
     }
 }

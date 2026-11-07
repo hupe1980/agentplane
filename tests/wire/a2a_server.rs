@@ -6028,6 +6028,14 @@ impl JournalStore for CountsReads {
     ) -> Result<Vec<agentplane::core::RunId>, agentplane::core::StoreError> {
         self.inner.assessments_of(run, limit).await
     }
+    async fn track_record(
+        &self,
+        capability: &str,
+        since: agentplane::core::Timestamp,
+        until: agentplane::core::Timestamp,
+    ) -> Result<agentplane::core::TrackRecord, agentplane::core::StoreError> {
+        self.inner.track_record(capability, since, until).await
+    }
     async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, agentplane::core::StoreError> {
         self.inner.admitted_as(key).await
     }

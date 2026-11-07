@@ -126,3 +126,51 @@ pub(crate) fn hold_from_row(
         by: row.by,
     }
 }
+
+/// The kind, label and number a verdict is indexed under — `pass`, `fail`,
+/// `label` or `number` — by both backends' track-record indexes.
+#[cfg(any(feature = "redb", feature = "postgres"))]
+fn stored_verdict(score: &crate::core::Score) -> (&'static str, &str, f64) {
+    match score {
+        crate::core::Score::Pass(true) => ("pass", "", 0.0),
+        crate::core::Score::Pass(false) => ("fail", "", 0.0),
+        crate::core::Score::Label(label) => ("label", label.as_str(), 0.0),
+        crate::core::Score::Number(n) => ("number", "", *n),
+    }
+}
+
+/// Count `count` indexed verdicts of one [`stored_verdict`] kind into
+/// `summary`, with `numbers` their sum, minimum and maximum for a number.
+///
+/// # Errors
+///
+/// The kind, when it is none of the four: an index row this build cannot read.
+#[cfg(any(feature = "redb", feature = "postgres"))]
+fn count_stored(
+    summary: &mut crate::core::MetricSummary,
+    kind: &str,
+    label: &str,
+    count: u64,
+    numbers: (f64, f64, f64),
+) -> Result<(), crate::core::StoreError> {
+    match kind {
+        "pass" => summary.passed += count,
+        "fail" => summary.failed += count,
+        "label" => *summary.labels.entry(label.to_owned()).or_default() += count,
+        "number" => {
+            let (sum, min, max) = numbers;
+            let these = crate::core::NumberSummary::new(count, sum, min, max);
+            match &mut summary.numbers {
+                Some(held) => held.merge(&these),
+                None => summary.numbers = Some(these),
+            }
+        }
+        other => {
+            return Err(crate::core::StoreError::Corrupt {
+                seq: 0,
+                detail: format!("run_verdict holds a verdict of unknown kind '{other}'"),
+            });
+        }
+    }
+    Ok(())
+}

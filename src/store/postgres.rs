@@ -283,14 +283,51 @@ CREATE TABLE IF NOT EXISTS run_admission (
 
 -- The runs recording a person's verdict on a run. **Derived**, not
 -- authoritative: fed by the `Assessed` record inside `append`, in the same
--- transaction, so the verdict's home stays the chain. Read in the feed's
--- order, which is commit order (see `JournalStore::assessments_of`).
+-- transaction, so the verdict's home stays the chain. Read in log order,
+-- joined to `run_seal`, so an unsealed verdict is not yet one (see
+-- `JournalStore::assessments_of`).
 CREATE TABLE IF NOT EXISTS run_assessment (
     tenant TEXT NOT NULL,
     of_run TEXT NOT NULL,
     run_id TEXT NOT NULL,
     PRIMARY KEY (tenant, of_run, run_id)
 );
+
+-- Every admitted run under what it was asked for, and the declaration revision
+-- that served it ('' for none). **Derived**, from `RunAdmitted` inside
+-- `append`. Byte collation, so the run id's text sorts by the instant minted
+-- into it and a window is one index range (see `JournalStore::track_record`).
+CREATE TABLE IF NOT EXISTS run_capability (
+    tenant        TEXT NOT NULL,
+    run_id        TEXT COLLATE \"C\" NOT NULL,
+    capability    TEXT NOT NULL,
+    agent_name    TEXT NOT NULL,
+    agent_version TEXT NOT NULL,
+    agent_digest  TEXT NOT NULL,
+    PRIMARY KEY (tenant, run_id)
+);
+CREATE INDEX IF NOT EXISTS run_capability_window
+    ON run_capability (tenant, capability, run_id);
+
+-- Every verdict on a run, keyed by the record that holds it. **Derived**, from
+-- `Assessed` inside `append`. Which one stands is chosen on read, by the
+-- verdict run's `run_seal.log_index` — the order `JournalStore::assessments_of`
+-- answers in, and the one a restore reproduces. `kind` is `pass`, `fail`,
+-- `label` or `number`.
+CREATE TABLE IF NOT EXISTS run_verdict (
+    tenant TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    seq    BIGINT NOT NULL,
+    of_run TEXT COLLATE \"C\" NOT NULL,
+    actor  TEXT NOT NULL,
+    basis  TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    kind   TEXT NOT NULL,
+    label  TEXT NOT NULL,
+    number DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (tenant, run_id, seq)
+);
+CREATE INDEX IF NOT EXISTS run_verdict_of ON run_verdict (tenant, of_run);
 
 -- An operator's stop request. Beside the chain rather than in it, and
 -- deliberately not fenced: whoever wants a run stopped is not its owner, holds
@@ -1052,6 +1089,7 @@ impl PostgresStore {
         let mut claimed: Option<String> = None;
         let mut waiting: Option<crate::core::SuspendReason> = None;
         let mut assessed: Vec<String> = Vec::new();
+        let mut tracked = TrackRows::default();
         for append in batch {
             seq += 1;
             let (body, written) = append.into_parts(seq, epoch, self.upcaster.as_ref())?;
@@ -1073,6 +1111,7 @@ impl PostgresStore {
                 crate::journal::RecordKind::Assessed { of, .. } => assessed.push(of.clone()),
                 _ => {}
             }
+            tracked.note(seq, &body.kind);
             let record = Record::seal_at(body, written, prev, self.signer.as_deref())?;
             prev = record.hash;
 
@@ -1110,6 +1149,7 @@ impl PostgresStore {
         self.touch_activity(tx, run, source).await?;
         self.derive_indexes(tx, run, claimed, conclusion, waiting, &assessed)
             .await?;
+        self.derive_track_indexes(tx, run, tracked).await?;
 
         // Inside the transaction, so the database delivers it only if the
         // append commits — and to every instance listening, not only this one.
@@ -1154,6 +1194,57 @@ impl PostgresStore {
         )
         .await
         .map_err(|error| be(&error))?;
+        Ok(())
+    }
+
+    /// The track-record indexes this batch moves, in its transaction: a
+    /// run's capability and revision, and each verdict.
+    async fn derive_track_indexes(
+        &self,
+        tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
+        run: RunId,
+        tracked: TrackRows,
+    ) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
+        if let Some((capability, name, version, digest)) = tracked.admitted {
+            tx.execute(
+                "INSERT INTO run_capability
+                   (tenant, run_id, capability, agent_name, agent_version, agent_digest)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (tenant, run_id) DO NOTHING",
+                &[
+                    &tenant,
+                    &run.to_string(),
+                    &capability,
+                    &name,
+                    &version,
+                    &digest,
+                ],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        }
+        for verdict in tracked.verdicts {
+            tx.execute(
+                "INSERT INTO run_verdict
+                   (tenant, run_id, seq, of_run, actor, basis, metric, kind, label, number)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                &[
+                    &tenant,
+                    &run.to_string(),
+                    &verdict.seq,
+                    &verdict.of,
+                    &verdict.actor,
+                    &verdict.basis,
+                    &verdict.metric,
+                    &verdict.kind,
+                    &verdict.label,
+                    &verdict.number,
+                ],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        }
         Ok(())
     }
 
@@ -1470,9 +1561,9 @@ impl JournalStore for PostgresStore {
         let rows = client
             .query(
                 "SELECT a.run_id FROM run_assessment a
-                 JOIN journal j ON j.tenant = a.tenant AND j.run_id = a.run_id AND j.seq = 1
+                 JOIN run_seal s ON s.tenant = a.tenant AND s.run_id = a.run_id
                  WHERE a.tenant = $1 AND a.of_run = $2
-                 ORDER BY j.tx, j.pos LIMIT $3",
+                 ORDER BY s.log_index LIMIT $3",
                 &[&self.tenant_name(), &run.to_string(), &limit],
             )
             .await
@@ -1486,6 +1577,108 @@ impl JournalStore for PostgresStore {
                 })
             })
             .collect()
+    }
+
+    async fn track_record(
+        &self,
+        capability: &str,
+        since: crate::core::Timestamp,
+        until: crate::core::Timestamp,
+    ) -> Result<crate::core::TrackRecord, StoreError> {
+        let mut record = crate::core::TrackRecord::new(capability.to_owned(), since, until);
+        let Some((from, to)) = crate::core::track_record_window(since, until) else {
+            return Ok(record);
+        };
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let window: [&(dyn deadpool_postgres::tokio_postgres::types::ToSql + Sync); 4] =
+            [&self.tenant_name(), &capability, &from, &to];
+        let runs = client
+            .query(
+                "SELECT c.agent_name, c.agent_version, c.agent_digest, o.outcome, COUNT(*)
+                   FROM run_capability c
+                   LEFT JOIN run_outcome o
+                     ON o.tenant = c.tenant AND o.run_id COLLATE \"C\" = c.run_id
+                  WHERE c.tenant = $1 AND c.capability = $2
+                    AND c.run_id >= $3 AND c.run_id < $4
+                  GROUP BY 1, 2, 3, 4",
+                &window,
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        for row in &runs {
+            let track = record.revision_mut(revision_of(row)?);
+            let count = count_of(row, 4)?;
+            track.admitted += count;
+            if let Some(outcome) = row.get::<_, Option<String>>(3) {
+                *track.outcomes.entry(outcome).or_default() += count;
+            }
+        }
+        let verdicts = client
+            .query(
+                "WITH standing AS (
+                    SELECT DISTINCT ON (v.of_run, v.actor, v.basis, v.metric) v.*
+                      FROM run_verdict v
+                      JOIN run_capability c ON c.tenant = v.tenant AND c.run_id = v.of_run
+                      JOIN run_seal s ON s.tenant = v.tenant AND s.run_id = v.run_id
+                     WHERE c.tenant = $1 AND c.capability = $2
+                       AND c.run_id >= $3 AND c.run_id < $4
+                     ORDER BY v.of_run, v.actor, v.basis, v.metric, s.log_index DESC
+                 )
+                 SELECT c.agent_name, c.agent_version, c.agent_digest, v.metric, v.kind, v.label,
+                        COUNT(*), SUM(v.number::numeric)::text, MIN(v.number), MAX(v.number)
+                   FROM standing v
+                   JOIN run_capability c ON c.tenant = v.tenant AND c.run_id = v.of_run
+                  GROUP BY 1, 2, 3, 4, 5, 6",
+                &window,
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        for row in &verdicts {
+            let metric: String = row.get(3);
+            let kind: String = row.get(4);
+            let label: String = row.get(5);
+            let count = count_of(row, 6)?;
+            // Summed as `numeric`, which is exact and cannot overflow, and read
+            // back as text, so a total past `f64` reads as infinite rather
+            // than failing the whole record.
+            let sum: String = row.get(7);
+            let sum: f64 = sum.parse().map_err(|_| StoreError::Corrupt {
+                seq: 0,
+                detail: format!("run_verdict sums to '{sum}'"),
+            })?;
+            let numbers = (sum, row.get(8), row.get(9));
+            let summary = record
+                .revision_mut(revision_of(row)?)
+                .metrics
+                .entry(metric)
+                .or_default();
+            super::count_stored(summary, &kind, &label, count, numbers)?;
+        }
+        let judged = client
+            .query(
+                "SELECT c.agent_name, c.agent_version, c.agent_digest, v.metric,
+                        COUNT(DISTINCT v.of_run)
+                   FROM run_verdict v
+                   JOIN run_capability c ON c.tenant = v.tenant AND c.run_id = v.of_run
+                   JOIN run_seal s ON s.tenant = v.tenant AND s.run_id = v.run_id
+                  WHERE c.tenant = $1 AND c.capability = $2
+                    AND c.run_id >= $3 AND c.run_id < $4
+                  GROUP BY 1, 2, 3, 4",
+                &window,
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        for row in &judged {
+            let metric: String = row.get(3);
+            let runs = count_of(row, 4)?;
+            record
+                .revision_mut(revision_of(row)?)
+                .metrics
+                .entry(metric)
+                .or_default()
+                .runs += runs;
+        }
+        Ok(record)
     }
 
     async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
@@ -2488,4 +2681,98 @@ impl AtomicJournal for PostgresStore {
             .map_err(|e| commit_refused_or_in_doubt(&e))?;
         Ok(sealed)
     }
+}
+
+/// What one batch contributes to the track-record indexes, gathered in the
+/// pass over its records that every other derived index uses.
+#[derive(Default)]
+struct TrackRows {
+    /// `(capability, agent name, version, digest)`, `''` for no declaration.
+    admitted: Option<(String, String, String, String)>,
+    verdicts: Vec<VerdictRow>,
+}
+
+struct VerdictRow {
+    /// The record's position in its own run, which joins it to the journal's
+    /// commit order.
+    seq: i64,
+    of: String,
+    actor: String,
+    basis: &'static str,
+    metric: String,
+    kind: &'static str,
+    label: String,
+    number: f64,
+}
+
+impl TrackRows {
+    fn note(&mut self, seq: u64, kind: &crate::journal::RecordKind) {
+        match kind {
+            crate::journal::RecordKind::RunAdmitted {
+                capability,
+                governed_by,
+                ..
+            } => {
+                let (name, version, digest) = governed_by.as_deref().map_or_else(
+                    || (String::new(), String::new(), String::new()),
+                    |agent| {
+                        (
+                            agent.name.clone(),
+                            agent.version.clone(),
+                            agent.digest.to_hex(),
+                        )
+                    },
+                );
+                self.admitted = Some((capability.clone(), name, version, digest));
+            }
+            crate::journal::RecordKind::Assessed {
+                of,
+                name,
+                value,
+                by,
+                ..
+            } => {
+                let (kind, label, number) = super::stored_verdict(value);
+                self.verdicts.push(VerdictRow {
+                    seq: seq.cast_signed(),
+                    of: of.clone(),
+                    actor: by.actor().to_owned(),
+                    basis: by.basis().as_str(),
+                    metric: name.clone(),
+                    kind,
+                    label: label.to_owned(),
+                    number,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The revision a grouped row names in its first three columns.
+fn revision_of(
+    row: &deadpool_postgres::tokio_postgres::Row,
+) -> Result<Option<crate::core::Revision>, StoreError> {
+    let digest: String = row.get(2);
+    if digest.is_empty() {
+        return Ok(None);
+    }
+    let digest = Digest::from_hex(&digest).map_err(|e| StoreError::Corrupt {
+        seq: 0,
+        detail: format!("run_capability holds an unreadable digest '{digest}': {e}"),
+    })?;
+    Ok(Some(crate::core::Revision::new(
+        row.get(0),
+        row.get(1),
+        digest,
+    )))
+}
+
+/// A `COUNT` column, which Postgres answers as a signed 64-bit integer.
+fn count_of(row: &deadpool_postgres::tokio_postgres::Row, at: usize) -> Result<u64, StoreError> {
+    let count: i64 = row.get(at);
+    u64::try_from(count).map_err(|_| StoreError::Corrupt {
+        seq: 0,
+        detail: format!("a count of {count}"),
+    })
 }

@@ -16,6 +16,38 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.60.0] — unreleased
+
+### Added
+
+- **`Runtime::track_record(capability, since..until)`**: what a capability's
+  runs admitted in the window came to — runs by their last conclusion, and
+  each person's latest verdict per metric on them — per declaration revision
+  and in `total()`. Use it instead of counting `assessments_of` run by run.
+  A window holding no millisecond is `RuntimeError::EmptyWindow`.
+- **`GET /capabilities/{capability}/track-record?since=&until=`** under
+  `api:capability.track`, defaulting to the last thirty days. Grant it in your
+  policy bundle to serve it.
+
+### Changed
+
+- **BREAKING: `JournalStore::track_record(capability, since, until)`**, with no
+  default. A store of your own derives it from `RunAdmitted` inside `append`
+  and from `Assessed` at its seal; a decorator delegates.
+  `JournalStore::assessments_of` answers sealed verdicts in log order. Postgres gains `run_capability` and
+  `run_verdict`, redb tables of the same names: recreate an existing store.
+
+### Fixed
+
+- **`tools::strict_schema::<T>()` left a unit enum with documented variants as
+  a `oneOf`**, which both strict subsets refuse, so the tool went non-strict. It
+  becomes a string `enum`, each variant's doc named in the description.
+- **Anthropic's union budget missed a parameter that is a `$ref` to a union**,
+  such as an untagged enum, so a request could pass here and be refused there.
+- **A restore could change which verdict stands.** Verdicts were ordered by
+  append, and a restore appends in the file's order. They are now in log order,
+  which a restore rebuilds; a verdict counts once its run is sealed.
+
 ## [0.59.0] — 2026-11-05
 
 ### Added

@@ -161,7 +161,8 @@ dispatches, so the operator API is deliberately *not* filtered by it: `GET
 /runs/{id}/history` returns the journal records to whoever holds
 `api:run.history`, payloads included — `GET /runs/{id}/output` the run's
 answer to whoever holds `api:run.output`, and `GET /runs/{id}/assessments`
-people's own words about it to whoever holds `api:run.assessments`. That is
+people's own words about it to whoever holds `api:run.assessments` (their
+counts, without the words, to whoever holds `api:capability.track`). That is
 right for the party whose journal
 it is — an auditor who cannot see what was written cannot audit — and the
 control there is the verb, which is why the read verbs are granted explicitly

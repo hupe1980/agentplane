@@ -961,6 +961,125 @@ async fn assert_derived_indexes_survived(fresh: &Arc<dyn JournalStore>, keyed: R
     );
 }
 
+/// **A restored store answers the same track record.** Its indexes derive
+/// from records and run ids only, both of which the export carries, so a
+/// catalog reads the same numbers after a recovery.
+#[tokio::test]
+// Run ids are minted from the ambient clock, so the window is read from it.
+#[allow(clippy::disallowed_methods)]
+async fn a_restored_store_answers_the_same_track_record() {
+    use agentplane::core::{Assessment, Operator, Score, Timestamp};
+    let origin = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&origin) as Arc<dyn JournalStore>)
+        .skill(Trivial)
+        .build();
+    let since = Timestamp::now_utc() - std::time::Duration::from_secs(60);
+    let mut runs = Vec::new();
+    for n in 0..2 {
+        runs.push(
+            rt.start("demo.trivial", Tainted::trusted(json!({ "n": n })))
+                .run()
+                .await
+                .expect("run")
+                .run_id,
+        );
+    }
+    for (who, value) in [("alice", true), ("alice", false), ("bob", true)] {
+        let verdict = Assessment::new(
+            runs[0],
+            "helpful",
+            Score::Pass(value),
+            Operator::authenticated(who).expect("a name"),
+            Timestamp::now_utc(),
+            None,
+        )
+        .expect("a verdict");
+        runs.push(rt.assess(verdict).await.expect("recorded"));
+    }
+    let until = Timestamp::now_utc() + std::time::Duration::from_secs(60);
+    let before = rt
+        .track_record("demo.trivial", since..until)
+        .await
+        .expect("read");
+    assert_eq!(before.total().admitted, 2, "{before:#?}");
+
+    let origin: Arc<dyn JournalStore> = origin;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&origin, &crate::no_cases(), &runs, &mut out)
+        .await
+        .expect("export");
+    let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(&out))
+        .await
+        .expect("restore");
+    let after = fresh
+        .track_record("demo.trivial", since, until)
+        .await
+        .expect("read");
+    assert_eq!(after, before, "the restore answered another track record");
+}
+
+/// The verdict that stands survives a restore of a file that lists a person's
+/// verdicts in the reverse of the order they were given.
+///
+/// A file lists runs in whatever order it was asked to, and a restore appends
+/// them in that order. Which verdict stands is read in log order, which the
+/// restore rebuilds from each run's recorded position, so the file's order
+/// cannot change it.
+#[tokio::test]
+async fn a_restore_keeps_the_verdict_that_stood_whatever_order_the_file_lists() {
+    use agentplane::core::{Assessment, Operator, Score, Timestamp};
+    let origin = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&origin) as Arc<dyn JournalStore>)
+        .skill(Trivial)
+        .build();
+    let judged = rt
+        .start("demo.trivial", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .expect("run")
+        .run_id;
+    let mut verdicts = Vec::new();
+    for value in [false, true] {
+        let verdict = Assessment::new(
+            judged,
+            "helpful",
+            Score::Pass(value),
+            Operator::authenticated("alice").expect("a name"),
+            Timestamp::UNIX_EPOCH,
+            None,
+        )
+        .expect("a verdict");
+        verdicts.push(rt.assess(verdict).await.expect("recorded"));
+    }
+    let standing = |a: &agentplane::core::Assessments| {
+        a.current()
+            .iter()
+            .map(|v| v.value().clone())
+            .collect::<Vec<_>>()
+    };
+    let before = rt.assessments(judged).await.expect("read");
+    assert_eq!(standing(&before), [Score::Pass(true)]);
+
+    let origin: Arc<dyn JournalStore> = origin;
+    let mut out = Vec::new();
+    let listed = [judged, verdicts[1], verdicts[0]];
+    agentplane::export::to_jsonl(&origin, &crate::no_cases(), &listed, &mut out)
+        .await
+        .expect("export");
+    let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(&out))
+        .await
+        .expect("restore");
+    let after = Runtime::builder(fresh)
+        .skill(Trivial)
+        .build()
+        .assessments(judged)
+        .await
+        .expect("read");
+    assert_eq!(after, before, "the restore reordered the verdicts");
+}
+
 /// A restore lands in exactly one tenant, and the neighbour cannot see it.
 ///
 /// An export carries no tenant: the runs in it belonged to whichever store
@@ -1571,6 +1690,14 @@ impl JournalStore for Doctored {
         limit: usize,
     ) -> Result<Vec<agentplane::core::RunId>, StoreError> {
         self.inner.assessments_of(run, limit).await
+    }
+    async fn track_record(
+        &self,
+        capability: &str,
+        since: agentplane::core::Timestamp,
+        until: agentplane::core::Timestamp,
+    ) -> Result<agentplane::core::TrackRecord, StoreError> {
+        self.inner.track_record(capability, since, until).await
     }
     async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
         self.inner.admitted_as(key).await

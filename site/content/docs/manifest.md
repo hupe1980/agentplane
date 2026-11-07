@@ -815,7 +815,9 @@ drivers apply it: a response schema outside it is refused before sending, and a
 tool is sent non-strict ([model providers](@/docs/interop.md#model-providers-providers-bedrock)).
 `agentplane::model::strict_schema_problem` names every rule a schema breaks, on
 every provider. `agentplane::tools::strict_schema::<T>()` makes a schema you
-generate ready as a typed tool's is, rewriting only what `serde` enforces.
+generate ready as a typed tool's is, rewriting only what `serde` enforces — a
+unit enum whose variants carry doc comments becomes a string `enum`, each
+variant's doc kept beside its value in the description.
 `agentplane::tools::closed_schema` makes somebody else's — an MCP server's —
 ready by narrowing alone: objects closed, nothing made nullable, no bound
 dropped. A grant drafted from discovery carries that form.

@@ -99,6 +99,9 @@ pub fn closed_schema(schema: &Value) -> Value {
 /// - A number's `format`, and a `minimum` or `maximum` equal to its Rust type's
 ///   own bound, are dropped: `schemars` derives them from the type and `serde`
 ///   refuses what they exclude. A range somebody declared stays.
+/// - A `oneOf` of distinct string constants — a unit enum whose variants carry
+///   doc comments — becomes a string `enum`, and its description names each
+///   value with the variant's doc.
 ///
 /// Every object is closed whatever it composes with, since `serde` hands the
 /// tool its declared fields and ignores the rest.
@@ -129,6 +132,7 @@ fn close(node: &mut Value, grounds: Grounds) {
     };
     if grounds == Grounds::Serde {
         drop_type_bounds(map);
+        enumerate_constants(map);
     }
     if map.contains_key("$ref") && map.len() > 1 {
         let target = map.remove("$ref").expect("checked above");
@@ -164,6 +168,80 @@ fn close(node: &mut Value, grounds: Grounds) {
         for branch in branches {
             close(branch, grounds);
         }
+    }
+}
+
+/// A `oneOf` of distinct string values, as an `enum` of them.
+///
+/// What `schemars` writes for a unit enum once a variant carries a doc
+/// comment, and neither strict subset holds a `oneOf`. Distinct constants are
+/// disjoint, so the `enum` admits exactly what the `oneOf` did, and `serde`
+/// reads a unit variant from its bare string. An `enum` rather than an `anyOf`
+/// because Anthropic charges every union parameter to a per-request budget.
+/// Each documented value is named in the description, beside its meaning.
+fn enumerate_constants(map: &mut Map<String, Value>) {
+    let Some(Value::Array(branches)) = map.get("oneOf") else {
+        return;
+    };
+    if map.get("type").is_some_and(|t| t != "string")
+        || map.contains_key("enum")
+        || map.contains_key("const")
+    {
+        return;
+    }
+    let mut values: Vec<&str> = Vec::with_capacity(branches.len());
+    let mut meanings: Vec<String> = Vec::new();
+    for branch in branches {
+        let Some(branch) = branch.as_object() else {
+            return;
+        };
+        let only_annotated = branch
+            .keys()
+            .all(|key| matches!(key.as_str(), "type" | "const" | "enum" | "description"));
+        if !only_annotated || branch.get("type").and_then(Value::as_str) != Some("string") {
+            return;
+        }
+        // `schemars` writes each documented variant as a `const` and gathers
+        // the undocumented ones into one `enum`.
+        let named: Vec<&str> = match (branch.get("const"), branch.get("enum")) {
+            (Some(Value::String(one)), None) => vec![one.as_str()],
+            (None, Some(Value::Array(many))) => {
+                let Some(many) = many.iter().map(Value::as_str).collect::<Option<Vec<_>>>() else {
+                    return;
+                };
+                many
+            }
+            _ => return,
+        };
+        for value in &named {
+            if values.contains(value) {
+                return;
+            }
+            values.push(value);
+        }
+        match branch.get("description") {
+            Some(Value::String(meaning)) => {
+                let named: Vec<String> = named.iter().map(|v| format!("`{v}`")).collect();
+                meanings.push(format!("{}: {meaning}", named.join(", ")));
+            }
+            Some(_) => return,
+            None => {}
+        }
+    }
+    if values.is_empty() {
+        return;
+    }
+    let values: Vec<Value> = values.into_iter().map(Value::from).collect();
+    map.remove("oneOf");
+    map.insert("type".to_owned(), json!("string"));
+    map.insert("enum".to_owned(), Value::Array(values));
+    if !meanings.is_empty() {
+        let own = map.get("description").and_then(Value::as_str);
+        let text = own.map_or_else(
+            || meanings.join("\n"),
+            |own| format!("{own}\n\n{}", meanings.join("\n")),
+        );
+        map.insert("description".to_owned(), Value::String(text));
     }
 }
 

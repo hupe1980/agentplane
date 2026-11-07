@@ -459,6 +459,14 @@ impl JournalStore for RefusesAppends {
     ) -> Result<Vec<agentplane::core::RunId>, StoreError> {
         self.inner.assessments_of(run, limit).await
     }
+    async fn track_record(
+        &self,
+        capability: &str,
+        since: agentplane::core::Timestamp,
+        until: agentplane::core::Timestamp,
+    ) -> Result<agentplane::core::TrackRecord, StoreError> {
+        self.inner.track_record(capability, since, until).await
+    }
     async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
         self.inner.admitted_as(key).await
     }
@@ -843,6 +851,102 @@ async fn a_later_verdict_replaces_an_earlier_one_in_the_view() {
             .is_empty(),
         "the index answered for the wrong run"
     );
+}
+
+/// **A capability's track record agrees with the verdicts that stand.** Each
+/// run counts once under how it concluded; a person's replaced verdict counts
+/// as its replacement; the verdicts' own runs are not runs of the capability.
+#[tokio::test]
+// Run ids are minted from the ambient clock, so the window is read from it.
+#[allow(clippy::disallowed_methods)]
+async fn a_track_record_counts_the_verdicts_that_stand() {
+    use agentplane::core::{Score, Tainted, Timestamp};
+    let store = Arc::new(RedbStore::open_in_memory().expect("a store"));
+    let runtime = answering(Arc::clone(&store) as Arc<dyn JournalStore>);
+    let since = Timestamp::now_utc() - Duration::from_secs(60);
+    let mut runs = Vec::new();
+    for n in 0..2 {
+        runs.push(
+            runtime
+                .start(
+                    "demo.answer",
+                    Tainted::trusted(serde_json::json!({ "n": n })),
+                )
+                .run()
+                .await
+                .expect("ran")
+                .run_id,
+        );
+    }
+    for (who, value) in [("alice", true), ("bob", false), ("alice", false)] {
+        runtime
+            .assess(verdict(runs[0], who, "helpful", Score::Pass(value)))
+            .await
+            .expect("recorded");
+    }
+    runtime
+        .assess(verdict(
+            runs[1],
+            "alice",
+            "action",
+            Score::Label("sent".into()),
+        ))
+        .await
+        .expect("recorded");
+    let until = Timestamp::now_utc() + Duration::from_secs(60);
+
+    let record = runtime
+        .track_record("demo.answer", since..until)
+        .await
+        .expect("read");
+    let total = record.total();
+    assert_eq!(total.admitted, 2, "{total:#?}");
+    assert_eq!(total.outcomes.get("succeeded"), Some(&2), "{total:#?}");
+    assert_eq!(total.open(), 0);
+    let helpful = &total.metrics["helpful"];
+    assert_eq!(
+        (helpful.runs, helpful.passed, helpful.failed),
+        (1, 0, 2),
+        "alice's replaced verdict was counted: {helpful:#?}"
+    );
+    assert_eq!(total.metrics["action"].labels.get("sent"), Some(&1));
+    assert_eq!(
+        record.revisions.len(),
+        1,
+        "a skill with no manifest is one revision, named by nothing"
+    );
+    assert!(record.revisions[0].agent.is_none());
+
+    let nothing = runtime
+        .track_record("demo.unasked", since..until)
+        .await
+        .expect("read");
+    assert!(nothing.revisions.is_empty(), "{nothing:#?}");
+}
+
+/// **A window that holds no millisecond is refused** — run ids carry no finer
+/// instant — rather than answered with an empty record a catalog would show as
+/// a capability nobody used.
+#[tokio::test]
+// Run ids are minted from the ambient clock, so the window is read from it.
+#[allow(clippy::disallowed_methods)]
+async fn an_empty_window_is_refused() {
+    use agentplane::core::{RuntimeError, Timestamp};
+    let store = Arc::new(RedbStore::open_in_memory().expect("a store"));
+    let runtime = answering(store as Arc<dyn JournalStore>);
+    let now = Timestamp::now_utc();
+    let whole = Timestamp::from_unix_timestamp(1_760_000_000).expect("an instant");
+    for window in [
+        now..now,
+        now..now - Duration::from_secs(1),
+        whole..whole + Duration::from_micros(500),
+    ] {
+        let refused = runtime.track_record("demo.answer", window).await;
+        assert!(
+            matches!(refused, Err(RuntimeError::EmptyWindow { .. })),
+            "{refused:?}"
+        );
+    }
 }
 
 /// **Only an answer is judged.** A run still working, one nobody has heard of,

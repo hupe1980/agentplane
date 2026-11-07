@@ -36,6 +36,7 @@ mod signature;
 mod skill;
 mod task;
 mod tenant;
+mod track_record;
 pub mod visible;
 
 pub use budget::{Budget, BudgetExceeded, Ceiling, Consumed, Ledger, Spend};
@@ -105,3 +106,7 @@ pub use task::{
     TaskVerdict, Withheld, verdict_fits,
 };
 pub use tenant::{TenantError, TenantId, erasure_scope};
+pub(crate) use track_record::run_window as track_record_window;
+pub use track_record::{
+    MetricSummary, NumberSummary, Revision, RevisionRecord, Track, TrackRecord,
+};

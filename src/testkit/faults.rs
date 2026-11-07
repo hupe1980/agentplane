@@ -474,6 +474,14 @@ impl JournalStore for Faulty {
     ) -> Result<Vec<crate::core::RunId>, StoreError> {
         self.inner.assessments_of(run, limit).await
     }
+    async fn track_record(
+        &self,
+        capability: &str,
+        since: crate::core::Timestamp,
+        until: crate::core::Timestamp,
+    ) -> Result<crate::core::TrackRecord, StoreError> {
+        self.inner.track_record(capability, since, until).await
+    }
 
     async fn runs_by_id(
         &self,
@@ -698,6 +706,14 @@ mod tests {
             _: crate::core::RunId,
             _: usize,
         ) -> Result<Vec<crate::core::RunId>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn track_record(
+            &self,
+            _: &str,
+            _: crate::core::Timestamp,
+            _: crate::core::Timestamp,
+        ) -> Result<crate::core::TrackRecord, StoreError> {
             unreachable!("the test reads capabilities only")
         }
         async fn admitted_as(&self, _: &str) -> Result<Option<RunId>, StoreError> {

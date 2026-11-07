@@ -1094,6 +1094,7 @@ fn every_declared_route() -> Vec<axum::http::Request<axum::body::Body>> {
         // the status view did not hand out.
         get("/runs/not-an-id/output", Some("bob")),
         get("/runs/not-an-id/assessments", Some("bob")),
+        get("/capabilities/demo.answer/track-record", Some("bob")),
         post(
             "/runs/not-an-id/assessments",
             Some("bob"),
@@ -1905,6 +1906,115 @@ async fn a_runs_answer_is_served_with_its_label_under_its_own_verb() {
         StatusCode::FORBIDDEN,
         "a grant of the status view handed out the answer: {body}"
     );
+}
+
+/// **A track record is served for the capability asked, under its own verb.**
+/// The window is the caller's, as RFC 3339 instants; one that holds no instant,
+/// or an instant that does not parse, is a 400.
+#[tokio::test]
+// Run ids are minted from the ambient clock, so the window is read from it.
+#[allow(clippy::disallowed_methods)]
+async fn a_track_record_is_served_for_the_capability_asked() {
+    let policy = Arc::new(Recording::default());
+    let f = fixture_with(&policy);
+    let router = f.router();
+    let rfc3339 = |t: agentplane::core::Timestamp| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let since =
+        rfc3339(agentplane::core::Timestamp::now_utc() - std::time::Duration::from_secs(3600));
+    let run =
+        f.rt.start("demo.answer", Tainted::trusted(json!({})))
+            .run()
+            .await
+            .unwrap()
+            .run_id;
+    let (status, body) = send(
+        &router,
+        post(
+            &format!("/runs/{run}/assessments"),
+            Some("bob"),
+            &json!({ "name": "helpful", "value": false }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = send(
+        &router,
+        get(
+            &format!("/capabilities/demo.answer/track-record?since={since}"),
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["capability"], "demo.answer", "{body}");
+    assert_eq!(body["total"]["admitted"], 1, "{body}");
+    assert_eq!(body["total"]["outcomes"]["succeeded"], 1, "{body}");
+    assert_eq!(body["total"]["metrics"]["helpful"]["failed"], 1, "{body}");
+    assert_eq!(
+        body["revisions"].as_array().map(Vec::len),
+        Some(1),
+        "{body}"
+    );
+    assert!(
+        policy
+            .asked()
+            .iter()
+            .any(|(who, action, _)| who == "bob" && action == "api:capability.track"),
+        "the route did not ask the gate under its own verb: {:?}",
+        policy.asked()
+    );
+
+    // No window is the last thirty days; an offset's `+` sent unencoded
+    // arrives as a space and still reads.
+    let offset = rfc3339(
+        (agentplane::core::Timestamp::now_utc() - std::time::Duration::from_secs(3600))
+            .to_offset(time::macros::offset!(+1)),
+    );
+    for query in [String::new(), format!("?since={offset}")] {
+        let (status, body) = send(
+            &router,
+            get(
+                &format!("/capabilities/demo.answer/track-record{query}"),
+                Some("bob"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(body["total"]["admitted"], 1, "{query}: {body}");
+    }
+
+    let (status, body) = send(
+        &router,
+        get(
+            &format!("/capabilities/demo.refund/track-record?since={since}"),
+            Some("bob"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["total"]["admitted"], 0,
+        "another capability's runs were counted: {body}"
+    );
+
+    for query in [
+        format!("since={since}&until={since}"),
+        "since=yesterday".to_owned(),
+    ] {
+        let (status, body) = send(
+            &router,
+            get(
+                &format!("/capabilities/demo.answer/track-record?{query}"),
+                Some("bob"),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
 }
 
 /// **A verdict is recorded as the authenticated caller, and read back as the

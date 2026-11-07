@@ -995,8 +995,9 @@ The metric, the value and who judged stay clear, so a quality reading still
 counts them after an erasure; the grammar keeps prose out of them.
 
 **Nothing is overwritten.** `Runtime::assessments(run)` answers every verdict in
-commit order, and `current()` the last by each actor on each metric; a replaced
-verdict stays in the history. `GET /runs/{run}/assessments` computes `current`
+log order, which a restore rebuilds, and `current()` the last by each actor on
+each metric; a replaced verdict stays in the history. A verdict counts once its
+run is sealed. `GET /runs/{run}/assessments` computes `current`
 over every verdict and pages `history`, newest kept.
 
 Refused with `RuntimeError::NotAssessable` (a `409`): a run still working,
@@ -1004,6 +1005,35 @@ waiting or withheld, one whose data was erased, and an operator's act. An
 unknown run is a `404`. `erase_run` takes a case-less run's verdicts'
 rationales with it; a case-bound run's go with the matter's key. An unreadable
 rationale reads as `None`. `GET /runs?outcome=assessed` lists verdicts.
+
+### A capability's track record {#track-record}
+
+What a capability's runs came to over a window — how they ended, and what
+people said about them — is one read: `Runtime::track_record(capability,
+since..until)`, served as `GET /capabilities/{capability}/track-record?since=…&until=…`
+under `api:capability.track`: RFC 3339 instants, `until` defaulting to now and
+`since` to thirty days before it.
+
+- **The window selects runs.** A run is in it when it was *admitted* in it — the
+  instant in its id, which an export carries — and its conclusion and the
+  verdicts on it count as they stand now, whenever they were reached. Verdicts
+  and the runs they judge are one cohort.
+- **Each run counts once**, under its last conclusion: a run that failed and
+  succeeded on resume is `succeeded`. `open` is admitted and not concluded.
+- **Each person's latest verdict per metric counts once**: `passed`/`failed`,
+  label counts, and for numbers `count`, `sum`, `min`, `max`, `mean`. `runs` is
+  how many runs have a verdict on that metric.
+- **Per revision, and in total.** Runs governed by a declaration are split by
+  its name, version and digest, so a prompt change shows even where the
+  version was not bumped; a skill with no manifest is the revision with no
+  `agent`.
+
+The store derives it as it writes each run and seals each verdict, so it never
+lags the journal and a restore rebuilds it. It is a reading for a catalog, not
+evidence: nothing in it is signed. Its cost is linear in the runs the window
+selects; no record is read. Run ids carry milliseconds, so a window that does
+not reach past the millisecond it starts in is `RuntimeError::EmptyWindow` (a
+`400`).
 
 ### The command line's exit statuses {#exit-statuses}
 
@@ -2064,6 +2094,7 @@ Copy the file; it calls operator routes and runs no agent code.
 | `GET /runs/{run}/output` | What did it *answer*? The value a run that succeeded produced, with its label — re-derived by strict replay, so its own verb (`api:run.output`) and its own route → [a run's answer](#a-runs-answer) |
 | `GET /runs/{run}/assessments` | What did people say about that answer? The verdicts standing and every one recorded → [verdicts](#verdicts) |
 | `POST /runs/{run}/assessments` | Record my verdict on it, as myself — `201` with the run that holds it |
+| `GET /capabilities/{capability}/track-record` | How has this capability done lately? Its runs admitted in `since`–`until` by outcome, and the verdicts standing on them, per revision → [track record](#track-record) |
 | `GET /tasks` | What is waiting for me? |
 | `GET /tasks/{task}` | What is this proposal, and may I decide it? |
 | `POST /tasks/{task}/claim` | This one is mine — don't let a colleague duplicate it |

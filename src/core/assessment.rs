@@ -184,7 +184,7 @@ fn token(text: &str) -> Result<(), AssessmentError> {
     }
 }
 
-/// Every assessment of one run, in the order the store recorded them.
+/// Every assessment of one run, in log order.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Assessments {
     /// All of them — a verdict later replaced stays here, because what a

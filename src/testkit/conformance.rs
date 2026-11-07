@@ -1313,6 +1313,7 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     the_feed_serves_every_record_once(fresh, &mut r).await;
     a_feed_follower_wakes_on_any_run(fresh, &mut r).await;
     a_verdict_is_found_from_the_run_it_judges(fresh, &mut r).await;
+    a_track_record_counts_each_run_and_verdict_once(fresh, &mut r).await;
     r
 }
 
@@ -2147,52 +2148,92 @@ async fn an_unkeyed_admission_claims_nothing(fresh: Factory<'_>, r: &mut Report)
     }
 }
 
-/// **A verdict is found from the run it judges**, by the append that writes
-/// it, in the order the store committed them, bounded, and only from that run.
+/// A verdict as the runtime writes one: its own run, the `Assessed` record and
+/// a conclusion, unsealed. Answers the epoch [`seal`](JournalStore::seal)
+/// needs.
+async fn write_verdict(
+    store: &Arc<dyn JournalStore>,
+    run: RunId,
+    verdict: RecordKind,
+) -> Result<crate::core::Epoch, String> {
+    let lease = store
+        .acquire(run, "conformance", LEASE)
+        .await
+        .map_err(|e| format!("a verdict's run could not be leased: {e}"))?;
+    store
+        .append(
+            lease.epoch,
+            vec![Append::new(run, verdict), concluded(run, "assessed")],
+        )
+        .await
+        .map_err(|e| format!("a verdict could not be written: {e}"))?;
+    Ok(lease.epoch)
+}
+
+fn verdict_on(of: RunId, by: &str, name: &str, value: crate::core::Score) -> RecordKind {
+    RecordKind::Assessed {
+        of: of.to_string(),
+        name: name.into(),
+        value,
+        by: crate::core::Operator::asserted(by).expect("a name"),
+        at: crate::core::Timestamp::UNIX_EPOCH,
+        rationale: None,
+    }
+}
+
+/// **A verdict is found from the run it judges, in log order**, bounded, only
+/// from that run, and only once sealed.
 ///
-/// The verdicts' own run ids sort in the *reverse* of the order they are
-/// written, so an index that orders by run id — which is ordered only to the
-/// millisecond — answers the later verdict first and is caught every time,
-/// not only when two land in one millisecond.
+/// Three verdicts are written first, second, third, minted so their run ids
+/// sort third, first, second, and sealed second, third, first: an index in
+/// append order or in run-id order answers another sequence. A fourth is
+/// written and never sealed.
 async fn a_verdict_is_found_from_the_run_it_judges(fresh: Factory<'_>, r: &mut Report) {
     r.checked += 1;
     let store = fresh().await;
     let judged = RunId::generate();
-    let other = RunId::generate();
-    let mut ids: Vec<RunId> = (0..3).map(|_| RunId::generate()).collect();
-    ids.sort_by_key(|id| std::cmp::Reverse(id.to_string()));
-    let mut written = Vec::new();
-    for (of, run) in [judged, other, judged].into_iter().zip(ids) {
-        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
-            return;
-        };
-        let verdict = Append::new(
+    let minted = |ms: u64| RunId(ulid::Ulid::from_parts(1_760_000_000_000 + ms, 9));
+    let (first, second, third, unsealed, other) =
+        (minted(2), minted(3), minted(1), minted(4), minted(5));
+    let mut epochs = std::collections::HashMap::new();
+    for (run, of) in [
+        (first, judged),
+        (second, judged),
+        (other, RunId::generate()),
+        (third, judged),
+        (unsealed, judged),
+    ] {
+        match write_verdict(
+            &store,
             run,
-            RecordKind::Assessed {
-                of: of.to_string(),
-                name: "helpful".into(),
-                value: crate::core::Score::Pass(true),
-                by: crate::core::Operator::asserted("conformance").expect("a name"),
-                at: crate::core::Timestamp::UNIX_EPOCH,
-                rationale: None,
-            },
-        );
-        if let Err(e) = store.append(lease.epoch, vec![verdict]).await {
-            r.record(
-                "assessments",
-                format!("a verdict could not be written: {e}"),
-            );
-            return;
-        }
-        if of == judged {
-            written.push(run);
+            verdict_on(of, "conformance", "helpful", crate::core::Score::Pass(true)),
+        )
+        .await
+        {
+            Ok(epoch) => {
+                epochs.insert(run, epoch);
+            }
+            Err(e) => {
+                r.record("assessments", e);
+                return;
+            }
         }
     }
+    for run in [second, other, third, first] {
+        if let Err(e) = store.seal(run, epochs[&run], "assessed").await {
+            r.record("assessments", format!("a verdict could not be sealed: {e}"));
+            return;
+        }
+    }
+    let written = vec![second, third, first];
     match store.assessments_of(judged, 10).await {
         Ok(found) if found == written => {}
         Ok(found) => r.record(
             "assessments",
-            format!("assessments_of must name {written:?} in that order, named {found:?}"),
+            format!(
+                "assessments_of must name the sealed verdicts {written:?} in log order, \
+                 named {found:?}"
+            ),
         ),
         Err(e) => r.record("assessments", format!("assessments_of failed: {e}")),
     }
@@ -2200,9 +2241,229 @@ async fn a_verdict_is_found_from_the_run_it_judges(fresh: Factory<'_>, r: &mut R
         Ok(found) if found == written[..1] => {}
         Ok(found) => r.record(
             "assessments",
-            format!("a limit of one must answer the oldest verdict, answered {found:?}"),
+            format!("a limit of one must answer the first in the log, answered {found:?}"),
         ),
         Err(e) => r.record("assessments", format!("assessments_of failed: {e}")),
+    }
+}
+
+/// **A track record counts each run once, as it stands, and each person's
+/// latest verdict once.**
+///
+/// The window is half-open over the instant in the run id: a run minted at
+/// its end is out, one at its start is in. A run that failed and then
+/// succeeded counts as succeeded; a verdict a person replaced counts as the
+/// replacement; a verdict on a run outside the window, or on a run of
+/// another capability, is not counted. Revisions are told apart by digest.
+#[allow(clippy::too_many_lines)]
+async fn a_track_record_counts_each_run_and_verdict_once(fresh: Factory<'_>, r: &mut Report) {
+    use crate::core::{NumberSummary, Operator, Revision, Score, Timestamp};
+    use crate::journal::AgentIdentity;
+
+    const T: u64 = 1_760_000_000_000;
+    r.checked += 1;
+    let store = fresh().await;
+    let at = |ms: u64| RunId(ulid::Ulid::from_parts(ms, u128::from(ms) * 7 + 3));
+    let instant = |ms: u64| {
+        Timestamp::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000).expect("an instant")
+    };
+    let revision = |version: &str, byte: u8| AgentIdentity {
+        name: "triage".into(),
+        version: version.into(),
+        digest: Digest::from_bytes([byte; 32]),
+        publisher: None,
+    };
+    let admit = |run: RunId, capability: &str, agent: Option<AgentIdentity>| {
+        let mut append = admitted(run);
+        if let RecordKind::RunAdmitted {
+            capability: c,
+            governed_by,
+            ..
+        } = &mut append.kind
+        {
+            capability.clone_into(c);
+            *governed_by = agent.map(Box::new);
+        }
+        append
+    };
+    let failed_then_succeeded = at(T);
+    let open = at(T + 500);
+    let undeclared = at(T + 999);
+    let at_the_end = at(T + 1000);
+    let before = at(T - 1);
+    let elsewhere = at(T + 10);
+    let runs: Vec<(RunId, Vec<Append>)> = vec![
+        (
+            failed_then_succeeded,
+            vec![
+                admit(failed_then_succeeded, "track", Some(revision("1", 1))),
+                concluded(failed_then_succeeded, "failed"),
+            ],
+        ),
+        (open, vec![admit(open, "track", Some(revision("2", 2)))]),
+        (
+            undeclared,
+            vec![
+                admit(undeclared, "track", None),
+                concluded(undeclared, "failed"),
+            ],
+        ),
+        (
+            at_the_end,
+            vec![
+                admit(at_the_end, "track", None),
+                concluded(at_the_end, "succeeded"),
+            ],
+        ),
+        (
+            before,
+            vec![admit(before, "track", None), concluded(before, "succeeded")],
+        ),
+        (
+            elsewhere,
+            vec![
+                admit(elsewhere, "other", None),
+                concluded(elsewhere, "succeeded"),
+            ],
+        ),
+    ];
+    for (run, appends) in runs {
+        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+            return;
+        };
+        if let Err(e) = store.append(lease.epoch, appends).await {
+            r.record("track record", format!("a run could not be written: {e}"));
+            return;
+        }
+        if run == failed_then_succeeded
+            && let Err(e) = store
+                .append(lease.epoch, vec![concluded(run, "succeeded")])
+                .await
+        {
+            r.record(
+                "track record",
+                format!("a resumed run could not conclude: {e}"),
+            );
+            return;
+        }
+    }
+    let alice = Operator::asserted("alice").expect("a name");
+    let bob = Operator::authenticated("bob").expect("a name");
+    let verdicts = [
+        (failed_then_succeeded, &alice, "helpful", Score::Pass(false)),
+        (failed_then_succeeded, &alice, "helpful", Score::Pass(true)),
+        (failed_then_succeeded, &bob, "helpful", Score::Pass(false)),
+        (undeclared, &alice, "fate", Score::Label("sent".into())),
+        (open, &alice, "score", Score::Number(4.0)),
+        (open, &bob, "score", Score::Number(2.0)),
+        (at_the_end, &alice, "helpful", Score::Pass(true)),
+        (elsewhere, &alice, "helpful", Score::Pass(true)),
+        (undeclared, &alice, "fate", Score::Label("edited".into())),
+        (open, &bob, "helpful", Score::Pass(true)),
+    ];
+    // Written in this order and sealed in `seal` order: alice's `edited` on
+    // `fate` is written last and sealed first, so `sent` stands. The last is
+    // never sealed and is not counted.
+    let mut written = Vec::new();
+    for (of, by, name, value) in verdicts {
+        let run = RunId::generate();
+        let verdict = RecordKind::Assessed {
+            of: of.to_string(),
+            name: name.into(),
+            value,
+            by: by.clone(),
+            at: Timestamp::UNIX_EPOCH,
+            rationale: None,
+        };
+        match write_verdict(&store, run, verdict).await {
+            Ok(epoch) => written.push((run, epoch)),
+            Err(e) => {
+                r.record("track record", e);
+                return;
+            }
+        }
+    }
+    written.pop();
+    let fate_edited = written.pop();
+    for (run, epoch) in fate_edited.into_iter().chain(written) {
+        if let Err(e) = store.seal(run, epoch, "assessed").await {
+            r.record(
+                "track record",
+                format!("a verdict could not be sealed: {e}"),
+            );
+            return;
+        }
+    }
+
+    let record = match store
+        .track_record("track", instant(T), instant(T + 1000))
+        .await
+    {
+        Ok(record) => record,
+        Err(e) => {
+            r.record("track record", format!("track_record failed: {e}"));
+            return;
+        }
+    };
+    let total = record.total();
+    let mut problems = Vec::new();
+    if total.admitted != 3 {
+        problems.push(format!(
+            "admitted {} runs, not the 3 minted in the window",
+            total.admitted
+        ));
+    }
+    let outcomes: Vec<(&str, u64)> = total
+        .outcomes
+        .iter()
+        .map(|(o, n)| (o.as_str(), *n))
+        .collect();
+    if outcomes != [("failed", 1), ("succeeded", 1)] {
+        problems.push(format!(
+            "outcomes {outcomes:?}, not one failed and one succeeded (the last conclusion)"
+        ));
+    }
+    if total.open() != 1 {
+        problems.push(format!("{} runs open, not 1", total.open()));
+    }
+    match total.metrics.get("helpful") {
+        Some(h) if (h.runs, h.passed, h.failed) == (1, 1, 1) => {}
+        other => problems.push(format!(
+            "helpful should be one run, one pass (alice's replacement) and one fail \
+             (bob's): {other:?}"
+        )),
+    }
+    match total.metrics.get("fate") {
+        Some(f) if f.runs == 1 && f.labels.get("sent") == Some(&1) => {}
+        other => problems.push(format!("fate should be one 'sent': {other:?}")),
+    }
+    match total.metrics.get("score").and_then(|s| s.numbers.as_ref()) {
+        Some(n) if *n == NumberSummary::new(2, 6.0, 2.0, 4.0) => {}
+        other => problems.push(format!("score should be 2 numbers, 6 in 2..=4: {other:?}")),
+    }
+    let agents: Vec<Option<(String, crate::core::Digest)>> = record
+        .revisions
+        .iter()
+        .map(|rev| {
+            rev.agent
+                .as_ref()
+                .map(|a: &Revision| (a.version.clone(), a.digest))
+        })
+        .collect();
+    let expected = vec![
+        None,
+        Some(("1".to_owned(), Digest::from_bytes([1; 32]))),
+        Some(("2".to_owned(), Digest::from_bytes([2; 32]))),
+    ];
+    if agents != expected {
+        problems.push(format!("revisions {agents:?}, not {expected:?}"));
+    }
+    match store.track_record("track", instant(T), instant(T)).await {
+        Ok(empty) if empty.revisions.is_empty() => {}
+        other => problems.push(format!("an empty window answered {other:?}")),
+    }
+    for problem in problems {
+        r.record("track record", problem);
     }
 }
 

@@ -505,18 +505,21 @@ pub trait JournalStore: Send + Sync + Debug {
     /// the same refusal as the listing, for the same reason.
     async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError>;
 
-    /// The runs that record a person's verdict on `run`, in the order the
-    /// store committed them, at most `limit` from the first.
+    /// The sealed runs that record a person's verdict on `run`, in log order,
+    /// at most `limit` from the first.
     ///
-    /// **Commit order, never run-id order.** Which verdict stands is decided by
-    /// which came last, and a run id is ordered only to the millisecond.
+    /// **Log order, never run-id or append order.** Which verdict stands is
+    /// decided by which came last, so the order must be one the history
+    /// carries: a verdict's position in the Merkle log is assigned under the
+    /// seal lock, committed to by every checkpoint, and rebuilt exactly by a
+    /// restore. A verdict whose run is not yet sealed is not listed; the sweep
+    /// that seals concluded runs makes it one.
     ///
     /// A **derived** index, as [`admitted_as`](Self::admitted_as)'s is: the
     /// verdict's home is the [`Assessed`](crate::journal::RecordKind::Assessed)
-    /// record, and the store maintains this from that record inside
-    /// [`append`](Self::append), in the same transaction, so the index can
-    /// neither outlive nor precede the record it points at and rebuilds from
-    /// the journal.
+    /// record, and the store maintains this from that record and its seal, in
+    /// the transactions that write them, so the index rebuilds from the
+    /// journal.
     ///
     /// **No default**: a store that forgot this would answer that nobody has
     /// judged a run somebody judged, and a quality reading built on it would
@@ -526,6 +529,38 @@ pub trait JournalStore: Send + Sync + Debug {
     ///
     /// If the store is unreachable, or the index holds a row it cannot read.
     async fn assessments_of(&self, run: RunId, limit: usize) -> Result<Vec<RunId>, StoreError>;
+
+    /// What `capability`'s runs admitted in `[since, until)` came to: how each
+    /// stands concluded and the standing verdicts on it, per declaration
+    /// revision. See [`TrackRecord`](crate::core::TrackRecord) for what is
+    /// counted.
+    ///
+    /// The window is over the instant minted into each run id, between
+    /// [`RunId::first_at`] of each bound, so it survives a restore. An empty or
+    /// inverted window answers an empty record.
+    ///
+    /// **Derived**, from two indexes the store keeps with the journal: each
+    /// admitted run's capability and revision, from `RunAdmitted`, and the
+    /// sealed verdicts. Of a person's verdicts on one metric of a run only the
+    /// one [`Assessments::current`](crate::core::Assessments::current) keeps is
+    /// counted — the last in the order [`assessments_of`](Self::assessments_of)
+    /// answers — so a person who changed their mind is counted once. The conclusion is read from the outcome
+    /// index [`runs_by_outcome`](Self::runs_by_outcome) pages, never copied, so
+    /// the two agree that the last conclusion wins. Linear in the window's runs;
+    /// no record is read.
+    ///
+    /// **No default**: a store that forgot this would answer that a capability
+    /// nobody stopped asking for was never asked for.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable, or an index holds a row it cannot read.
+    async fn track_record(
+        &self,
+        capability: &str,
+        since: crate::core::Timestamp,
+        until: crate::core::Timestamp,
+    ) -> Result<crate::core::TrackRecord, StoreError>;
 
     /// The run that holds this admission key, if one does.
     ///

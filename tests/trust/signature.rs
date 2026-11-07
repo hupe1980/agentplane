@@ -711,6 +711,14 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
         ) -> Result<Vec<agentplane::core::RunId>, StoreError> {
             self.0.assessments_of(run, limit).await
         }
+        async fn track_record(
+            &self,
+            capability: &str,
+            since: agentplane::core::Timestamp,
+            until: agentplane::core::Timestamp,
+        ) -> Result<agentplane::core::TrackRecord, StoreError> {
+            self.0.track_record(capability, since, until).await
+        }
         async fn runs_by_id(
             &self,
             after: Option<RunId>,
@@ -1850,6 +1858,14 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
             limit: usize,
         ) -> Result<Vec<agentplane::core::RunId>, StoreError> {
             self.inner.assessments_of(run, limit).await
+        }
+        async fn track_record(
+            &self,
+            capability: &str,
+            since: agentplane::core::Timestamp,
+            until: agentplane::core::Timestamp,
+        ) -> Result<agentplane::core::TrackRecord, StoreError> {
+            self.inner.track_record(capability, since, until).await
         }
         async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
             self.inner.abandoned_runs(limit).await

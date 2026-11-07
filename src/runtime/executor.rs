@@ -2730,7 +2730,39 @@ impl Runtime {
         .await
     }
 
-    /// Every verdict recorded on `run`, in the order the store recorded them.
+    /// What `capability`'s runs admitted in `window` came to: how each stands
+    /// concluded and the standing verdicts on it, per declaration revision and
+    /// in total.
+    ///
+    /// A catalog's reading — derived by the store with the records it counts,
+    /// so it agrees with the journal, and never evidence. See
+    /// [`TrackRecord`](crate::core::TrackRecord) for what the window selects.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::EmptyWindow`] when `window` holds no millisecond — it
+    /// ends at or before it starts, or inside the millisecond it starts in;
+    /// otherwise if the journal cannot be read.
+    pub async fn track_record(
+        &self,
+        capability: &str,
+        window: std::ops::Range<crate::core::Timestamp>,
+    ) -> Result<crate::core::TrackRecord, RuntimeError> {
+        // Run ids carry milliseconds, so a window inside one holds no run id.
+        if crate::core::track_record_window(window.start, window.end).is_none() {
+            return Err(RuntimeError::EmptyWindow {
+                since: window.start.to_string(),
+                until: window.end.to_string(),
+            });
+        }
+        self.store
+            .track_record(capability, window.start, window.end)
+            .await
+            .map_err(RuntimeError::from_store)
+    }
+
+    /// Every verdict recorded on `run`, in log order — the order a restore
+    /// rebuilds, so the verdict that stands survives one.
     ///
     /// [`Assessments::current`](crate::core::Assessments::current) answers
     /// which stand; the history keeps the ones a later verdict replaced. All

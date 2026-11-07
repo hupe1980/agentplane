@@ -244,6 +244,14 @@ impl JournalStore for SealedJournal {
     ) -> Result<Vec<crate::core::RunId>, StoreError> {
         self.inner.assessments_of(run, limit).await
     }
+    async fn track_record(
+        &self,
+        capability: &str,
+        since: crate::core::Timestamp,
+        until: crate::core::Timestamp,
+    ) -> Result<crate::core::TrackRecord, StoreError> {
+        self.inner.track_record(capability, since, until).await
+    }
 
     /// Delegated, and the key is **not** sealed on the way through: it is the
     /// counterparty's message identity rather than content, and the index has to

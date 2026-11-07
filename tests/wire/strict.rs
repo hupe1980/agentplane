@@ -327,3 +327,102 @@ fn closing_never_widens_a_composed_schema() {
         false
     );
 }
+
+/// **A unit enum whose variants are documented is offered strictly.**
+/// `schemars` writes it as a `oneOf` of string constants, which neither strict
+/// subset holds; `serde` reads a unit variant from its bare string, so the
+/// constants become an `enum`, and each variant's doc stays beside its value
+/// in the description.
+#[test]
+fn a_documented_unit_enum_is_offered_strictly() {
+    /// What became of the proposal.
+    #[derive(schemars::JsonSchema, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    #[allow(dead_code)]
+    enum Fate {
+        /// Sent as proposed.
+        Sent,
+        /// Changed before sending.
+        Edited,
+        Dismissed,
+    }
+    #[derive(schemars::JsonSchema, serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Answer {
+        fate: Fate,
+        maybe: Option<Fate>,
+    }
+
+    let schema = agentplane::tools::strict_schema::<Answer>();
+    assert_eq!(strict_schema_problem(&schema), None, "{schema}");
+    let fate = &schema["$defs"]["Fate"];
+    assert_eq!(fate["type"], "string", "{fate}");
+    assert_eq!(
+        fate["enum"],
+        json!(["dismissed", "sent", "edited"]),
+        "{fate}"
+    );
+    assert_eq!(
+        fate["description"],
+        "What became of the proposal.\n\n`sent`: Sent as proposed.\n`edited`: Changed before sending.",
+    );
+    let read: Answer = serde_json::from_value(json!({ "fate": "edited", "maybe": null }))
+        .expect("a value the enum admits is one serde reads");
+    assert!(matches!(read.fate, Fate::Edited));
+}
+
+/// **Only a `oneOf` that is a set of distinct strings becomes an `enum`.** A
+/// repeated constant is a value the `oneOf` refuses and an `enum` would admit;
+/// an object branch is a data variant; a schema somebody else wrote is only
+/// ever narrowed.
+#[test]
+fn a_oneof_that_is_not_a_set_of_distinct_strings_is_left_as_written() {
+    // `strict_schema` rewrites only what it generated, so the rule is reached
+    // through a type whose schema carries the repeated constant.
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Repeated;
+    impl schemars::JsonSchema for Repeated {
+        fn schema_name() -> std::borrow::Cow<'static, str> {
+            "Repeated".into()
+        }
+        fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+            schemars::Schema::try_from(json!({
+                "type": "object",
+                "properties": { "fate": { "oneOf": [
+                    { "type": "string", "const": "sent" },
+                    { "type": "string", "const": "sent", "description": "twice" },
+                ] } },
+                "required": ["fate"],
+            }))
+            .expect("an object schema")
+        }
+    }
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    enum Mixed {
+        /// A unit variant.
+        Plain,
+        /// A data variant.
+        Carrying(u32),
+    }
+    let mixed = agentplane::tools::strict_schema::<Mixed>();
+    assert!(mixed.get("oneOf").is_some(), "{mixed}");
+    assert!(mixed.get("enum").is_none(), "{mixed}");
+
+    let rewritten = agentplane::tools::strict_schema::<Repeated>();
+    assert!(
+        rewritten["properties"]["fate"].get("oneOf").is_some(),
+        "a repeated constant became an enum: {rewritten}"
+    );
+
+    let foreign = json!({
+        "type": "object",
+        "properties": { "fate": { "oneOf": [
+            { "type": "string", "const": "sent" },
+            { "type": "string", "const": "edited" },
+        ] } },
+        "required": ["fate"],
+    });
+    assert_eq!(agentplane::tools::closed_schema(&foreign), foreign);
+}

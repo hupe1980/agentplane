@@ -351,7 +351,7 @@ compiles. That is what `--verify` is for.
 | Replace a deterministic protocol engine | Keep it; agentplane sits *beside* it, never inside it |
 | Require Kubernetes | One static binary |
 | Train, fine-tune, or serve models | Permanently out of scope |
-| Grade output quality | It emits replayable traces; grade them elsewhere, and `agentplane bind` ties the verdict to the records it judged. A person's verdict is recorded in the plane (`Runtime::assess`) |
+| Grade output quality | It emits replayable traces; grade them elsewhere, and `agentplane bind` ties the verdict to the records it judged. A person's verdict is recorded in the plane (`Runtime::assess`), and a capability's outcomes and verdicts over a window are one read (`Runtime::track_record`) |
 | Interpret payload contents | Payloads are opaque, and labeled |
 | Claim regulatory compliance | It provides technical means; compliance is the deployer's |
 

@@ -283,6 +283,22 @@ ulid_newtype!(
     RunId, "run"
 );
 
+impl RunId {
+    /// The least id minted at `instant`'s millisecond: every run admitted at
+    /// or after it has an id at least this, compared as ids or as their
+    /// written form. What bounds a window over admission instants.
+    #[must_use]
+    pub fn first_at(instant: Timestamp) -> Self {
+        // A ULID's instant is 48 bits of milliseconds since the epoch.
+        const LAST: i128 = (1 << 48) - 1;
+        let ms = (instant.unix_timestamp_nanos() / 1_000_000).clamp(0, LAST);
+        Self(ulid::Ulid::from_parts(
+            u64::try_from(ms).expect("clamped into 48 bits"),
+            0,
+        ))
+    }
+}
+
 ulid_newtype!(
     /// A long-lived, correlated business fact spanning many runs and weeks.
     CaseId, "case"

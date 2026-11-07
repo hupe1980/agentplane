@@ -489,6 +489,11 @@ pub enum RuntimeError {
     #[error("run {run} cannot be assessed: {why}")]
     NotAssessable { run: String, why: String },
 
+    /// A track record was asked over a window that holds no millisecond: its
+    /// end is not after the millisecond it starts in.
+    #[error("the window from {since} until {until} is empty")]
+    EmptyWindow { since: String, until: String },
+
     /// An operator's lift or release was recorded, and the control it ended
     /// still stands.
     ///

@@ -1670,6 +1670,14 @@ pub mod action {
     /// from its listing: who may judge and who may read the judgements are two
     /// grants, and a quality review reads far more than it writes.
     pub const RUN_ASSESSMENTS: &str = "api:run.assessments";
+    /// Reading what a capability's runs came to over a window: how they ended
+    /// and what people said about them.
+    ///
+    /// Apart from [`RUN_ASSESSMENTS`] because it answers across every run of a
+    /// capability, and apart from [`RUN_LIST`] because it carries verdicts;
+    /// authorized against the capability, so a rule can scope a team to its
+    /// own.
+    pub const CAPABILITY_TRACK: &str = "api:capability.track";
     pub const RUN_LIST: &str = "api:run.list";
     /// Reading which runs are executing **right now**.
     ///
@@ -1821,6 +1829,7 @@ pub mod action {
         RUN_OUTPUT,
         RUN_ASSESS,
         RUN_ASSESSMENTS,
+        CAPABILITY_TRACK,
         RUN_LIST,
         RUN_LIVE,
         RUN_WAITING,
@@ -2146,6 +2155,176 @@ async fn run_assessments(
             .map(AssessmentView::from)
             .collect(),
         truncated: skip > 0,
+    }))
+}
+
+/// The window a track record covers: runs admitted from `since` until
+/// `until`, both RFC 3339 instants.
+#[derive(serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TrackQuery {
+    /// The first instant of the window; thirty days before `until` when absent.
+    since: Option<String>,
+    /// The first instant after it; now when absent.
+    until: Option<String>,
+}
+
+/// The window a track record covers when the caller names no start.
+const TRACK_WINDOW: std::time::Duration = std::time::Duration::from_hours(30 * 24);
+
+/// What a capability's runs admitted in a window came to.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct TrackRecordView {
+    capability: String,
+    since: String,
+    until: String,
+    /// Every revision together.
+    total: TrackView,
+    /// Per declaration revision; `agent` absent for a skill with no manifest.
+    revisions: Vec<RevisionView>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct RevisionView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<AgentRevisionView>,
+    track: TrackView,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct AgentRevisionView {
+    name: String,
+    version: String,
+    digest: String,
+}
+
+/// Runs and the standing verdicts on them.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct TrackView {
+    admitted: u64,
+    /// Admitted and not concluded.
+    open: u64,
+    /// Runs by how they stand concluded now: the last conclusion.
+    outcomes: std::collections::BTreeMap<String, u64>,
+    /// Each person's latest verdict per metric, by metric.
+    metrics: std::collections::BTreeMap<String, MetricView>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct MetricView {
+    /// Runs with at least one standing verdict on this metric.
+    runs: u64,
+    /// Standing verdicts, of every kind.
+    verdicts: u64,
+    passed: u64,
+    failed: u64,
+    labels: std::collections::BTreeMap<String, u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    numbers: Option<NumberView>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct NumberView {
+    count: u64,
+    sum: f64,
+    min: f64,
+    max: f64,
+    mean: f64,
+}
+
+impl From<&crate::core::Track> for TrackView {
+    fn from(t: &crate::core::Track) -> Self {
+        Self {
+            admitted: t.admitted,
+            open: t.open(),
+            outcomes: t.outcomes.clone(),
+            metrics: t
+                .metrics
+                .iter()
+                .map(|(metric, m)| {
+                    let numbers = m.numbers.as_ref().map(|n| NumberView {
+                        count: n.count,
+                        sum: n.sum,
+                        min: n.min,
+                        max: n.max,
+                        mean: n.mean().unwrap_or_default(),
+                    });
+                    let view = MetricView {
+                        runs: m.runs,
+                        verdicts: m.verdicts(),
+                        passed: m.passed,
+                        failed: m.failed,
+                        labels: m.labels.clone(),
+                        numbers,
+                    };
+                    (metric.clone(), view)
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A capability's track record over a window.
+async fn capability_track_record(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Uniform(Path(capability)): Uniform<Path<String>>,
+    Uniform(Query(q)): Uniform<Query<TrackQuery>>,
+) -> Result<Json<TrackRecordView>, ApiError> {
+    let s = api
+        .gate(&headers, action::CAPABILITY_TRACK, &capability)
+        .await?;
+    // A `+` sent unencoded in an offset arrives as a space: read it back.
+    let instant = |text: &str, what: &str| {
+        crate::core::Timestamp::parse(
+            &text.replace(' ', "+"),
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| invalid(&format!("`{what}` is not an RFC 3339 instant")))
+    };
+    let until = match &q.until {
+        Some(text) => instant(text, "until")?,
+        None => now_for_account(),
+    };
+    let since = match &q.since {
+        Some(text) => instant(text, "since")?,
+        None => until - TRACK_WINDOW,
+    };
+    let record = s
+        .plane
+        .track_record(&capability, since..until)
+        .await
+        .map_err(|e| match e {
+            crate::core::RuntimeError::EmptyWindow { .. } => invalid(&e.to_string()),
+            _ => store_failed(),
+        })?;
+    let rfc3339 = |t: crate::core::Timestamp| {
+        t.format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|_| t.to_string())
+    };
+    Ok(Json(TrackRecordView {
+        capability: record.capability.clone(),
+        since: rfc3339(record.since),
+        until: rfc3339(record.until),
+        total: TrackView::from(&record.total()),
+        revisions: record
+            .revisions
+            .iter()
+            .map(|r| RevisionView {
+                agent: r.agent.as_ref().map(|a| AgentRevisionView {
+                    name: a.name.clone(),
+                    version: a.version.clone(),
+                    digest: a.digest.to_hex(),
+                }),
+                track: TrackView::from(&r.track),
+            })
+            .collect(),
     }))
 }
 

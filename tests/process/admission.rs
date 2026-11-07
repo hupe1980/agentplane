@@ -769,6 +769,14 @@ impl JournalStore for BlindToKeys {
     ) -> Result<Vec<agentplane::core::RunId>, agentplane::core::StoreError> {
         self.0.assessments_of(run, limit).await
     }
+    async fn track_record(
+        &self,
+        capability: &str,
+        since: agentplane::core::Timestamp,
+        until: agentplane::core::Timestamp,
+    ) -> Result<agentplane::core::TrackRecord, agentplane::core::StoreError> {
+        self.0.track_record(capability, since, until).await
+    }
     async fn runs_by_id(
         &self,
         after: Option<agentplane::RunId>,

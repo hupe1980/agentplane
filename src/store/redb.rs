@@ -115,11 +115,32 @@ const RUN_OUTCOME: TableDefinition<(&str, &str), (&str, u64)> = TableDefinition:
 const RUN_ADMISSION: TableDefinition<(&str, &str), (&str, i64)> =
     TableDefinition::new("run_admission");
 
-/// `(tenant, assessed_run, feed_position) -> assessment_run`: the runs
-/// recording a verdict on a run, in commit order — see
+/// `(tenant, assessed_run, log_index) -> assessment_run`: the sealed runs
+/// recording a verdict on a run, in log order — see
 /// [`JournalStore::assessments_of`].
 const RUN_ASSESSMENT: TableDefinition<(&str, &str, u64), &str> =
     TableDefinition::new("run_assessment");
+
+/// `(tenant, capability, run_id) -> (name, version, digest)`: every admitted
+/// run under what it was asked for, with the declaration revision that served
+/// it (empty strings for none). Written from `RunAdmitted`; a run id's text
+/// sorts by its admission instant, so a window is one range — see
+/// [`JournalStore::track_record`].
+const RUN_CAPABILITY: TableDefinition<(&str, &str, &str), (&str, &str, &str)> =
+    TableDefinition::new("run_capability");
+
+/// `(tenant, judged_run, actor, basis, metric) -> (kind, label, number)`: each
+/// actor's verdict per metric on a run that is last in the log.
+/// `kind` is `pass`, `fail`, `label` or `number`.
+const RUN_VERDICT: TableDefinition<VerdictKey, VerdictValue> = TableDefinition::new("run_verdict");
+type VerdictKey = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+);
+type VerdictValue = (&'static str, &'static str, f64);
 
 /// `(tenant, updated_at, run_id) -> ()`, every run by last durable append.
 const RUN_ACTIVITY: TableDefinition<(&str, u64, &str), ()> = TableDefinition::new("run_activity");
@@ -363,6 +384,8 @@ impl RedbStore {
             w.open_table(RUN_SEAL).map_err(table_error)?;
             w.open_table(RUN_BY_OUTCOME).map_err(table_error)?;
             w.open_table(RUN_OUTCOME).map_err(table_error)?;
+            w.open_table(RUN_CAPABILITY).map_err(table_error)?;
+            w.open_table(RUN_VERDICT).map_err(table_error)?;
             w.open_table(RUN_WAITING).map_err(table_error)?;
             w.open_table(RUN_WAITING_AT).map_err(table_error)?;
             w.open_table(SEAL_LOG).map_err(table_error)?;
@@ -1252,18 +1275,9 @@ impl JournalStore for RedbStore {
                             .map_err(|e| be(&e))?;
                     }
 
-                    // The verdict index, likewise: a person's verdict on a
-                    // run is findable from the run in the transaction that
-                    // records it, or not at all.
-                    if let crate::journal::RecordKind::Assessed { of, .. } = record.kind() {
-                        w.open_table(RUN_ASSESSMENT)
-                            .map_err(|e| be(&e))?
-                            .insert(
-                                (tenant.as_str(), of.as_str(), position - 1),
-                                run_id.as_str(),
-                            )
-                            .map_err(|e| be(&e))?;
-                    }
+                    // The capability index, likewise. Verdicts are indexed
+                    // by `seal`, at their position in the log.
+                    track_indexes(&w, &tenant, &run_id, record.kind())?;
 
                     // The outcome index derives from the chain, here, in the
                     // same transaction as the record it derives from — and the
@@ -1801,6 +1815,7 @@ impl JournalStore for RedbStore {
         let key = self.run_key(run);
         let tenant = self.tenant.clone();
         let outcome = outcome.to_owned();
+        let upcaster = Arc::clone(&self.upcaster);
         self.with_db(move |db| {
             let w = begin_write(db)?;
             let head_hash = {
@@ -1861,6 +1876,7 @@ impl JournalStore for RedbStore {
                         .map_err(|e| be(&e))?
                         .insert((tenant.as_str(), next), key.as_str())
                         .map_err(|e| be(&e))?;
+                    index_verdict(&w, tenant.as_str(), &key, run, next, upcaster.as_ref())?;
                     // The outcome index is *not* written here: it derives from
                     // the `RunSealed` record inside `append`, where the last
                     // conclusion wins. The seal freezes the journal and enters
@@ -1905,6 +1921,21 @@ impl JournalStore for RedbStore {
                 })?);
             }
             Ok(found)
+        })
+        .await
+    }
+
+    async fn track_record(
+        &self,
+        capability: &str,
+        since: crate::core::Timestamp,
+        until: crate::core::Timestamp,
+    ) -> Result<crate::core::TrackRecord, StoreError> {
+        let tenant = self.tenant_name();
+        let capability = capability.to_owned();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            read_track_record(&r, &tenant, capability, since, until)
         })
         .await
     }
@@ -2347,6 +2378,156 @@ impl JournalStore for RedbStore {
         })
         .await
     }
+}
+
+/// The capability index a `RunAdmitted` record moves, inside its append.
+fn track_indexes(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    run_id: &str,
+    kind: &crate::journal::RecordKind,
+) -> Result<(), StoreError> {
+    if let crate::journal::RecordKind::RunAdmitted {
+        capability,
+        governed_by,
+        ..
+    } = kind
+    {
+        let (name, version, digest) = governed_by.as_deref().map_or_else(
+            || (String::new(), String::new(), String::new()),
+            |agent| {
+                (
+                    agent.name.clone(),
+                    agent.version.clone(),
+                    agent.digest.to_hex(),
+                )
+            },
+        );
+        w.open_table(RUN_CAPABILITY)
+            .map_err(|e| be(&e))?
+            .insert(
+                (tenant, capability.as_str(), run_id),
+                (name.as_str(), version.as_str(), digest.as_str()),
+            )
+            .map_err(|e| be(&e))?;
+    }
+    Ok(())
+}
+
+/// The verdict indexes, inside the seal that gives a verdict's run its log
+/// position: `position` orders the history, and the verdict replaces the
+/// actor's earlier one on the metric because seals commit in log order.
+fn index_verdict(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    key: &str,
+    run: RunId,
+    position: u64,
+    upcaster: &dyn crate::journal::Upcaster,
+) -> Result<(), StoreError> {
+    let first = w
+        .open_table(JOURNAL)
+        .map_err(|e| be(&e))?
+        .get((key, 1u64))
+        .map_err(|e| be(&e))?
+        .map(|row| Row::decode(row.value()))
+        .transpose()?
+        .map(|row| row.into_record(upcaster))
+        .transpose()?;
+    let Some(crate::journal::RecordKind::Assessed {
+        of,
+        name,
+        value,
+        by,
+        ..
+    }) = first.as_ref().map(Record::kind)
+    else {
+        return Ok(());
+    };
+    let run_id = run.to_string();
+    w.open_table(RUN_ASSESSMENT)
+        .map_err(|e| be(&e))?
+        .insert((tenant, of.as_str(), position), run_id.as_str())
+        .map_err(|e| be(&e))?;
+    let (kind, label, number) = super::stored_verdict(value);
+    w.open_table(RUN_VERDICT)
+        .map_err(|e| be(&e))?
+        .insert(
+            (
+                tenant,
+                of.as_str(),
+                by.actor(),
+                by.basis().as_str(),
+                name.as_str(),
+            ),
+            (kind, label, number),
+        )
+        .map_err(|e| be(&e))?;
+    Ok(())
+}
+
+/// [`JournalStore::track_record`] over one read transaction.
+fn read_track_record(
+    r: &redb::ReadTransaction,
+    tenant: &str,
+    capability: String,
+    since: crate::core::Timestamp,
+    until: crate::core::Timestamp,
+) -> Result<crate::core::TrackRecord, StoreError> {
+    let mut record = crate::core::TrackRecord::new(capability, since, until);
+    let Some((from, to)) = crate::core::track_record_window(since, until) else {
+        return Ok(record);
+    };
+    let runs = r.open_table(RUN_CAPABILITY).map_err(|e| be(&e))?;
+    let outcomes = r.open_table(RUN_OUTCOME).map_err(|e| be(&e))?;
+    let verdicts = r.open_table(RUN_VERDICT).map_err(|e| be(&e))?;
+    let capability = record.capability.clone();
+    let window =
+        (tenant, capability.as_str(), from.as_str())..(tenant, capability.as_str(), to.as_str());
+    for row in runs.range(window).map_err(|e| be(&e))? {
+        let (key, agent) = row.map_err(|e| be(&e))?;
+        let (_, _, run) = key.value();
+        let (name, version, digest) = agent.value();
+        let agent = if digest.is_empty() {
+            None
+        } else {
+            let digest =
+                crate::core::Digest::from_hex(digest).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("run_capability holds an unreadable digest for {run}: {e}"),
+                })?;
+            Some(crate::core::Revision::new(
+                name.to_owned(),
+                version.to_owned(),
+                digest,
+            ))
+        };
+        let track = record.revision_mut(agent);
+        track.admitted += 1;
+        if let Some(held) = outcomes
+            .get((tenant, run_key_in(tenant, run).as_str()))
+            .map_err(|e| be(&e))?
+        {
+            *track.outcomes.entry(held.value().0.to_owned()).or_default() += 1;
+        }
+        let mut judged: Vec<String> = Vec::new();
+        let first = (tenant, run, "", "", "");
+        for verdict in verdicts.range(first..).map_err(|e| be(&e))? {
+            let (key, value) = verdict.map_err(|e| be(&e))?;
+            let (in_tenant, of, _, _, metric) = key.value();
+            if in_tenant != tenant || of != run {
+                break;
+            }
+            let summary = track.metrics.entry(metric.to_owned()).or_default();
+            if !judged.iter().any(|m| m == metric) {
+                judged.push(metric.to_owned());
+                summary.runs += 1;
+            }
+            let (kind, label, number) = value.value();
+            super::count_stored(summary, kind, label, 1, (number, number, number))?;
+        }
+    }
+    Ok(record)
 }
 
 #[cfg(test)]
