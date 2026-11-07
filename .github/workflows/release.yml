@@ -185,6 +185,9 @@ jobs:
     steps:
       - if: runner.os == 'Linux'
         run: echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+      # The runner's Homebrew is preinstalled with auto-update off and goes
+      # stale; a user's is current, so this installs with a current one.
+      - run: brew update --quiet
       - run: brew install hupe1980/tap/agentplane
       - run: brew test agentplane
 
