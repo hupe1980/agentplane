@@ -123,6 +123,14 @@ pub enum EffectReplay {
     /// Distinct from `Refused`: not a limit the run reached but a principal an
     /// operator withdrew, and the run pauses until the halt is lifted.
     Withheld { subject: String, reason: String },
+    /// A stop stood when this hop was reached, so nothing was announced.
+    ///
+    /// Distinct from `Withheld`: a stop ends the run, so nothing supersedes
+    /// it and every pass re-raises it here.
+    Cancelled {
+        actor: crate::core::Operator,
+        reason: String,
+    },
     /// It started and we do not know whether it landed.
     ///
     /// The recorded [`Recovery`] is what decides whether re-performing it is
@@ -169,6 +177,7 @@ impl EffectReplay {
             Self::Refused { .. }
             | Self::Denied { .. }
             | Self::Withheld { .. }
+            | Self::Cancelled { .. }
             | Self::Orphan { .. } => crate::core::Spend::ZERO,
         }
     }
@@ -184,6 +193,7 @@ impl EffectReplay {
             Self::Refused { .. }
             | Self::Denied { .. }
             | Self::Withheld { .. }
+            | Self::Cancelled { .. }
             | Self::Orphan { .. } => {}
         }
     }
@@ -395,6 +405,7 @@ impl StepCursor {
     }
 
     /// Fold one record into this step's replay sequence.
+    #[allow(clippy::too_many_lines)]
     fn apply(&mut self, key: EffectKey, seq: Seq, kind: &RecordKind) {
         match kind {
             RecordKind::EffectStarted {
@@ -472,6 +483,16 @@ impl StepCursor {
             RecordKind::AuthorityWithheld {
                 subject, reason, ..
             } => self.withheld(key, seq, subject, reason),
+            // A stop found at a hop: the hop announced nothing, and the run
+            // ended there, so it is the last word at this key.
+            RecordKind::RunCancelled { actor, reason } => self.unannounced(
+                key,
+                seq,
+                EffectReplay::Cancelled {
+                    actor: actor.clone(),
+                    reason: reason.clone(),
+                },
+            ),
             RecordKind::PolicyDenied {
                 reason,
                 action,
@@ -1053,6 +1074,25 @@ mod tests {
             ),
             "the announcement did not supersede every withholding before it"
         );
+    }
+
+    /// A stop found at a hop is read back there, as the hop's state.
+    #[test]
+    fn a_stop_at_a_hop_is_the_hops_state() {
+        let stopped = records(vec![(
+            S0,
+            key(1),
+            RecordKind::RunCancelled {
+                actor: crate::core::Operator::asserted("ops").unwrap(),
+                reason: "pressed stop".into(),
+            },
+        )]);
+        let mut slice = ReplayCursor::from_records(&stopped).take(S0, Phase::Forward);
+        assert!(matches!(
+            slice.next(key(1), &desc(), 1).unwrap(),
+            Some(EffectReplay::Cancelled { ref reason, .. }) if reason == "pressed stop"
+        ));
+        assert!(slice.exhausted());
     }
 
     /// A refusal at a hop after its withholding was lifted is what stands

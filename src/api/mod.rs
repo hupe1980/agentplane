@@ -2431,7 +2431,7 @@ async fn run_view(
 /// Stop a run.
 ///
 /// Returns `202`, not `200`: the request is durable when this returns, and the
-/// run stops at its next step boundary. Reporting `200` would claim the run had
+/// run stops before its next effect. Reporting `200` would claim the run had
 /// already stopped, which is true only when it was suspended — and an operator
 /// who believes a running agent has halted when it has not is worse off than one
 /// who knows they are waiting.

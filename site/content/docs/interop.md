@@ -807,8 +807,8 @@ engine.
 **A suspension comes back as a Task, and its task id is the run id.** So
 `tasks/get` answers by reading the journal rather than a table beside it, and the
 handle still means something after a restart or from another instance.
-`tasks/cancel` is the runtime's own cancellation, recorded and honoured at the
-next step boundary. Both act only on runs the asker admitted — any other run id
+`tasks/cancel` is the runtime's own cancellation, recorded and honoured before
+the run's next effect. Both act only on runs the asker admitted — any other run id
 answers as no such task — and a completed task hands back the call's own result,
 a cancelled one reads `cancelled`, a suspended or withheld one reads `working`,
 and any other concluded run reads `failed`.

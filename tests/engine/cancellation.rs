@@ -226,6 +226,19 @@ async fn stopping_a_suspended_run_undoes_what_it_did() {
 
     let out = f.rt.replay(run, Mode::Resume).await.unwrap();
     assert!(out.status.is_cancelled(), "got {:?}", out.status);
+
+    // Found at a step boundary, so no pass re-reads it: a strict replay cannot
+    // reach this ending, and the verdict says so rather than verifying it.
+    let verdict = f.rt.verify(run).await.unwrap();
+    assert!(
+        matches!(
+            verdict.finding,
+            agentplane::runtime::Finding::CannotReplay(
+                agentplane::runtime::CannotReplay::EndedByAnAct { .. }
+            )
+        ),
+        "{verdict}"
+    );
 }
 
 /// Who stopped it, and why, are in the hash chain.
@@ -784,4 +797,363 @@ async fn a_stop_on_a_mixed_ready_set_unwinds_with_the_recorded_outputs() {
         ],
         "the stop unwound before the recorded step replayed: {seen:?}"
     );
+}
+
+// ── A stop reaches inside a step ────────────────────────────────────────────
+//
+// The executor reads a stop at each step boundary, and a step may hold many
+// dispatches: a tool-calling agent's whole loop is one. Each live dispatch
+// asks before it announces anything.
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+mod inside_a_step {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use agentplane::runtime::Agent;
+    use agentplane::testkit::{FakeProvider, Faulty, Schedule};
+
+    use super::*;
+
+    const TELLER: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  identity:
+    role: A teller.
+  models:
+    privileged: { provider: fake, model: teller-1 }
+  tools:
+    - ref: tool://ledger/read
+      mutates: false
+      max_sensitivity: internal
+      description: Read a balance.
+  execution: { kind: tool-calling, max_turns: 5 }
+  security: { max_sensitivity_egress: internal }
+  budgets: {}
+"#;
+
+    type Plane = Arc<OnceLock<Arc<Runtime>>>;
+
+    /// Stop the run that is calling, from inside the call — a person pressing
+    /// Stop while the call is in flight, without a race.
+    async fn press_stop(plane: &Plane, run: RunId) {
+        plane
+            .get()
+            .expect("the plane is wired")
+            .request_cancel(run, &operator("ops"), "pressed stop")
+            .await
+            .expect("the stop is recorded");
+    }
+
+    /// A tool server that answers, counting, and presses Stop on its first call.
+    #[derive(Debug)]
+    struct StopsOnFirstCall {
+        plane: Plane,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl agentplane::tools::ToolClient for StopsOnFirstCall {
+        async fn call(
+            &self,
+            _tool: &agentplane::tools::ToolId,
+            _arguments: &Value,
+            provenance: Option<&agentplane::core::Provenance>,
+        ) -> Result<Value, agentplane::tools::ToolError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                press_stop(&self.plane, provenance.expect("a governed call").run).await;
+            }
+            Ok(json!({ "balance": 42 }))
+        }
+
+        fn destination(&self, _tool: &agentplane::tools::ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
+        }
+    }
+
+    fn cancels(records: &[agentplane::journal::Record]) -> Vec<&agentplane::journal::Record> {
+        records
+            .iter()
+            .filter(|r| matches!(r.kind(), RecordKind::RunCancelled { .. }))
+            .collect()
+    }
+
+    /// **A stop during a tool call ends the tool loop there.**
+    ///
+    /// The model asked for three calls before answering. The stop arrives
+    /// during the first; the call in flight completes and is recorded, and
+    /// neither another model turn nor another tool call is dispatched. One
+    /// record names the asker, keyed to the hop that found the stop.
+    #[tokio::test]
+    async fn a_stop_during_a_model_turn_ends_the_tool_loop() {
+        let provider = FakeProvider::new();
+        for id in ["call_1", "call_2", "call_3"] {
+            provider.will_call_tool(id, "ledger__read", json!({ "account": "AC-1" }));
+        }
+        provider.will_say("the balance is 42");
+        let plane: Plane = Arc::default();
+        let ledger = Arc::new(StopsOnFirstCall {
+            plane: Arc::clone(&plane),
+            calls: AtomicUsize::new(0),
+        });
+        let store = Arc::new(RedbStore::open_in_memory().unwrap());
+        let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .provider(
+                "fake",
+                Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+            )
+            .tool_server(
+                "ledger",
+                Arc::clone(&ledger) as Arc<dyn agentplane::tools::ToolClient>,
+            )
+            .agent(Agent::new(
+                &agentplane::manifest::Manifest::parse(TELLER).unwrap(),
+            ))
+            .build();
+        plane.set(Arc::clone(&rt)).unwrap();
+
+        let out = rt
+            .start("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+            .run()
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&out.status, RunStatus::Cancelled { actor, reason }
+                if actor.actor() == "ops" && reason == "pressed stop"),
+            "{:?}",
+            out.status
+        );
+        assert_eq!(
+            provider.calls(),
+            1,
+            "a model turn was dispatched after the stop"
+        );
+        assert_eq!(
+            ledger.calls.load(Ordering::SeqCst),
+            1,
+            "a tool call was dispatched after the stop"
+        );
+        let records = (Arc::clone(&store) as Arc<dyn JournalStore>)
+            .read(out.run_id, 1)
+            .await
+            .unwrap();
+        let cancels = cancels(&records);
+        assert_eq!(cancels.len(), 1, "one stop, one record: {cancels:?}");
+        assert!(
+            cancels[0].effect_key().is_some(),
+            "the stop was found at a hop, so it is keyed to that hop"
+        );
+    }
+
+    /// **A run stopped at a hop replays to the same stop.**
+    ///
+    /// Strict replay never reads the live request; it reads the keyed record
+    /// and stops at that hop for that reason, consuming everything.
+    #[tokio::test]
+    async fn a_run_stopped_at_a_hop_replays_strictly_to_the_same_stop() {
+        let provider = FakeProvider::new();
+        for id in ["call_1", "call_2"] {
+            provider.will_call_tool(id, "ledger__read", json!({ "account": "AC-1" }));
+        }
+        provider.will_say("the balance is 42");
+        let plane: Plane = Arc::default();
+        let ledger = Arc::new(StopsOnFirstCall {
+            plane: Arc::clone(&plane),
+            calls: AtomicUsize::new(0),
+        });
+        let store = Arc::new(RedbStore::open_in_memory().unwrap());
+        let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .provider(
+                "fake",
+                Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+            )
+            .tool_server(
+                "ledger",
+                Arc::clone(&ledger) as Arc<dyn agentplane::tools::ToolClient>,
+            )
+            .agent(Agent::new(
+                &agentplane::manifest::Manifest::parse(TELLER).unwrap(),
+            ))
+            .build();
+        plane.set(Arc::clone(&rt)).unwrap();
+        let out = rt
+            .start("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+            .run()
+            .await
+            .unwrap();
+        assert!(out.status.is_cancelled(), "{:?}", out.status);
+
+        let strict = rt.replay(out.run_id, Mode::Strict).await.unwrap();
+        assert!(
+            matches!(&strict.status, RunStatus::Cancelled { reason, .. } if reason == "pressed stop"),
+            "a strict replay reached another verdict: {:?}",
+            strict.status
+        );
+        // Reproducible, so verifiable: the stop is part of the step's history.
+        let verdict = rt.verify(out.run_id).await.unwrap();
+        assert!(verdict.is_verified(), "{verdict}");
+        assert_eq!(provider.calls(), 1, "a replay called the model");
+        assert_eq!(
+            ledger.calls.load(Ordering::SeqCst),
+            1,
+            "a replay called the tool"
+        );
+    }
+
+    /// The first of two posts.
+    #[derive(Debug)]
+    struct PostsFirst {
+        world: World,
+    }
+
+    #[async_trait::async_trait]
+    impl Effect for PostsFirst {
+        type Output = Value;
+        fn descriptor(&self) -> EffectDescriptor {
+            EffectDescriptor::new("ledger.post", json!({ "what": "first" }))
+        }
+        fn recovery(&self) -> Recovery {
+            Recovery::Idempotent {
+                key: "ledger:first".into(),
+            }
+        }
+        async fn perform(&self) -> Result<Value, EffectError> {
+            self.world.lock().unwrap().push("first".into());
+            Ok(json!({ "posted": "first" }))
+        }
+    }
+
+    /// Posts twice in one step; the stop arrives while the first post runs.
+    #[derive(Debug)]
+    struct PostsTwice {
+        plane: Plane,
+        world: World,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for PostsTwice {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("posts-twice").provides("demo.twice")
+        }
+        fn compensation(&self) -> Compensation {
+            Compensation::Compensatable
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let run = cx.run_id();
+            cx.effect(PostsFirst {
+                world: Arc::clone(&self.world),
+            })
+            .await?;
+            // The stop is pressed after the first post landed and before the
+            // second is asked for.
+            press_stop(&self.plane, run).await;
+            cx.effect(Ledger {
+                world: Arc::clone(&self.world),
+                what: "second",
+            })
+            .await?;
+            Ok(Outcome::done(Tainted::trusted(json!({ "ok": true }))))
+        }
+        async fn compensate(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _out: &Tainted<Value>,
+        ) -> Result<(), SkillError> {
+            cx.effect(Ledger {
+                world: Arc::clone(&self.world),
+                what: "reversed",
+            })
+            .await?;
+            Ok(())
+        }
+    }
+
+    /// **A stop between two effects sends the second nothing and undoes the
+    /// first** — the undo dispatching under the very stop that refused the
+    /// second post.
+    #[tokio::test]
+    async fn a_stop_between_two_effects_sends_the_second_nothing_and_undoes_the_first() {
+        let plane: Plane = Arc::default();
+        let world: World = Arc::default();
+        let store = Arc::new(RedbStore::open_in_memory().unwrap());
+        let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .skill(PostsTwice {
+                plane: Arc::clone(&plane),
+                world: Arc::clone(&world),
+            })
+            .build();
+        plane.set(Arc::clone(&rt)).unwrap();
+
+        let out = rt
+            .start("demo.twice", Tainted::trusted(json!({})))
+            .run()
+            .await
+            .unwrap();
+
+        assert!(out.status.is_cancelled(), "{:?}", out.status);
+        assert_eq!(
+            *world.lock().unwrap(),
+            vec!["first".to_owned(), "reversed".to_owned()],
+            "the second post was sent, or the first was not undone"
+        );
+    }
+
+    /// Posts once.
+    #[derive(Debug)]
+    struct PostsOnce(World);
+
+    #[async_trait::async_trait]
+    impl Skill for PostsOnce {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("posts-once").provides("demo.once")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            cx.effect(Ledger {
+                world: Arc::clone(&self.0),
+                what: "once",
+            })
+            .await?;
+            Ok(Outcome::done(Tainted::trusted(json!({ "ok": true }))))
+        }
+    }
+
+    /// **A stop that cannot be read refuses the hop.** The boundary read
+    /// answers; the hop's does not, and nothing is sent.
+    #[tokio::test]
+    async fn an_unreadable_stop_refuses_the_hop() {
+        let world: World = Arc::default();
+        let store: Arc<dyn JournalStore> = Arc::new(Faulty::new(
+            Arc::new(RedbStore::open_in_memory().unwrap()),
+            Schedule::healthy().stops_unreadable_after(1),
+        ));
+        let rt = Runtime::builder(Arc::clone(&store))
+            .skill(PostsOnce(Arc::clone(&world)))
+            .build();
+        let out = rt
+            .start("demo.once", Tainted::trusted(json!({})))
+            .run()
+            .await;
+
+        assert!(
+            world.lock().unwrap().is_empty(),
+            "the post was sent although the stop could not be read: {out:?}"
+        );
+        assert!(
+            !matches!(out, Ok(ref o) if matches!(o.status, RunStatus::Succeeded)),
+            "a run whose stop could not be read succeeded: {out:?}"
+        );
+    }
 }

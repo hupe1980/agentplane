@@ -3624,7 +3624,7 @@ async fn cancel_task(
         .find_map(|record| record.body.case.map(|case| case.to_string()));
 
     // Still `WORKING`, deliberately. The request is durable, and the run stops
-    // at its next step boundary — reporting `CANCELED` here would claim it had
+    // before its next effect — reporting `CANCELED` here would claim it had
     // already stopped and unwound, which is exactly what has not happened yet.
     serde_json::to_value(task_of(
         id,

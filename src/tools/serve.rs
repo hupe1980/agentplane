@@ -1008,7 +1008,7 @@ impl ServerHandler for McpServer {
     }
 
     /// **`tasks/cancel` is the runtime's own cancellation**, recorded in the
-    /// journal and honoured at the next step boundary. Cooperative, as the
+    /// journal and honoured before the run's next effect. Cooperative, as the
     /// specification asks and as this runtime already works: nothing is
     /// interrupted mid-effect.
     async fn cancel_task(

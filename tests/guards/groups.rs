@@ -2848,6 +2848,42 @@ impl Skill for HoldWaitSend {
     }
 }
 
+/// **A group spans a wait.** The handle cannot outlive the wait, so the step
+/// takes the group up again by name after it; that is the same group, not a
+/// nested one, and the send commits once the timer fires.
+#[tokio::test]
+async fn a_group_spanning_a_wait_commits_after_it() {
+    let world = World::new();
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .timers(store.clone() as Arc<dyn agentplane::case::TimerStore>)
+        .skill(HoldWaitSend {
+            world: Arc::clone(&world),
+        })
+        .build();
+    let out = rt
+        .start("hold.wait.send", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .expect("run");
+    assert!(out.status.is_suspended(), "{:?}", out.status);
+
+    // Any instant past the wake; the sweep fires what is due by then.
+    let later = time::OffsetDateTime::from_unix_timestamp(4_102_444_800).expect("2100");
+    let woke = rt.fire_timers(later).await.expect("the sweep runs");
+    assert_eq!(woke.fired, 1);
+    let done = rt
+        .replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect("read back");
+    assert_eq!(done.status, RunStatus::Succeeded, "{:?}", done.status);
+    assert_eq!(
+        world.entries(),
+        vec!["held", "sent"],
+        "the group was refused as nested after its own wait and taken back"
+    );
+}
+
 /// **A cancel does not finish a wait that ended meanwhile.** The run is
 /// cancelled while suspended inside a group, after its timer is due: the pass
 /// that abandons the group replays past the wait, and must take the hold back
@@ -2874,6 +2910,51 @@ async fn a_cancel_after_a_wait_ended_sends_nothing() {
         out.status
     );
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    // The wake is journaled and the run not yet resumed: the window between a
+    // timer sweep's append and its resume, which the stop lands in. The
+    // abandoning pass then replays past the wait and reaches the send.
+    let journal = store.clone() as Arc<dyn JournalStore>;
+    let records = journal.read(out.run_id, 1).await.expect("records");
+    let sleep = records
+        .iter()
+        .rev()
+        .find(|r| {
+            matches!(r.kind(), agentplane::journal::RecordKind::EffectStarted { descriptor, .. }
+                if descriptor.kind == "timer.sleep")
+        })
+        .expect("the run is asleep");
+    let lease = journal
+        .acquire(out.run_id, "sweep", std::time::Duration::from_secs(30))
+        .await
+        .expect("lease");
+    journal
+        .append(
+            lease.epoch,
+            vec![
+                agentplane::journal::Append::new(
+                    out.run_id,
+                    agentplane::journal::RecordKind::EffectDone {
+                        output: json!({ "fired_at": 0 }),
+                        source: None,
+                        by: None,
+                        spend: agentplane::core::Spend::default(),
+                        declared: agentplane::core::DeclaredOutput::trusted(),
+                        content: None,
+                        elapsed_ms: None,
+                    },
+                )
+                .effect(sleep.effect_key().expect("keyed"))
+                .step(sleep.body.step.expect("a step"))
+                .phase(sleep.body.phase),
+            ],
+        )
+        .await
+        .expect("the wake is journaled");
+    journal
+        .release_lease(out.run_id, lease.epoch)
+        .await
+        .expect("released");
 
     rt.request_cancel(
         out.run_id,
@@ -3251,4 +3332,130 @@ async fn a_refused_second_atomic_member_replays_as_it_ran() {
         format!("{:?}", out.status),
         "a faithful history whose second atomic member was refused read as divergent"
     );
+}
+
+// ── A stop found inside a group ─────────────────────────────────────────────
+//
+// A stop is asked before each live dispatch, so a group whose next member
+// meets a stop is taken back whole: nothing of that member was sent.
+
+type Plane = Arc<std::sync::OnceLock<Arc<Runtime>>>;
+
+async fn press_stop(plane: &Plane, run: agentplane::core::RunId) {
+    let ops = agentplane::core::Operator::asserted("ops").expect("an operator");
+    plane
+        .get()
+        .expect("the plane is wired")
+        .request_cancel(run, &ops, "pressed stop")
+        .await
+        .expect("the stop is recorded");
+}
+
+/// Holds stock, is stopped, then would authorise a card — or, with
+/// `atomic`, post to the ledger in the journal's own transaction.
+#[derive(Debug)]
+struct StoppedMidGroup {
+    world: Arc<World>,
+    plane: Plane,
+    atomic: bool,
+}
+
+#[async_trait::async_trait]
+impl Skill for StoppedMidGroup {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("stopped").provides("stopped")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let w = &self.world;
+        let run = cx.run_id();
+        let mut g = cx
+            .group("checkout", ["inventory", "payments", "ledger"])
+            .await
+            .map_err(SkillError::Step)?;
+        g.reversible("inventory", Call::new("stock.hold", "held", w), |_| {
+            Call::new("stock.release", "released", w)
+        })
+        .await
+        .map_err(SkillError::Step)?;
+        press_stop(&self.plane, run).await;
+        if self.atomic {
+            #[cfg(feature = "testkit")]
+            g.atomic(
+                "ledger",
+                Arc::new(Posts {
+                    account: "AC-1".to_owned(),
+                    amount: 129,
+                    refuses: false,
+                    world: Arc::clone(w),
+                }),
+            )
+            .map_err(SkillError::Step)?;
+        } else {
+            g.reversible("payments", Call::new("card.auth", "authorised", w), |_| {
+                Call::new("card.void", "voided", w)
+            })
+            .await
+            .map_err(SkillError::Step)?;
+        }
+        g.commit(&[]).await.map_err(SkillError::Step)?;
+        Ok(Outcome::done(Tainted::trusted(json!("booked"))))
+    }
+}
+
+async fn stopped_mid_group(
+    store: Arc<dyn JournalStore>,
+    atomic: bool,
+) -> (Arc<World>, agentplane::runtime::RunOutcome) {
+    let world = World::new();
+    let plane: Plane = Arc::default();
+    let rt = Runtime::builder(store)
+        .skill(StoppedMidGroup {
+            world: Arc::clone(&world),
+            plane: Arc::clone(&plane),
+            atomic,
+        })
+        .build();
+    plane.set(Arc::clone(&rt)).expect("wired once");
+    let out = rt
+        .start("stopped", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .expect("run");
+    (world, out)
+}
+
+/// **A stop at a group member takes the group back.** The next member is
+/// never sent, and the member that landed is reversed under the stop.
+#[tokio::test]
+async fn a_stop_at_a_group_member_takes_the_group_back() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let (world, out) = stopped_mid_group(store, false).await;
+    assert!(out.status.is_cancelled(), "{:?}", out.status);
+    assert_eq!(
+        world.entries(),
+        vec!["held", "released"],
+        "the next member was sent, or the one that landed was not reversed"
+    );
+}
+
+/// **An atomic member is not committed under a stop.** It is admitted through
+/// the gate rather than the ordinary dispatch path, and the stop is asked
+/// there too.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn an_atomic_member_is_not_committed_under_a_stop() {
+    let (store, _redb) = staged();
+    let (world, out) = stopped_mid_group(Arc::clone(&store) as Arc<dyn JournalStore>, true).await;
+    assert!(out.status.is_cancelled(), "{:?}", out.status);
+    assert!(
+        store.applied().is_empty(),
+        "an atomic member committed under a stop: {:?}",
+        store.applied()
+    );
+    assert_eq!(world.entries(), vec!["held", "released"]);
 }

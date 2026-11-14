@@ -110,6 +110,7 @@ pub struct Schedule {
     contested: Vec<RunId>,
     detail: Option<&'static str>,
     failing_renewals: u64,
+    stops_readable: Option<u64>,
 }
 
 impl Schedule {
@@ -126,6 +127,7 @@ impl Schedule {
             contested: Vec::new(),
             detail: None,
             failing_renewals: 0,
+            stops_readable: None,
         }
     }
 
@@ -145,6 +147,7 @@ impl Schedule {
             contested: Vec::new(),
             detail: None,
             failing_renewals: 0,
+            stops_readable: None,
         }
     }
 
@@ -213,6 +216,18 @@ impl Schedule {
         self
     }
 
+    /// Answer the first `n` reads of a stop request and fail every later one.
+    ///
+    /// A stop is read at each step boundary and before each live dispatch;
+    /// an unreadable one must refuse the dispatch rather than read as "no
+    /// stop", and only a schedule that lets the boundary through reaches the
+    /// hop.
+    #[must_use]
+    pub const fn stops_unreadable_after(mut self, n: u64) -> Self {
+        self.stops_readable = Some(n);
+        self
+    }
+
     /// Fail the *n*-th append (1-based) with `fault`.
     #[must_use]
     pub fn at(mut self, n: u64, fault: Fault) -> Self {
@@ -273,6 +288,7 @@ pub struct Faulty {
     schedule: Schedule,
     calls: AtomicU64,
     renewals: AtomicU64,
+    stop_reads: AtomicU64,
     injected: Arc<std::sync::Mutex<Vec<(u64, Fault)>>>,
     runs: Arc<std::sync::Mutex<Vec<RunId>>>,
 }
@@ -286,6 +302,7 @@ impl Faulty {
             schedule,
             calls: AtomicU64::new(0),
             renewals: AtomicU64::new(0),
+            stop_reads: AtomicU64::new(0),
             injected: Arc::new(std::sync::Mutex::new(Vec::new())),
             runs: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
@@ -622,6 +639,19 @@ impl JournalStore for Faulty {
         &self,
         run: RunId,
     ) -> Result<Option<crate::journal::Cancellation>, StoreError> {
+        let n = self.stop_reads.fetch_add(1, Ordering::SeqCst) + 1;
+        if self
+            .schedule
+            .stops_readable
+            .is_some_and(|readable| n > readable)
+        {
+            return Err(StoreError::Backend(
+                self.schedule
+                    .detail
+                    .unwrap_or("injected: the stop request is unreadable")
+                    .to_owned(),
+            ));
+        }
         self.inner.cancellation(run).await
     }
 }

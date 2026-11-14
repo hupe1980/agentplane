@@ -1069,7 +1069,7 @@ impl Declarative {
                             call
                         })
                         .await?;
-                    let label = completion.label().join(prompt.label()).clone();
+                    let label = completion.label().join(prompt.label());
                     let Some(mut value) = completion.peek().structured.clone() else {
                         return Ok(Outcome::fail(format!(
                             "plan step {index}: the parse returned nothing structured"

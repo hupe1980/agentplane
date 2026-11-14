@@ -1060,6 +1060,18 @@ pub enum StepError {
     #[error("the authority of '{subject}' was withdrawn: {reason}")]
     Withheld { subject: String, reason: String },
 
+    /// A stop stood for this run when it was about to dispatch.
+    ///
+    /// Not a fault: somebody stopped the run, and the hop that found the
+    /// request recorded it and dispatched nothing. Never handed to a model as
+    /// a tool error — the run ends, its work is unwound, and it concludes
+    /// `cancelled` under the asker's name.
+    #[error("stopped by {actor}: {reason}")]
+    Cancelled {
+        actor: crate::core::Operator,
+        reason: String,
+    },
+
     /// **Not a failure.** The run is waiting for something that has not
     /// happened, and its frame has been persisted.
     ///
@@ -1156,6 +1168,7 @@ impl StepError {
             Self::Budget(_) => "budget",
             Self::NotWired(_) => "not_wired",
             Self::Withheld { .. } => "withheld",
+            Self::Cancelled { .. } => "cancelled",
             Self::Suspended(_) => "suspended",
             Self::Denied { .. } => "denied",
             Self::GroupFootprint { .. } => "group_footprint",

@@ -588,7 +588,7 @@ async function cancelRun() {
       return;
     }
     const answer = await call('POST', '/api/runs/' + encodeURIComponent(run) + '/cancel', { reason: reason.value.trim() });
-    const text = answer.ok ? 'cancellation recorded — the run stops at its next step boundary' : refusal(answer);
+    const text = answer.ok ? 'cancellation recorded — the run stops before its next effect' : refusal(answer);
     if (state.run !== run) {
       toast(shortRun(run) + ': ' + text);
       return;

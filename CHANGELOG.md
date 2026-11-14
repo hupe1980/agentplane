@@ -16,7 +16,43 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.60.0] — unreleased
+## [0.61.0] — 2026-11-14
+
+### Added
+
+- **`testkit::Schedule::stops_unreadable_after(n)`**: a store whose stop
+  request cannot be read after `n` reads.
+
+### Changed
+
+- **A stop lands before the run's next effect, not at its next step
+  boundary.** Each live dispatch asks first, so a tool-calling agent stopped
+  mid-loop makes no further model turn or tool call; the call in flight
+  completes. A `ToolClient` wrapper that refuses a stopped run's calls can go.
+- **BREAKING: `StepError::Cancelled { actor, reason }` and
+  `EffectReplay::Cancelled`.** An exhaustive match adds the arm. A
+  `RunCancelled` record may carry an effect key.
+- **`Runtime::verify` judges a run stopped or withheld at a dispatch**, which
+  it answered `cannot replay: ended by an act`. A stop found at a step boundary
+  still is.
+
+### Fixed
+
+- **A group could not span a wait.** Taking it up again by name after the wait
+  was refused as nesting, so the run failed and the group was reversed. The
+  same name and footprint now reattach to the open group.
+- **An atomic group member could commit on the pass that abandons a cancelled
+  run's open group.**
+
+### Security
+
+- **`rmcp` ≥ 3.9** (RUSTSEC-2026-0457, RUSTSEC-2026-0462). The `mcp-http`
+  feature reaches the Streamable HTTP client that buffered a response body
+  without bound. The lock moves to 3.10.0; run `cargo update -p rmcp` on an
+  older lock.
+- **`rustix` 1.1.6** (RUSTSEC-2026-0486, unsound), through `clap` and `opendal`.
+
+## [0.60.0] — 2026-11-07
 
 ### Added
 

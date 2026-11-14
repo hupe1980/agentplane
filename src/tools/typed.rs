@@ -581,7 +581,7 @@ mod tests {
         ] {
             assert_eq!(failure.disposition(), expected);
             let id = ToolId::new("ledger", "read");
-            let error = failure.clone().at(id.clone());
+            let error = failure.clone().at(id);
             assert_eq!(
                 error.disposition(),
                 expected,

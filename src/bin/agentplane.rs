@@ -8483,6 +8483,12 @@ spec:
         super::dispatch(<super::Cli as clap::Parser>::try_parse_from(args).expect("parses"))
     }
 
+    /// Run one command line that must succeed: no fault, and exit code zero.
+    fn succeeds(args: &[&str], what: &str) {
+        let code = cli(args).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(code, std::process::ExitCode::SUCCESS, "{what}: {args:?}");
+    }
+
     /// **A halt thrown at the terminal stops a plane this binary builds.**
     ///
     /// `halt --store` writes to the quota store; a `run`, `serve` or resume
@@ -8499,27 +8505,31 @@ spec:
         let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/summariser.yaml");
         let input = r#"{"ticket":"printer on fire"}"#;
 
-        cli(&[
-            "agentplane",
-            "run",
-            manifest,
-            "--input",
-            input,
-            "--store",
-            store,
-        ])
-        .expect("an unhalted plane runs the example");
-        cli(&[
-            "agentplane",
-            "halt",
-            "--store",
-            store,
-            "--reason",
-            "incident 7",
-            "--actor",
-            "ops",
-        ])
-        .expect("the halt is thrown");
+        succeeds(
+            &[
+                "agentplane",
+                "run",
+                manifest,
+                "--input",
+                input,
+                "--store",
+                store,
+            ],
+            "an unhalted plane runs the example",
+        );
+        succeeds(
+            &[
+                "agentplane",
+                "halt",
+                "--store",
+                store,
+                "--reason",
+                "incident 7",
+                "--actor",
+                "ops",
+            ],
+            "the halt is thrown",
+        );
         let refused = cli(&[
             "agentplane",
             "run",
@@ -8592,30 +8602,34 @@ spec:
     fn a_terminal_lift_is_recorded_as_asserted() {
         let (dir, store, case) = store_with_a_case("lift");
         let store = store.as_str();
-        cli(&[
-            "agentplane",
-            "halt",
-            "--store",
-            store,
-            "--reason",
-            "incident 7",
-            "--actor",
-            "ops",
-        ])
-        .expect("the halt is thrown");
-        cli(&[
-            "agentplane",
-            "hold",
-            "--store",
-            store,
-            "--case",
-            &case,
-            "--reason",
-            "order 9",
-            "--actor",
-            "ops",
-        ])
-        .expect("the hold is placed");
+        succeeds(
+            &[
+                "agentplane",
+                "halt",
+                "--store",
+                store,
+                "--reason",
+                "incident 7",
+                "--actor",
+                "ops",
+            ],
+            "the halt is thrown",
+        );
+        succeeds(
+            &[
+                "agentplane",
+                "hold",
+                "--store",
+                store,
+                "--case",
+                &case,
+                "--reason",
+                "order 9",
+                "--actor",
+                "ops",
+            ],
+            "the hold is placed",
+        );
 
         assert_eq!(
             cli(&[
@@ -8727,30 +8741,34 @@ spec:
 
         let (dir, store, case) = store_with_a_case("unattributed");
         let store = store.as_str();
-        cli(&[
-            "agentplane",
-            "halt",
-            "--store",
-            store,
-            "--reason",
-            "incident 7",
-            "--actor",
-            "ops",
-        ])
-        .expect("the halt is thrown");
-        cli(&[
-            "agentplane",
-            "hold",
-            "--store",
-            store,
-            "--case",
-            &case,
-            "--reason",
-            "order 9",
-            "--actor",
-            "ops",
-        ])
-        .expect("the hold is placed");
+        succeeds(
+            &[
+                "agentplane",
+                "halt",
+                "--store",
+                store,
+                "--reason",
+                "incident 7",
+                "--actor",
+                "ops",
+            ],
+            "the halt is thrown",
+        );
+        succeeds(
+            &[
+                "agentplane",
+                "hold",
+                "--store",
+                store,
+                "--case",
+                &case,
+                "--reason",
+                "order 9",
+                "--actor",
+                "ops",
+            ],
+            "the hold is placed",
+        );
 
         for args in [
             &["agentplane", "halt", "--store", store, "--lift"][..],
@@ -9418,16 +9436,18 @@ spec:
         let hostile =
             "\u{1b}]52;c;ZXZpbA==\u{7}\u{9b}31m<img src=x onerror=alert(1)>\u{202E}gnp.exe";
         let input = serde_json::json!({ "ticket": hostile }).to_string();
-        cli(&[
-            "agentplane",
-            "run",
-            manifest,
-            "--input",
-            &input,
-            "--store",
-            store,
-        ])
-        .expect("the example runs");
+        succeeds(
+            &[
+                "agentplane",
+                "run",
+                manifest,
+                "--input",
+                &input,
+                "--store",
+                store,
+            ],
+            "the example runs",
+        );
         let run = succeeded_in(store)[0];
 
         let journal: Arc<dyn agentplane::journal::JournalStore> =
@@ -9820,16 +9840,18 @@ spec:
         let dir = temp_dir("dev-same");
         let path = dir.join("plane.redb");
         let store = path.to_str().expect("utf-8 path");
-        cli(&[
-            "agentplane",
+        succeeds(
+            &[
+                "agentplane",
+                "run",
+                manifest,
+                "--input",
+                "{\"ticket\":\"t\"}",
+                "--store",
+                store,
+            ],
             "run",
-            manifest,
-            "--input",
-            "{\"ticket\":\"t\"}",
-            "--store",
-            store,
-        ])
-        .expect("run");
+        );
         let ran = succeeded_in(store)[0];
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

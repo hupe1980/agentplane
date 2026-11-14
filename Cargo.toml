@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.60.0"
+version      = "0.61.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -242,7 +242,7 @@ tokio-postgres = { version = "0.7.18", optional = true, features = [
   "with-serde_json-1",
 ] }
 deadpool-postgres = { version = "0.14.1", optional = true }
-rmcp = { version = "3.1", default-features = false, features = ["client", "transport-io"], optional = true }
+rmcp = { version = "3.9", default-features = false, features = ["client", "transport-io"], optional = true }
 # The request type rmcp's HTTP server puts on a served request, read by
 # `mcp-server` to refuse one that arrives over HTTP with no caller — whoever
 # mounted the catalogue. Already in the graph wherever that server is.
@@ -314,7 +314,7 @@ http = "1"
 # published OpenAPI document, in the `http,redb` build too, where the library's
 # own copy (behind `manifest`) is absent. Same version as the library's.
 jsonschema = { version = "0.56.0", default-features = false }
-rmcp = { version = "3.1", default-features = false, features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3.9", default-features = false, features = ["server", "transport-io", "macros"] }
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5.3", features = ["util"] }

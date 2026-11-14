@@ -396,7 +396,7 @@ fn unpark_for(
                 .map_err(|e| be(&e))?
                 .is_some()
             {
-                matching.push(effect.clone());
+                matching.push(effect);
                 break;
             }
         }

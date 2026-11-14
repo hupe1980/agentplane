@@ -280,7 +280,8 @@ ulid_newtype!(
     ///
     /// Runs stay short *by design* — longevity lives in the [`CaseId`], so a
     /// six-week business process never pins a code version.
-    RunId, "run"
+    RunId,
+    "run"
 );
 
 impl RunId {
@@ -301,7 +302,8 @@ impl RunId {
 
 ulid_newtype!(
     /// A long-lived, correlated business fact spanning many runs and weeks.
-    CaseId, "case"
+    CaseId,
+    "case"
 );
 
 ulid_newtype!(
@@ -311,7 +313,8 @@ ulid_newtype!(
     /// a [`CaseId`] because the relationship is different in kind: a case is a
     /// matter that several runs *touch* over weeks, while a batch is a single
     /// act that several runs *constitute* in one pass.
-    BatchId, "batch"
+    BatchId,
+    "batch"
 );
 
 /// Position of a step within a plan.

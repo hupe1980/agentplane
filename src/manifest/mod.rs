@@ -1674,7 +1674,7 @@ fn tool_references_in(text: &str) -> Vec<String> {
             })
             .collect();
         if crate::tools::ToolId::parse(&candidate).is_some() {
-            found.push(candidate.clone());
+            found.push(candidate);
         }
         // Advance past the scheme, never past the candidate: two references
         // written back to back must both be seen.
@@ -1999,7 +1999,7 @@ impl Manifest {
                     grant.reference
                 )));
             };
-            if !tool_ids.insert(id.clone()) {
+            if !tool_ids.insert(id) {
                 return Err(ManifestError::Syntax(format!(
                     "spec.tools: '{}' is granted more than once — two safety declarations \
                      for one tool make list order decide which one governs",

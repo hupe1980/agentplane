@@ -761,9 +761,12 @@ pub enum RecordKind {
     /// asker's name and reason inside the hash chain — an intervention nobody
     /// signed is an outage, not oversight.
     ///
-    /// Written at a **step boundary**, never mid-effect: interrupting between
-    /// "announced" and "recorded" manufactures the in-doubt case the effect
-    /// protocol exists to avoid.
+    /// Written at a **step boundary**, run-level with no effect key; or at a
+    /// hop about to dispatch inside a step, keyed to that hop, which was not
+    /// announced. Never between an announcement and its outcome: interrupting
+    /// there manufactures the in-doubt case the effect protocol exists to
+    /// avoid. A keyed stop is the last forward record of its step, and replay
+    /// re-raises it there.
     RunCancelled {
         actor: crate::core::Operator,
         reason: String,

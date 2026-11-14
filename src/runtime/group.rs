@@ -461,6 +461,10 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
             // one rather than a quarantine.
             let what = format!("the atomic members on [{touched}] did not commit: {e}");
             self.cx.abort_open_group(&what).await?;
+            // A stop ends the run, not just the group: it leaves as itself.
+            if matches!(e, StepError::Cancelled { .. }) {
+                return Err(e);
+            }
             return Err(StepError::GroupAborted { what });
         }
 
@@ -649,9 +653,13 @@ impl<'a> StepCtx<'a> {
     /// up front is what makes the frontier mean something: a group that could
     /// touch anything has committed to nothing.
     ///
+    /// Asking again by the same name and footprint while that group is open
+    /// takes it up again: a wait borrows the context, so a group spanning one
+    /// is reached after it this way.
+    ///
     /// # Errors
     ///
-    /// If a group is already open — groups do not nest, because a nested abort
+    /// If another group is already open — groups do not nest, because a nested abort
     /// would have to decide whether it takes the outer group with it, and
     /// either answer is wrong half the time.
     pub async fn group<'g, R, S>(
@@ -664,7 +672,14 @@ impl<'a> StepCtx<'a> {
         S: Into<String>,
     {
         let name = name.into();
+        let resources: Vec<String> = resources.into_iter().map(Into::into).collect();
         if let Some(open) = self.open_group() {
+            // The same group, taken up again after a wait: the handle cannot
+            // outlive one, because the wait borrows the context, so the group
+            // lives on the context and is reattached by name and footprint.
+            if open.name == name && open.resources == resources {
+                return Ok(EffectGroup::new(self));
+            }
             return Err(StepError::GroupFootprint {
                 group: name,
                 detail: format!(
@@ -674,7 +689,6 @@ impl<'a> StepCtx<'a> {
                 ),
             });
         }
-        let resources: Vec<String> = resources.into_iter().map(Into::into).collect();
         if resources.is_empty() {
             return Err(StepError::GroupFootprint {
                 group: name,
@@ -916,6 +930,7 @@ impl StepCtx<'_> {
     /// transaction re-applied on replay would be a second real write, which is
     /// the failure the effect protocol exists to prevent — atomicity does not
     /// exempt anything from it.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn commit_atomic(
         &mut self,
         group: &str,
@@ -991,6 +1006,11 @@ impl StepCtx<'_> {
                             return Err(stands);
                         }
                     }
+                    // A stop found at this member: nothing was committed, and
+                    // the run ended here.
+                    Some(crate::journal::EffectReplay::Cancelled { actor, reason }) => {
+                        return Err(StepError::Cancelled { actor, reason });
+                    }
                     // An atomic member's records commit with its transaction,
                     // so the only things history can hold under its key are
                     // the pair and a gate refusal. A failure or an orphaned
@@ -1040,10 +1060,12 @@ impl StepCtx<'_> {
             // A refusal re-admitted on this pass: the members before it are
             // gated now and commit with it, as one transaction.
             for (earlier, earlier_descriptor, earlier_member) in pending.drain(..) {
+                self.stop_at_hop(earlier).await?;
                 self.gate(earlier, earlier, &earlier_descriptor, true, None, None, 0)
                     .await?;
                 keyed.push((earlier, earlier_member));
             }
+            self.stop_at_hop(key).await?;
             self.gate(key, key, &descriptor, true, None, None, 0)
                 .await?;
             keyed.push((key, member));

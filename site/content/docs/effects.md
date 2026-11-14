@@ -614,7 +614,9 @@ A pause is not an abandonment. A suspension, an exhausted ceiling or a withdrawn
 authority inside an open group leaves the group open and reverses nothing: the
 frame is persisted and the step re-runs from the top on resume, rebuilding the
 group from the journal as it replays the members, so a group may legitimately
-span a durable wait. A cancel of a run paused that way re-runs the paused step
+span a durable wait. The handle cannot outlive the wait, which borrows the
+context, so the step takes the group up again by the same name and footprint
+afterwards — the same group, not a nested one. A cancel of a run paused that way re-runs the paused step
 once to abandon the group — its reversals run — and then unwinds the steps
 before it.
 
@@ -675,14 +677,26 @@ discovered.
 Article 14 is not "a human can approve things". It is oversight, and the half
 most runtimes omit is the ability to intervene and **stop**.
 
-### Cooperative, at a step boundary
+### Cooperative, before the next effect
 
-`Runtime::request_cancel` records the request durably and returns. The executor
-observes it at the top of its next ready-set loop — never mid-effect, because
-interrupting between "announced" and "recorded" manufactures exactly the
-in-doubt case the effect protocol exists to avoid. A suspended run has no thread
-to notice anything, so `request_cancel` resumes it itself; a run executing
-elsewhere sees the request at its own next boundary.
+`Runtime::request_cancel` records the request durably and returns. The run
+observes it before its next effect: at a step boundary, and at every live
+dispatch inside a step — a model turn, a tool call, a peer hop, a commission, a
+group member. A dispatch that finds a stop announces nothing, records
+`RunCancelled` at its own key, and ends the step; the run then unwinds as for
+any stop. So a tool-calling agent stopped mid-loop makes no further model turn
+and no further tool call.
+
+It is never mid-effect: interrupting between "announced" and "recorded"
+manufactures exactly the in-doubt case the effect protocol exists to avoid, so
+a call already in flight completes and is recorded — a stop costs at most that
+call. Compensation and group reversal dispatch under a stop; they are what it
+asks for. A stop that cannot be read refuses the dispatch. A suspended run has
+no thread to notice anything, so `request_cancel` resumes it itself.
+
+A consulted agent is a run of its own: a stop on the run that consulted it
+lands once the consultation answers, and the consulted run's own stop is its
+own.
 
 A model call its own step stops while it streams is different: it concludes as
 a recorded completion, not mid-effect

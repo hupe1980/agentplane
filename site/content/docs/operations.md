@@ -924,7 +924,7 @@ declaration digest the run was admitted under and the one in hand:
 |---|---|
 | **verified** | Every recorded effect was asked for again, in order, and the run reached the ending it recorded — a recorded failure included: the recorded ending is what is verified. Under a different digest it reads *no divergence on this run*, which says nothing about the next input |
 | **diverged** | The first effect this build asked for differently, or beyond the record, or never asked for — with its step, phase and both keys. Or every effect matched and the run ended differently |
-| **cannot replay** | A reason that is not the edit, named: *erased* (sealed to a destroyed key), *key absent* (sealed, and this plane holds no key ring — nothing is known to be erased), *canonicalization changed*, *entry point removed* (the file no longer provides the capability the run executed), *not concluded*, or *ended by an act* (a cancellation, abandonment or sweep its steps did not decide) |
+| **cannot replay** | A reason that is not the edit, named: *erased* (sealed to a destroyed key), *key absent* (sealed, and this plane holds no key ring — nothing is known to be erased), *canonicalization changed*, *entry point removed* (the file no longer provides the capability the run executed), *not concluded*, or *ended by an act* (a cancellation, abandonment or sweep its steps did not decide — one found at a dispatch inside a step replays, and is verified) |
 
 It writes nothing — no lease, no conclusion, no index moves — and it reaches
 nothing: every provider, tool server and peer the manifest names is answered
@@ -2105,7 +2105,7 @@ Copy the file; it calls operator routes and runs no agent code.
 | `GET /cases/{case}` | What has happened on this matter, and by when must it end? |
 | `GET /obligations` | What did we miss and has nobody accounted for? Longest-overdue first, and it outlives the case's closure |
 | `POST /obligations/acknowledge` | I have looked at that one — take it off the list, keep the record |
-| `POST /runs/{run}/cancel` | Stop it — `202`, because the run stops at its next boundary |
+| `POST /runs/{run}/cancel` | Stop it — `202`, because the run stops before its next effect |
 | `POST /runs/{run}/reconcile` | I looked it up: here is what actually happened to that effect |
 | `POST /runs/{run}/reopen` | The doubt is answered — judge the run again |
 | `POST /runs/{run}/abandon` | Nobody will ever establish what happened; close it where it stands |

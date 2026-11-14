@@ -1915,7 +1915,7 @@ impl<'a> StepCtx<'a> {
                 }
             }
 
-            self.starts_no_work_when_abandoning(&descriptor)?;
+            self.stop_at_hop(key).await?;
 
             // ── Live ───────────────────────────────────────────────────────
             //
@@ -2362,6 +2362,9 @@ impl<'a> StepCtx<'a> {
             Some(EffectReplay::Withheld { subject, reason }) => {
                 Err(StepError::Withheld { subject, reason })
             }
+            Some(EffectReplay::Cancelled { actor, reason }) => {
+                Err(StepError::Cancelled { actor, reason })
+            }
             Some(EffectReplay::Failed { error, spend, .. }) => {
                 self.bill_replayed(spend, 0);
                 Err(StepError::Effect(crate::core::EffectError::Rejected(error)))
@@ -2747,26 +2750,41 @@ impl<'a> StepCtx<'a> {
             .await
     }
 
-    /// Refuse a forward dispatch on the pass that abandons a cancelled run.
+    /// Refuse a forward dispatch when a stop stands for this run.
     ///
-    /// That pass re-walks the paused step only so its open group can abort, so
-    /// past the frontier it takes work back and starts none: whatever was
-    /// raised, lifted or decided since the pause, a forward dispatch here would
-    /// perform — and could commit — what the operator asked to stop.
-    fn starts_no_work_when_abandoning(
-        &self,
-        descriptor: &EffectDescriptor,
-    ) -> Result<(), StepError> {
-        if self.abandoning && !self.undoing() {
-            return Err(StepError::Effect(crate::core::EffectError::Rejected(
-                format!(
-                    "{} was not dispatched: the run is being cancelled, and cancelling \
-                 starts no new work",
-                    descriptor.kind
-                ),
-            )));
+    /// The executor reads a stop at each step boundary, but a step can hold
+    /// many dispatches — a tool loop's every model turn and tool call is one
+    /// step — so each live forward dispatch asks first, before anything is
+    /// announced. On a stop the hop records who asked, at its own key, and
+    /// ends the step; the executor unwinds as it does for a boundary stop.
+    /// Asked before a withdrawal: a stop ends the run, and pausing a run
+    /// somebody stopped would leave the stop unanswered.
+    ///
+    /// The pass that re-walks a stopped run's paused step to abandon its open
+    /// group refuses here too, without a second record: its boundary already
+    /// journaled this stop. Undo is exempt — it is what the stop asks for. A
+    /// stop that cannot be read refuses the hop.
+    pub(crate) async fn stop_at_hop(&mut self, key: EffectKey) -> Result<(), StepError> {
+        if self.undoing() || !self.writes_enabled() {
+            return Ok(());
         }
-        Ok(())
+        let Some(stop) = self.journal().cancellation(self.run).await? else {
+            return Ok(());
+        };
+        if !self.abandoning {
+            self.append_effect(
+                key,
+                RecordKind::RunCancelled {
+                    actor: stop.actor.clone(),
+                    reason: stop.reason.clone(),
+                },
+            )
+            .await?;
+        }
+        Err(StepError::Cancelled {
+            actor: stop.actor,
+            reason: stop.reason,
+        })
     }
 
     /// Whether this dispatch takes work back: a compensating phase, or a group
@@ -3494,6 +3512,11 @@ impl<'a> StepCtx<'a> {
                 }
                 Ok(Replayed::Continue(attempt))
             }
+            // A stop found at this hop. Re-raised on every pass: a stop ends
+            // the run, so there is no later decision for a resume to reach.
+            Some(EffectReplay::Cancelled { actor, reason }) => {
+                Err(StepError::Cancelled { actor, reason })
+            }
             Some(refusal @ (EffectReplay::Refused { .. } | EffectReplay::Denied { .. })) => {
                 // Re-admitted refusals fall through to a live dispatch of the
                 // same key; everything else re-raises inside.
@@ -3835,6 +3858,7 @@ impl<'a> StepCtx<'a> {
                 Some(
                     refusal @ (EffectReplay::Refused { .. }
                     | EffectReplay::Withheld { .. }
+                    | EffectReplay::Cancelled { .. }
                     | EffectReplay::Denied { .. }),
                 ) => return Err(recorded_refusal(refusal)),
                 Some(EffectReplay::Failed { error, spend, .. }) => {
@@ -5296,6 +5320,7 @@ fn recorded_refusal(replay: EffectReplay) -> StepError {
             reason,
         },
         EffectReplay::Withheld { subject, reason } => StepError::Withheld { subject, reason },
+        EffectReplay::Cancelled { actor, reason } => StepError::Cancelled { actor, reason },
         // The callers match only these.
         other => StepError::Effect(crate::core::EffectError::Other(format!(
             "not a recorded refusal: {other:?}"

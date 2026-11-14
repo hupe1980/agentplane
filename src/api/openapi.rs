@@ -380,7 +380,7 @@ pub const ROUTES: &[Route] = &[
         method: Method::Post,
         path: "/runs/{run}/cancel",
         operation: "cancel_run",
-        summary: "Stop a run at its next step boundary.",
+        summary: "Stop a run before its next effect.",
         action: action::RUN_CANCEL,
         query: None,
         body: Some(Body::Json(schema::<super::CancelRequest>)),

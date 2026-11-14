@@ -1064,7 +1064,7 @@ pub trait JournalStore: Send + Sync + Debug {
     ///
     /// So the request lands beside the chain rather than in it, exactly as a
     /// lease does, and the *owner* journals `RunCancelled` when it observes the
-    /// request at its next step boundary. That keeps "who asked, and why" inside
+    /// request before its next effect. That keeps "who asked, and why" inside
     /// the hash chain without letting an unfenced writer append to it.
     ///
     /// Idempotent: returns `false` if a request was already recorded, so a

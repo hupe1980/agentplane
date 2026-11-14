@@ -4675,10 +4675,87 @@ pub struct Label {""",
         "the pass that abandons a cancelled run's open group dispatches forward "
         "work past the frontier, so a wait that ended, a lifted withholding or a "
         "raised ceiling lets the cancel send and commit what it was asked to stop",
-        """        if self.abandoning && !self.undoing() {
-            return Err(StepError::Effect""",
-        """        if self.abandoning && self.undoing() {
-            return Err(StepError::Effect""",
+        """        let Some(stop) = self.journal().cancellation(self.run).await? else {""",
+        """        let Some(stop) = self.journal().cancellation(self.run).await?.filter(|_| !self.abandoning) else {""",
+    ),
+    "AGroupCannotSpanAWait": (
+        "src/runtime/group.rs",
+        "a_group_spanning_a_wait_commits_after_it",
+        "a step taking its group up again after a wait is refused as nesting, so "
+        "every group that spans a wait is reversed and its run fails",
+        """            if open.name == name && open.resources == resources {""",
+        """            if open.name == name && open.resources != resources {""",
+    ),
+    "AStopIsNotAskedAtTheHop": (
+        "src/runtime/ctx.rs",
+        "a_stop_during_a_model_turn_ends_the_tool_loop",
+        "a stop is read only at step boundaries, so a tool-calling agent stopped "
+        "mid-loop keeps calling its model and its tools until it answers",
+        """        let Some(stop) = self.journal().cancellation(self.run).await? else {""",
+        """        let Some(stop) = self.journal().cancellation(self.run).await?.filter(|_| self.abandoning) else {""",
+    ),
+    "UndoIsRefusedUnderAStop": (
+        "src/runtime/ctx.rs",
+        "a_stop_between_two_effects_sends_the_second_nothing_and_undoes_the_first",
+        "a compensation is refused by the very stop that asked for it, so a "
+        "stopped run quarantines with its work standing instead of unwinding",
+        """        if self.undoing() || !self.writes_enabled() {""",
+        """        if !self.writes_enabled() {""",
+    ),
+    "AnUnreadableStopIsIgnored": (
+        "src/runtime/ctx.rs",
+        "an_unreadable_stop_refuses_the_hop",
+        "a stop that cannot be read is taken for no stop, so a run somebody may "
+        "have stopped goes on dispatching",
+        """        let Some(stop) = self.journal().cancellation(self.run).await? else {""",
+        """        let Some(stop) = self.journal().cancellation(self.run).await.unwrap_or(None) else {""",
+    ),
+    "AStoppedHopIsNotReplayed": (
+        "src/runtime/ctx.rs",
+        "a_run_stopped_at_a_hop_replays_strictly_to_the_same_stop",
+        "replay passes a stop recorded at a hop and dispatches what the run never "
+        "did, so a stopped run diverges from its own record",
+        """            Some(EffectReplay::Cancelled { actor, reason }) => {
+                Err(StepError::Cancelled { actor, reason })
+            }
+            Some(refusal @ (EffectReplay::Refused""",
+        """            Some(EffectReplay::Cancelled { .. }) => Ok(Replayed::Continue(attempt)),
+            Some(refusal @ (EffectReplay::Refused""",
+    ),
+    "AStoppedStepFails": (
+        "src/runtime/executor.rs",
+        "a_stop_during_a_model_turn_ends_the_tool_loop",
+        "a step ended by a stop concludes the run as a failure, which a failed "
+        "run's resume would carry on from",
+        """        Err(SkillError::Step(StepError::Cancelled { actor, reason })) => {
+            (RunStatus::Cancelled { actor, reason }, None)""",
+        """        Err(SkillError::Step(StepError::Cancelled { reason, .. })) => {
+            (RunStatus::Failed(reason), None)""",
+    ),
+    "AStopAtAHopIsNotVerified": (
+        "src/runtime/executor.rs",
+        "a_run_stopped_at_a_hop_replays_strictly_to_the_same_stop",
+        "a run stopped inside a step is refused as unverifiable although a strict "
+        "replay reproduces its stop",
+        """        if ended_by_an_act(&ending) && !ended_at_a_hop(&records, &ending) {""",
+        """        if ended_by_an_act(&ending) && ended_at_a_hop(&records, &ending) {""",
+    ),
+    "AtomicMembersSkipTheStop": (
+        "src/runtime/group.rs",
+        "an_atomic_member_is_not_committed_under_a_stop",
+        "an atomic member is admitted through the gate without asking for a "
+        "stop, so it commits in the journal's transaction after the run was stopped",
+        """            self.stop_at_hop(key).await?;
+            self.gate(key, key, &descriptor, true, None, None, 0)""",
+        """            self.gate(key, key, &descriptor, true, None, None, 0)""",
+    ),
+    "AStopInATransactionIsAGroupFailure": (
+        "src/runtime/group.rs",
+        "an_atomic_member_is_not_committed_under_a_stop",
+        "a stop found at an atomic member leaves as a group failure, so the run "
+        "concludes failed and a resume carries on what somebody stopped",
+        """            if matches!(e, StepError::Cancelled { .. }) {""",
+        """            if matches!(e, StepError::NotWired(_)) {""",
     ),
     "ACancelReadmitsARefusal": (
         "src/runtime/ctx.rs",
@@ -7570,8 +7647,8 @@ pub struct Label {""",
         "a transaction that did not commit is treated as damage rather than as "
         "nothing happening, so the group quarantines instead of being taken "
         "back — throwing away the one property this class exists for",
-        "            self.cx.abort_open_group(&what).await?;\n            return Err(StepError::GroupAborted { what });\n        }\n\n        let mut outputs = Vec::with_capacity(deferred.len());",
-        "            self.cx\n                .settle_open_group(GroupOutcome::Quarantined, Some(&what))\n                .await?;\n            return Err(StepError::GroupUnsettled { group: name, detail: what });\n        }\n\n        let mut outputs = Vec::with_capacity(deferred.len());",
+        "            self.cx.abort_open_group(&what).await?;\n            // A stop ends the run, not just the group: it leaves as itself.",
+        "            self.cx\n                .settle_open_group(GroupOutcome::Quarantined, Some(&what))\n                .await?;\n            return Err(StepError::GroupUnsettled { group: name, detail: what });",
     ),
     "AReplayedTransactionRuns": (
         "src/runtime/group.rs",

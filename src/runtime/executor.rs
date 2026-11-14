@@ -1942,8 +1942,10 @@ impl Runtime {
     ///
     /// * **Suspended** — nothing is executing, so this resumes the run itself.
     ///   It observes the request at its first step boundary and unwinds.
-    /// * **Running here or elsewhere** — the owner observes the request at its
-    ///   next step boundary. Nothing is interrupted mid-effect, deliberately:
+    /// * **Running here or elsewhere** — the owner observes the request before
+    ///   its next effect: at a step boundary, or at the next dispatch inside a
+    ///   step, so a tool-calling agent makes no further model turn or tool call.
+    ///   A call already in flight completes and is recorded, deliberately:
     ///   stopping between "announced" and "recorded" manufactures the in-doubt
     ///   case the effect protocol exists to avoid.
     /// * **Quarantined** — refused with [`RuntimeError::CannotUnwind`]: the
@@ -2049,9 +2051,9 @@ impl Runtime {
         // lease before it reads, and a `LeaseHeld` refusal means somebody is
         // executing the run right now — here or on another instance. That is
         // not a failure of this call. The request is already durable, and the
-        // live owner checks for it at every step boundary (the cancellation
-        // read at the top of the executor's ready-set loop), so the stop
-        // arrives without a second executor ever touching the run. Resuming
+        // live owner checks for it at every step boundary and before every
+        // live dispatch, so the stop arrives without a second executor ever
+        // touching the run. Resuming
         // anyway would, on the owner's own instance, hand the resume the *same
         // epoch* the live execution is writing under — two executors on one
         // chain that fencing, by construction, cannot tell apart.
@@ -5561,7 +5563,7 @@ impl Runtime {
         let Some(ending) = recorded_ending(&records) else {
             return Ok(verdict(Finding::CannotReplay(CannotReplay::NotConcluded)));
         };
-        if ended_by_an_act(&ending) {
+        if ended_by_an_act(&ending) && !ended_at_a_hop(&records, &ending) {
             return Ok(verdict(Finding::CannotReplay(CannotReplay::EndedByAnAct {
                 outcome: ending,
             })));
@@ -6061,13 +6063,13 @@ impl Runtime {
                 ready = recorded;
                 deferred = Some(rest);
             }
-            // ── The stop check, at a step boundary and nowhere else ────────
+            // ── The stop check, at a step boundary ─────────────────────────
             //
-            // Between boundaries an effect may be announced and not yet
-            // recorded, and interrupting there manufactures the in-doubt case
-            // the whole protocol exists to avoid. Checking here costs one
-            // store read per ready set and buys a cancellation that can never
-            // strand an effect.
+            // Each live dispatch inside a step asks too (`StepCtx::stop_at_hop`),
+            // before it announces anything; neither ever interrupts an effect
+            // between its announcement and its record, which is the in-doubt
+            // case the whole protocol exists to avoid. Asking here as well
+            // stops a ready set before any of its steps starts.
             //
             // Skipped while replaying: a recorded run's history already
             // contains whatever stop it received, and re-reading the live
@@ -9232,6 +9234,11 @@ fn classify(
         Err(SkillError::Step(StepError::Withheld { subject, reason })) => {
             (RunStatus::Withheld { subject, reason }, None)
         }
+        // A stop found at a hop is the boundary's stop, reached mid-step: the
+        // hop recorded who asked before refusing.
+        Err(SkillError::Step(StepError::Cancelled { actor, reason })) => {
+            (RunStatus::Cancelled { actor, reason }, None)
+        }
         Err(e) => {
             let msg = e.to_string();
             // Matched structurally, never on the message: a match on the word
@@ -9758,6 +9765,19 @@ fn recorded_ending(records: &[Record]) -> Option<String> {
 /// session is somebody else's agent's work — all three are what a person may
 /// want to say was or was not helpful.
 const ASSESSABLE_ACTS: &[&str] = &["cancelled", "abandoned", OBSERVED_OUTCOME];
+
+/// Whether an act ended the run at a hop inside a step, where it is part of
+/// that step's own history: a stop or a withdrawal recorded at an effect key
+/// is re-raised there by a strict replay, so the ending is reproducible. One
+/// found at a step boundary is not, because no pass re-reads the request.
+fn ended_at_a_hop(records: &[Record], outcome: &str) -> bool {
+    let last = records.iter().rev().find(|r| match r.kind() {
+        RecordKind::RunCancelled { .. } => outcome == "cancelled",
+        RecordKind::AuthorityWithheld { .. } => outcome == WITHHELD_OUTCOME,
+        _ => false,
+    });
+    last.is_some_and(|r| r.effect_key().is_some())
+}
 
 /// Whether an ending was an act rather than something the run's steps reached.
 ///

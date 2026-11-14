@@ -62,6 +62,8 @@ pub enum CannotReplay {
     NotConcluded,
     /// A person or the plane ended it, not its own steps — a cancellation, an
     /// abandonment, a sweep — so re-deriving its steps says nothing about it.
+    /// A stop or a withdrawal found at a dispatch inside a step is recorded
+    /// there and re-raised by a strict replay, so it is verified instead.
     EndedByAnAct { outcome: String },
 }
 

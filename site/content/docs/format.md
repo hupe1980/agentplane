@@ -1020,7 +1020,9 @@ chain.
 **Two pairs supersede rather than replace.** `BudgetReadmitted` follows a
 `BudgetRefused` and `AuthorityRestored` follows an `AuthorityWithheld`; in both
 cases the earlier record stays in the chain and the later one says it was
-overturned. An `AuthorityWithheld` is run-level when a step boundary wrote it,
+overturned. A `RunCancelled` is likewise run-level when a step boundary wrote
+it and keyed when a hop about to dispatch did; a keyed one is the last forward
+record of its step, and nothing supersedes it. An `AuthorityWithheld` is run-level when a step boundary wrote it,
 and carries an effect key when a hop about to present a credential did; that
 hop's later `EffectStarted` at the same key supersedes it. A reader
 reconstructing a run's state takes the **last word** — a

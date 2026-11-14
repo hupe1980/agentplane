@@ -3906,7 +3906,7 @@ impl PostgresStore {
         for row in rows {
             let key: String = row.get(0);
             out.push(ItemRecord {
-                key: key.clone(),
+                key,
                 run: RunId::parse(&row.get::<_, String>(1))
                     .map_err(|e| corrupt("bad run id", e))?,
                 outcome: outcome_from(row.get::<_, Option<String>>(2), row.get(3))?,
